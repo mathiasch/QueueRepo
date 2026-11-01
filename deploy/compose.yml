@@ -1,0 +1,27 @@
+# Postgres (+ optional Cloudflare Tunnel) as rootless containers of user "queued":
+#   sudo -iu queued podman compose -f /opt/queued/deploy/compose.yml up -d
+services:
+  db:
+    image: docker.io/library/postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: queued
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: queued
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  # Public HTTPS without open ports. Route your hostname to http://127.0.0.1:8080
+  cloudflared:
+    image: docker.io/cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    profiles: ["tunnel"]
+
+volumes:
+  pgdata:

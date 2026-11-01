@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, ApiError, fmtTime, STATUS_LABEL, type Project, type Task } from "./api";
+import { api, ApiError, fmtTime, STATUS_LABEL, type Commit, type Project, type Task } from "./api";
 import { useStore } from "./store";
 
 export function ProjectsView() {
@@ -7,17 +7,27 @@ export function ProjectsView() {
   const [selected, setSelected] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [goal, setGoal] = useState("");
+  const [remote, setRemote] = useState("");
+  const [branch, setBranch] = useState("main");
+  const [token, setToken] = useState("");
+  const [showGit, setShowGit] = useState(false);
+  const [busy, setBusy] = useState(false);
 
   const create = async (e: React.FormEvent) => {
     e.preventDefault();
+    setBusy(true);
     try {
-      const p = await api.post<Project>("/projects", { name, goal });
+      const p = await api.post<Project>("/projects", { name, goal, git_remote_url: remote || undefined, git_branch: branch, git_token: token || undefined });
       setName("");
       setGoal("");
+      setRemote("");
+      setToken("");
       await reloadProjects();
       setSelected(p.id);
     } catch (err) {
       toast({ title: "Fehler", body: err instanceof ApiError ? err.message : String(err), tone: "error" });
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -29,8 +39,30 @@ export function ProjectsView() {
         <h3>Neues Projekt</h3>
         <input placeholder="Name" value={name} onChange={(e) => setName(e.target.value)} required />
         <textarea rows={2} placeholder="Ziel des Projekts (steuert u. a. die OnEmptyQueue-Vorschläge)" value={goal} onChange={(e) => setGoal(e.target.value)} />
+        <p className="muted small">Jedes Projekt ist ein Git-Repository. Ohne Remote wird ein neues Repo angelegt, mit Remote wird es geklont.</p>
+        {showGit && (
+          <div className="row wrap">
+            <label>
+              Git-Remote (optional)
+              <input placeholder="https://github.com/org/repo.git" value={remote} onChange={(e) => setRemote(e.target.value)} />
+            </label>
+            <label>
+              Branch
+              <input value={branch} onChange={(e) => setBranch(e.target.value)} />
+            </label>
+            <label>
+              Zugangstoken (für private Repos / Push)
+              <input type="password" autoComplete="off" placeholder="z. B. GitHub fine-grained PAT" value={token} onChange={(e) => setToken(e.target.value)} />
+            </label>
+          </div>
+        )}
         <div className="row">
-          <button className="primary">Anlegen</button>
+          <button className="primary" disabled={busy}>
+            {busy ? (remote ? "Klone…" : "Lege an…") : "Anlegen"}
+          </button>
+          <button type="button" className="ghost small" onClick={() => setShowGit(!showGit)}>
+            {showGit ? "Ohne Remote" : "Bestehendes Repo klonen…"}
+          </button>
         </div>
       </form>
       <div className="grid">
@@ -41,6 +73,7 @@ export function ProjectsView() {
               <span className="tag">{p.role}</span>
             </div>
             <div className="muted small">{p.description || `von ${p.owner_name}`}</div>
+            <div className="muted small mono clamp1">{p.git_remote_url ?? "lokales Git-Repo"}</div>
           </div>
         ))}
       </div>
@@ -48,7 +81,7 @@ export function ProjectsView() {
   );
 }
 
-type Tab = "settings" | "files" | "members" | "tasks";
+type Tab = "settings" | "files" | "git" | "members" | "tasks";
 
 function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
   const { reloadProjects, toast } = useStore();
@@ -86,13 +119,14 @@ function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
         </a>
       </div>
       <div className="seg">
-        {(["files", "tasks", "settings", "members"] as Tab[]).map((t) => (
+        {(["files", "git", "tasks", "settings", "members"] as Tab[]).map((t) => (
           <button key={t} className={tab === t ? "active" : ""} onClick={() => setTab(t)}>
-            {{ files: "Dateien", tasks: "Aufträge", settings: "Einstellungen", members: "Mitglieder" }[t]}
+            {{ files: "Dateien", git: "Git", tasks: "Aufträge", settings: "Einstellungen", members: "Mitglieder" }[t]}
           </button>
         ))}
       </div>
       {tab === "files" && <Files id={id} canEdit={canEdit} />}
+      {tab === "git" && <GitLog p={p} canEdit={canEdit} />}
       {tab === "tasks" && <ProjectTasks id={id} />}
       {tab === "settings" && <ProjectSettings p={p} canEdit={canEdit} onSaved={load} onDelete={p.role === "owner" ? remove : undefined} />}
       {tab === "members" && <Members id={id} isOwner={p.role === "owner"} />}
@@ -110,10 +144,15 @@ function ProjectSettings({ p, canEdit, onSaved, onDelete }: { p: Project; canEdi
     review_enabled: p.review_enabled,
     review_provider: p.review_provider ?? "",
     review_model: p.review_model ?? "",
+    git_remote_url: p.git_remote_url ?? "",
+    git_branch: p.git_branch,
+    auto_push: p.auto_push,
   });
+  const [token, setToken] = useState<string | null>(null);
   const save = async () => {
     try {
-      await api.patch(`/projects/${p.id}`, f);
+      await api.patch(`/projects/${p.id}`, token === null ? f : { ...f, git_token: token });
+      setToken(null);
       toast({ title: "Gespeichert" });
       onSaved();
       reloadProjects();
@@ -161,6 +200,32 @@ function ProjectSettings({ p, canEdit, onSaved, onDelete }: { p: Project; canEdi
           </label>
         </div>
       )}
+      <h4>Git</h4>
+      <div className="row wrap">
+        <label>
+          Remote <span className="muted">– leer = nur lokal</span>
+          <input disabled={!canEdit} placeholder="https://github.com/org/repo.git" value={f.git_remote_url} onChange={(e) => setF({ ...f, git_remote_url: e.target.value })} />
+        </label>
+        <label>
+          Branch
+          <input disabled={!canEdit} value={f.git_branch} onChange={(e) => setF({ ...f, git_branch: e.target.value })} />
+        </label>
+        <label>
+          Token {p.has_git_token && token === null && <span className="tag ok">gesetzt</span>}
+          <input
+            type="password"
+            autoComplete="off"
+            disabled={!canEdit}
+            placeholder={p.has_git_token ? "unverändert – neues eingeben oder leeren" : "optional"}
+            value={token ?? ""}
+            onChange={(e) => setToken(e.target.value)}
+          />
+        </label>
+      </div>
+      <label className="check">
+        <input type="checkbox" disabled={!canEdit || !f.git_remote_url} checked={f.auto_push} onChange={(e) => setF({ ...f, auto_push: e.target.checked })} />
+        Nach jedem erfolgreichen Auftrag automatisch pushen
+      </label>
       <div className="row">
         {canEdit && (
           <button className="primary" onClick={save}>
@@ -314,6 +379,56 @@ function Members({ id, isOwner }: { id: string; isOwner: boolean }) {
           <button className="primary small">Hinzufügen</button>
         </form>
       )}
+    </div>
+  );
+}
+
+function GitLog({ p, canEdit }: { p: Project; canEdit: boolean }) {
+  const { toast } = useStore();
+  const [commits, setCommits] = useState<Commit[]>([]);
+  const [busy, setBusy] = useState(false);
+  const load = () => api.get<Commit[]>(`/projects/${p.id}/commits`).then(setCommits);
+  useEffect(() => {
+    load();
+  }, [p.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  const push = async () => {
+    setBusy(true);
+    try {
+      await api.post(`/projects/${p.id}/push`);
+      toast({ title: `Nach ${p.git_branch} gepusht` });
+    } catch (e) {
+      toast({ title: "Push fehlgeschlagen", body: e instanceof ApiError ? e.message : String(e), tone: "error" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="stack">
+      <div className="row wrap">
+        <span className="mono small grow">
+          {p.git_remote_url ?? "lokales Repository"} · {p.git_branch}
+        </span>
+        {canEdit && p.git_remote_url && (
+          <button className="small" disabled={busy} onClick={push}>
+            {busy ? "Pushe…" : "Jetzt pushen"}
+          </button>
+        )}
+      </div>
+      <div className="list">
+        {commits.map((c) => (
+          <div key={c.sha} className="item">
+            <div className="item-main">
+              <span className="mono small muted">{c.sha.slice(0, 8)}</span>
+              <div className="grow min0">
+                <div className="title">{c.subject}</div>
+                <div className="meta muted">
+                  {c.author} · {fmtTime(c.date)}
+                </div>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

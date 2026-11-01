@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, ApiError, fmtTime, fmtTokens, type Meta, type User } from "./api";
+import { api, ApiError, budgetUsage, fmtTokens, limitChip, type Meta, type User } from "./api";
 import { StoreProvider, useStore } from "./store";
 import { QueueView } from "./Queue";
 import { ProjectsView } from "./Projects";
@@ -61,11 +61,20 @@ function Shell() {
           ))}
         </nav>
         <div className="limits">
-          {limits.map((l) => (
-            <span key={l.provider} className={l.limited_until ? "chip warn" : "chip"} title={`5h-Fenster: ${l.runs} Runs, ${fmtTokens(l.input_tokens)} in / ${fmtTokens(l.output_tokens)} out, Cache ${fmtTokens(l.cache_read_tokens)}${l.cost_usd ? `, $${l.cost_usd.toFixed(2)}` : ""}`}>
-              {l.provider} {l.limited_until ? `⏸ bis ${fmtTime(l.limited_until)}` : fmtTokens(l.input_tokens + l.output_tokens)}
-            </span>
-          ))}
+          {limits
+            .filter((l) => l.runs_5h > 0 || l.blocked || budgetUsage(l) !== null)
+            .map((l) => {
+              const c = limitChip(l);
+              return (
+                <span
+                  key={l.provider}
+                  className={`chip ${c.tone}`}
+                  title={`5h: ${fmtTokens(l.used_5h)} Tokens (${l.runs_5h} Runs, Cache ${fmtTokens(l.cache_read_5h)}) · 7 Tage: ${fmtTokens(l.used_7d)} · 30 Tage: $${l.cost_30d.toFixed(2)}${l.budget_reason ? ` · ${l.budget_reason}` : ""}`}
+                >
+                  {c.text}
+                </span>
+              );
+            })}
         </div>
       </header>
 

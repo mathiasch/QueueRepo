@@ -1,0 +1,31 @@
+[package]
+name = "queued-runner"
+version.workspace = true
+edition.workspace = true
+description = "Unprivileged executor: owns project git workspaces and runs agents in rootless sandboxes"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "queued-runner"
+path = "src/main.rs"
+
+[dependencies]
+queued-common = { path = "../common" }
+anyhow.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-stream = "0.1"
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+base64.workspace = true
+futures.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest.workspace = true

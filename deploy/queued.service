@@ -1,0 +1,33 @@
+# queued: web UI/API + scheduler. No file system or process privileges needed.
+[Unit]
+Description=queued (agentic coding queue)
+After=network-online.target queued-runner.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=queued
+Group=queued
+EnvironmentFile=/etc/queued/queued.env
+WorkingDirectory=/opt/queued
+ExecStart=/opt/queued/bin/queued
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/queued/app
+
+[Install]
+WantedBy=multi-user.target

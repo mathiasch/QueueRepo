@@ -1,0 +1,47 @@
+[package]
+name = "queued"
+version.workspace = true
+edition.workspace = true
+description = "Agentic coding task queue – orchestrator (no host privileges)"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "queued"
+path = "src/main.rs"
+
+[dependencies]
+queued-common = { path = "../common" }
+anyhow.workspace = true
+axum.workspace = true
+axum-extra = { version = "0.10", features = ["cookie"] }
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures.workspace = true
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
+uuid.workspace = true
+chrono.workspace = true
+argon2 = "0.5"
+rand = "0.8"
+base64.workspace = true
+sha2 = "0.10"
+aes-gcm = "0.10"
+reqwest.workspace = true
+jsonwebtoken = "9"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url = "2"
+time = "0.3"
+regex = "1"
+web-push = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+queued-runner = { path = "../runner" }
+tempfile.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }

@@ -1,0 +1,23 @@
+# queued-runner: owns workspaces/git, starts agents in rootless Podman.
+# Runs as the unprivileged user "queued". Rootless Podman needs the setuid
+# newuidmap/newgidmap helpers, therefore NoNewPrivileges is NOT set here.
+[Unit]
+Description=queued runner (rootless agent sandbox)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=queued
+Group=queued
+EnvironmentFile=/etc/queued/runner.env
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+ExecStart=/opt/queued/bin/queued-runner
+Restart=on-failure
+RestartSec=3
+ProtectSystem=full
+PrivateTmp=yes
+ReadWritePaths=/var/lib/queued/runner /home/queued
+
+[Install]
+WantedBy=multi-user.target

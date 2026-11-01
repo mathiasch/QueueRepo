@@ -1,0 +1,9 @@
+[package]
+name = "queued-common"
+version.workspace = true
+edition.workspace = true
+description = "Wire protocol between the queue app and the runner"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

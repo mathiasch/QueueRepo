@@ -1,0 +1,14 @@
+{
+  "name": "queued-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "test:system": "playwright test --project=system",
+    "test:ui": "playwright test --project=desktop --project=iphone --project=iphone-landscape"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "22.10.5"
+  }
+}

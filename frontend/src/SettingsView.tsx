@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, ApiError, fmtTime, type Settings } from "./api";
+import { api, ApiError, b64ToBytes, fmtTime, fmtTokens, providerLabel, type Limit, type Settings } from "./api";
 import { useStore } from "./store";
 
 const ACTIONS: [string, string, string][] = [
@@ -115,6 +115,7 @@ export function SettingsView() {
           </button>
         </div>
       </div>
+      <Budgets />
       <Credentials />
       <div className="card row">
         <div className="grow">
@@ -163,10 +164,6 @@ function PushControls() {
   );
 }
 
-function b64ToBytes(b64: string) {
-  const s = atob(b64.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (b64.length % 4)) % 4));
-  return Uint8Array.from(s, (c) => c.charCodeAt(0));
-}
 
 function Credentials() {
   const { meta, toast } = useStore();
@@ -219,7 +216,7 @@ function CredentialRow({
   return (
     <div className="cred">
       <div className="row">
-        <strong className="grow">{provider}</strong>
+        <strong className="grow">{providerLabel(provider)}</strong>
         {current ? <span className="tag ok">{KIND_LABEL[current.kind] ?? current.kind} · {fmtTime(current.updated_at)}</span> : <span className="tag">nicht verbunden</span>}
         <button className="small" onClick={() => setOpen(!open)}>
           {current ? "Ändern" : "Verbinden"}
@@ -248,6 +245,92 @@ function CredentialRow({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function Budgets() {
+  const { limits, meta } = useStore();
+  return (
+    <div className="card stack" data-testid="budgets">
+      <h3>Token-Budgets</h3>
+      <p className="muted small">
+        Rollierende Fenster pro Provider. Ist ein Budget erreicht, startet die Queue für diesen Provider keine neuen Aufträge, bis genug Verbrauch aus dem Fenster
+        gefallen ist. Gezählt werden Input + Output + Cache-Writes, Cache-Reads separat. Trifft ein echtes Abo-Limit, merkt sich die Queue den Verbrauch an diesem Punkt
+        als <em>beobachtetes Limit</em>, das ist ein guter Startwert für dein 5h-Budget.
+      </p>
+      {meta.providers.map((p) => {
+        const l = limits.find((x) => x.provider === p);
+        return l ? <BudgetRow key={p} l={l} /> : null;
+      })}
+    </div>
+  );
+}
+
+function Bar({ used, limit, label }: { used: number; limit: number | null; label: string }) {
+  const pct = limit ? Math.min(100, (used / limit) * 100) : 0;
+  return (
+    <div className="bar-wrap" title={label}>
+      <div className="bar-label small">
+        <span>{label}</span>
+        <span className="muted">{limit ? `${Math.round(pct)} %` : "kein Limit"}</span>
+      </div>
+      <div className="bar">
+        <div className={`bar-fill ${pct >= 100 ? "err" : pct >= 80 ? "warn" : ""}`} style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function BudgetRow({ l }: { l: Limit }) {
+  const { toast, reload } = useStore();
+  const [b5, setB5] = useState(l.limit_5h_tokens?.toString() ?? "");
+  const [b7, setB7] = useState(l.limit_7d_tokens?.toString() ?? "");
+  const [usd, setUsd] = useState(l.limit_30d_usd?.toString() ?? "");
+  const num = (v: string) => (v.trim() === "" ? null : Number(v));
+  const save = async () => {
+    try {
+      await api.put(`/budgets/${l.provider}`, { limit_5h_tokens: num(b5), limit_7d_tokens: num(b7), limit_30d_usd: num(usd) });
+      await reload();
+      toast({ title: `Budget für ${providerLabel(l.provider)} gespeichert` });
+    } catch (e) {
+      toast({ title: "Fehler", body: e instanceof ApiError ? e.message : String(e), tone: "error" });
+    }
+  };
+  return (
+    <div className="cred" data-testid={`budget-${l.provider}`}>
+      <div className="row">
+        <strong className="grow">{providerLabel(l.provider)}</strong>
+        {l.limited_until && <span className="tag err">Abo-Limit bis {fmtTime(l.limited_until)}</span>}
+        {l.budget_until && <span className="tag err">Budget erschöpft bis {fmtTime(l.budget_until)}</span>}
+      </div>
+      <Bar used={l.used_5h} limit={l.limit_5h_tokens} label={`5 Std.: ${fmtTokens(l.used_5h)} Tokens · ${l.runs_5h} Runs · Cache ${fmtTokens(l.cache_read_5h)}`} />
+      <Bar used={l.used_7d} limit={l.limit_7d_tokens} label={`7 Tage: ${fmtTokens(l.used_7d)} Tokens`} />
+      <Bar used={l.cost_30d} limit={l.limit_30d_usd} label={`30 Tage: $${l.cost_30d.toFixed(2)}`} />
+      <div className="row wrap">
+        <label>
+          5h-Budget (Tokens)
+          <input inputMode="numeric" value={b5} onChange={(e) => setB5(e.target.value)} placeholder="unbegrenzt" />
+        </label>
+        <label>
+          7-Tage-Budget (Tokens)
+          <input inputMode="numeric" value={b7} onChange={(e) => setB7(e.target.value)} placeholder="unbegrenzt" />
+        </label>
+        <label>
+          30-Tage-Budget (USD)
+          <input inputMode="decimal" value={usd} onChange={(e) => setUsd(e.target.value)} placeholder="unbegrenzt" />
+        </label>
+      </div>
+      <div className="row wrap">
+        <button className="small primary" onClick={save}>
+          Speichern
+        </button>
+        {l.observed_limit_tokens ? (
+          <button className="small ghost" onClick={() => setB5(String(Math.floor(l.observed_limit_tokens! * 0.9)))}>
+            Beobachtetes Limit {fmtTokens(l.observed_limit_tokens)} ({fmtTime(l.observed_at)}) → 90 % übernehmen
+          </button>
+        ) : null}
+      </div>
     </div>
   );
 }
