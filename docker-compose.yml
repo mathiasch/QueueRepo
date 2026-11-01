@@ -1,0 +1,61 @@
+# Production stack. First run:
+#   cp .env.example .env   (edit!)
+#   docker compose --profile build build agent-image
+#   docker compose up -d                       (+ --profile tunnel for Cloudflare)
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: queued
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: queued
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queued"]
+      interval: 5s
+      retries: 10
+
+  app:
+    build: .
+    image: queued:latest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://queued:${POSTGRES_PASSWORD}@db/queued
+      # Same path inside and outside the container, so agent containers
+      # started via the host docker daemon can bind-mount workspaces.
+      DATA_DIR: ${DATA_PATH:-/srv/queued}
+      HOST_DATA_DIR: ${DATA_PATH:-/srv/queued}
+      SANDBOX: docker
+    volumes:
+      - ${DATA_PATH:-/srv/queued}:${DATA_PATH:-/srv/queued}
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  # Sandbox image for agent runs (built once, used by `app` via docker run).
+  agent-image:
+    build:
+      context: .
+      dockerfile: docker/agent.Dockerfile
+    image: queued-agent:latest
+    profiles: ["build"]
+
+  # Optional: Cloudflare Tunnel → public HTTPS without open ports.
+  # In the Cloudflare dashboard route your hostname to http://app:8080.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    restart: unless-stopped
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on: [app]
+    profiles: ["tunnel"]
+
+volumes:
+  pgdata:
