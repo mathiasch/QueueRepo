@@ -18,7 +18,18 @@ Artefakte pro Paket in `docs/roadmap/`: `WPxx-plan.md`, `WPxx-impl.md` (Umsetzun
   - `cd e2e && npx playwright test` (startet den kompletten Stack selbst; Chromium unter `/opt/pw-browsers`)
 - Externe Dienste (GitHub/GitLab/Linear/Slack/Jira-APIs, echte Agent-CLIs) sind hier nicht live erreichbar: gegen lokale Fake-Server im Test (axum/wiremock-artig, eigene Implementierung im Test) testen und das im Bericht klar sagen. Der Mock-Provider (`backend/crates/app/src/agent.rs`, `MOCK_*`-Keywords) darf für neue Szenarien erweitert werden.
 - Docker-Daemon ist ggf. startbar (`dockerd &`), Podman fehlt; Sandbox-Engine in Tests ist `none`.
+- Frontend: bis WP00 abgeschlossen ist React (`frontend/`), danach Rust/Leptos – UI-Arbeit immer im aktuellen Frontend.
 - UI ist deutsch; mobile Safe-Area-Regeln (CSS-Variablen `--sat/--sab/...`, Tab-Bar unten) einhalten.
+
+## WP00 – GUI auf Rust umstellen (Reihenfolge: direkt nach WP01, vor allen anderen Paketen)
+Nutzerwunsch: das komplette Frontend in Rust statt React/TypeScript.
+- Framework: **Leptos (CSR, WASM, Build mit Trunk)** – bleibt Web-App/PWA (iPhone, Web Push, Safe Areas), E2E-Tests bleiben gültig. Abweichung (z. B. Dioxus) nur mit harter Begründung im Plan.
+- Volle Funktionsparität mit dem bisherigen React-UI (Login/Registrierung/OIDC-Buttons, Queue mit allen Sektionen, Composer inkl. Optionen, Task-Drawer mit Live-Log/Diff/Revert/Edit, Inbox, Projekte inkl. Git/Dateien/Mitglieder/Einstellungen, Einstellungen inkl. Budgets/Credentials/Push, Toasts, SSE-Live-Updates, Limit-Chips) und gleiche UX/Design (bestehendes CSS weiterverwenden, Safe-Area-Variablen, Tab-Bar unten mobil, 16px-Inputs auf Touch).
+- API-Typen nach Möglichkeit mit dem Backend teilen (z. B. DTOs in `queued-common`), keine Typ-Duplikate per Hand, wo das sauber geht.
+- PWA: Manifest, Icons, Service Worker (`sw.js` bleibt JS – Browser-Vorgabe), Push-Subscription.
+- Vitest-Tests durch Rust-Tests ersetzen (reine Logik als normale `cargo test`, DOM-nahe Logik ggf. `wasm-bindgen-test`); **alle Playwright-System- und E2E-Tests (inkl. iPhone hoch/quer) müssen ohne inhaltliche Abschwächung grün sein** – Selektoren nur anpassen, wo das Markup sich zwingend ändert.
+- React/TS-Frontend vollständig entfernen; Build in `e2e/scripts/stack.sh`, `deploy/install.sh`, `Dockerfile`, CI (`.github/workflows/ci.yml`) und README auf Trunk umstellen. `trunk` (0.22.1) und Target `wasm32-unknown-unknown` sind hier installiert; `wasm-bindgen-cli` ggf. per `cargo install` in exakt der zur Crate passenden Version (Trunk-Download von GitHub kann blockiert sein).
+- Nach WP00 gilt für alle Pakete: UI-Arbeit erfolgt im Rust-Frontend.
 
 ## WP01 – Strukturierte CLI-Integration & Fehlerklassifikation
 Wettbewerb nutzt strukturierte Signale statt Text-Parsing.
