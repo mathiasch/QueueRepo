@@ -235,6 +235,14 @@ async fn write_queue_files(workspace: &Path, files: &[(String, String)]) -> Resu
     Ok(())
 }
 
+/// Milliseconds without output. A reader may store a timestamp newer than
+/// the `now` read just before it (race between the two loads) – that means
+/// "output just now", never an underflow (panic in debug, a huge idle time
+/// and thus a false stall in release builds).
+fn idle_for(now_ms: u64, last_output_ms: u64) -> u64 {
+    now_ms.saturating_sub(last_output_ms)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StopReason {
     Timeout,
@@ -317,7 +325,7 @@ async fn run_inner(
             _ = &mut deadline => reason = Some(StopReason::Timeout),
             _ = cancel.cancelled() => reason = Some(StopReason::Cancel),
             _ = tick.tick(), if idle_ms.is_some() => {
-                let idle = started.elapsed().as_millis() as u64 - last_output.load(Ordering::Relaxed);
+                let idle = idle_for(started.elapsed().as_millis() as u64, last_output.load(Ordering::Relaxed));
                 if idle >= idle_ms.unwrap_or(u64::MAX) {
                     reason = Some(StopReason::Stall);
                 }
@@ -377,6 +385,14 @@ async fn run_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_time_never_underflows() {
+        assert_eq!(idle_for(5000, 1000), 4000);
+        // Output stored after `now` was read: no false stall.
+        assert_eq!(idle_for(1000, 1001), 0);
+        assert_eq!(idle_for(0, u64::MAX), 0);
+    }
 
     fn cfg(dir: &Path, engine: Engine) -> RunnerConfig {
         RunnerConfig {

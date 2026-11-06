@@ -5,7 +5,8 @@
 //! MOCK_TRANSIENT_ALWAYS, MOCK_AUTH, MOCK_STRUCTURED, MOCK_STRUCTURED_BAD,
 //! MOCK_TOKENS (usage lines with pauses), MOCK_TURNS (fails if a turn limit is
 //! passed), MOCK_TRAP (waits for SIGINT and flushes usage), MOCK_STDERR429,
-//! MOCK_REVIEW_LIMIT (the review run hits a rate limit).
+//! MOCK_REVIEW_LIMIT (the review run hits a rate limit), MOCK_QUIET (6 s
+//! without any output after the first usage line, then success).
 use serde_json::Value;
 
 use super::{
@@ -29,6 +30,7 @@ case "$P" in
 esac
 case "$P" in
   *MOCK_SLOW*) echo '{"type":"text","text":"working slowly"}'; sleep 30;;
+  *MOCK_QUIET*) sleep 6;;
   *MOCK_TRAP*)
     trap 'echo "{\"type\":\"usage\",\"input_tokens\":1200,\"output_tokens\":150}"; echo "{\"type\":\"text\",\"text\":\"interrupted cleanly\"}"; echo "{\"type\":\"final\",\"text\":\"interrupted cleanly\"}"; exit 130' INT
     echo '{"type":"text","text":"waiting for SIGINT"}'; sleep 30 & wait $!;;

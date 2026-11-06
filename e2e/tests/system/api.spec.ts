@@ -94,3 +94,42 @@ test("cancel crosses the process boundary", async ({ request }) => {
   await waitTask(request, t, "cancelled");
   expect(Date.now() - started).toBeLessThan(10_000);
 });
+
+test("cancel during verify across processes ends cancelled without a fix task", async ({ request }) => {
+  await apiUser(request, "verifycancel");
+  const p = await apiProject(request, { name: "VerifyCancel" });
+  await request.patch(`/api/projects/${p}`, { data: { review_enabled: false, verify_command: "echo verifying; sleep 30" } });
+  const t = (await (await request.post("/api/tasks", { data: { project_id: p, prompt: "slow verify" } })).json()).id;
+  await expect
+    .poll(async () => (await (await request.get(`/api/tasks/${t}`)).json()).events.some((e: any) => e.kind === "verify" && e.content.startsWith("$")), { timeout: 30_000 })
+    .toBe(true);
+  const started = Date.now();
+  await request.post(`/api/tasks/${t}/cancel`);
+  const c = await waitTask(request, t, "cancelled");
+  expect(Date.now() - started).toBeLessThan(10_000);
+  expect(c.task.failure_class).toBe("cancelled");
+  const tasks = await (await request.get(`/api/projects/${p}/tasks`)).json();
+  expect(tasks.filter((x: any) => x.kind === "fix")).toHaveLength(0);
+});
+
+test("resume only lifts the caller's own provider pause", async ({ playwright, baseURL }) => {
+  const a = await playwright.request.newContext({ baseURL });
+  const b = await playwright.request.newContext({ baseURL });
+  await apiUser(a, "pauseowner");
+  await apiUser(b, "pauseother");
+  const p = await apiProject(a, { name: "PauseOwner" });
+  const t = (await (await a.post("/api/tasks", { data: { project_id: p, prompt: "MOCK_AUTH login" } })).json()).id;
+  await expect
+    .poll(async () => (await (await a.get("/api/limits")).json()).find((l: any) => l.provider === "mock").paused_reason, { timeout: 30_000 })
+    .toBe("Invalid API key");
+  expect((await b.post("/api/limits/mock/resume")).status()).toBe(200);
+  const mine = (await (await a.get("/api/limits")).json()).find((l: any) => l.provider === "mock");
+  expect(mine.paused_reason).toBe("Invalid API key");
+  expect(mine.blocked).toBe(true);
+  // The pause is set just before the task is re-queued.
+  await expect.poll(async () => (await (await a.get(`/api/tasks/${t}`)).json()).task.status).toBe("queued");
+  expect([403, 404]).toContain((await b.get(`/api/tasks/${t}`)).status());
+  await a.post(`/api/tasks/${t}/cancel`);
+  await a.dispose();
+  await b.dispose();
+});

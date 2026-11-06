@@ -526,14 +526,20 @@ pub fn project_remote(st: &AppState, p: &Project) -> Option<GitRemote> {
     })
 }
 
-fn run_name(task: Uuid, label: &str) -> String {
+/// Runner-side name of a task's run (`agent`, `review`, `verify`).
+pub fn run_name(task: Uuid, label: &str) -> String {
     format!("q-{}-{label}", &task.simple().to_string()[..12])
 }
 
 /// Classes after which the next run continues the same work (keeps the
-/// task's first `snapshot_before`, so diff/revert cover all runs).
-fn continues_interrupted(task: &Task) -> bool {
+/// task's first `snapshot_before`, so diff/revert cover all runs) – but only
+/// if HEAD is still the interrupted run's partial commit (`snapshot_after`).
+/// Otherwise another task of the project ran in between (it may overtake a
+/// task in backoff), the remote was pulled or leftovers were committed as WIP,
+/// and keeping the old base would make diff/revert swallow foreign commits.
+fn continues_interrupted(task: &Task, head: &str) -> bool {
     task.snapshot_before.is_some()
+        && task.snapshot_after.as_deref() == Some(head)
         && task
             .failure_class
             .as_deref()
@@ -624,7 +630,7 @@ async fn run_inner(
     for w in &begin.warnings {
         event(st, task, "status", &format!("git: {w}")).await;
     }
-    let before = if continues_interrupted(task) {
+    let before = if continues_interrupted(task, &begin.head) {
         task.snapshot_before.clone().unwrap_or(begin.head)
     } else {
         begin.head
@@ -814,7 +820,27 @@ async fn run_inner(
             .filter(|c| !c.trim().is_empty())
         {
             event(st, task, "verify", &format!("$ {cmd}")).await;
-            if let Err(msg) = run_verify(st, task, cmd, cancel).await? {
+            let verdict = run_verify(st, task, cmd, cancel).await?;
+            if cancel.is_cancelled() {
+                // A user cancel stops the verify command – not a task failure.
+                finish(
+                    st,
+                    task.id,
+                    Finish {
+                        status: status::CANCELLED,
+                        summary: Some(summary),
+                        handoff,
+                        error: Some("abgebrochen".into()),
+                        review: None,
+                        questions: None,
+                        usage,
+                        failure_class: Some(FailureClass::Cancelled),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+            if let Err(msg) = verdict {
                 failure = Some(format!("Verifikation `{cmd}` fehlgeschlagen:\n{msg}"));
             }
         }
@@ -1010,6 +1036,17 @@ impl Committer<'_> {
             .await
     }
 
+    /// Partial commit of a run that is re-queued; remembered as
+    /// `snapshot_after`, so the next run can tell whether it continues
+    /// directly on top of it (see [`continues_interrupted`]).
+    async fn interrupted_commit(&self, suffix: String) {
+        if let Some(sha) = self.partial(suffix).await {
+            if let Err(e) = set_snapshot_after(self.st, self.task.id, &sha).await {
+                tracing::warn!("task {}: snapshot_after not stored: {e:#}", self.task.id);
+            }
+        }
+    }
+
     /// A partial commit must not turn an interruption into a crash; the next
     /// run's `begin` commits leftovers as WIP anyway.
     async fn partial(&self, suffix: String) -> Option<String> {
@@ -1075,7 +1112,7 @@ async fn interrupted(
                 // The provider failure itself was already logged.
                 _ => {}
             }
-            c.partial(format!(" (unterbrochen: {})", class.as_str()))
+            c.interrupted_commit(format!(" (unterbrochen: {})", class.as_str()))
                 .await;
             let note = match class {
                 FailureClass::Stalled => Some(note_stalled(lim.stall_secs.unwrap_or(0))),
@@ -1087,7 +1124,7 @@ async fn interrupted(
         }
         Disposition::RateLimited(reset) => {
             let until = pause_rate_limited(st, task, &task.provider, reset).await;
-            c.partial(" (unterbrochen: Limit)".into()).await;
+            c.interrupted_commit(" (unterbrochen: Limit)".into()).await;
             queue::requeue(
                 st,
                 task.id,
@@ -1132,7 +1169,8 @@ async fn interrupted(
         }
         Disposition::AuthPaused(msg) => {
             pause_auth(st, task, &task.provider, &msg).await;
-            c.partial(" (unterbrochen: Anmeldung)".into()).await;
+            c.interrupted_commit(" (unterbrochen: Anmeldung)".into())
+                .await;
             queue::requeue(
                 st,
                 task.id,
@@ -1305,6 +1343,15 @@ async fn exec(
     };
     let res = st.runner.exec(&req, tx).await;
     watcher.abort();
+    if res.is_err() {
+        // The stream broke (network drop, proxy) or the start was refused
+        // (409: an orphaned run with this name is still active). The runner
+        // only notices a vanished client on its next output line, so a
+        // silent agent would keep running and block every retry of the task.
+        if let Err(e) = st.runner.cancel(&req.name).await {
+            tracing::debug!("cancel of {} after a stream error failed: {e:#}", req.name);
+        }
+    }
     res
 }
 

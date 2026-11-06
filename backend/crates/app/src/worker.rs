@@ -23,6 +23,24 @@ pub const RESTART_NOTE: &str = "(Note: a previous run was interrupted by a serve
 /// failure (counts as a transient retry, never as a fix attempt); blocked
 /// once the retries are exhausted.
 pub async fn recover(st: &AppState) -> Result<()> {
+    // The runner may outlive the app: stop orphaned runs of these tasks, or
+    // they keep changing the workspace and every retry is refused with 409
+    // until they end (best effort, the runner may be down as well).
+    let orphans: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM tasks WHERE status='running'")
+        .fetch_all(&st.db)
+        .await?;
+    let cancels = orphans.iter().flat_map(|id| {
+        ["agent", "review", "verify"].map(|l| {
+            let name = runner::run_name(*id, l);
+            async move { st.runner.cancel(&name).await }
+        })
+    });
+    if tokio::time::timeout(Duration::from_secs(10), futures::future::join_all(cancels))
+        .await
+        .is_err()
+    {
+        tracing::warn!("cancelling orphaned runs timed out");
+    }
     let blocked: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
         "UPDATE tasks SET status='blocked', failure_class='infra', transient_retries=transient_retries+1,
                 error=$2, finished_at=now(), updated_at=now()
