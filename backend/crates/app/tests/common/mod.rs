@@ -2,8 +2,15 @@
 //! real runner in-process (engine `none`), the real app router + scheduler,
 //! all talking HTTP over loopback.
 #![allow(dead_code)]
-use std::time::Duration;
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
+use futures::StreamExt;
 use queued::{config::Config, state::AppState};
 use queued_runner::{RunnerConfig, RunnerState};
 use serde_json::{json, Value};
@@ -13,6 +20,8 @@ pub struct Harness {
     pub base: String,
     pub st: AppState,
     pub runner_dir: tempfile::TempDir,
+    /// Set with [`start_flaky`]: number of `/v1/exec` requests seen by the proxy.
+    pub exec_count: Option<Arc<AtomicUsize>>,
     _app_dir: tempfile::TempDir,
 }
 
@@ -22,19 +31,41 @@ pub struct Client {
 }
 
 pub async fn start(pool: PgPool) -> Harness {
+    start_with(pool, |_| {}).await
+}
+
+/// Like [`start`], with adjusted app config.
+pub async fn start_with(pool: PgPool, f: impl FnOnce(&mut Config)) -> Harness {
+    boot(pool, f, false).await
+}
+
+/// App talks to the runner through [`flaky_proxy`]: the first exec stream is
+/// cut after the first usage frame (runner restart / network drop).
+pub async fn start_flaky(pool: PgPool) -> Harness {
+    boot(pool, |_| {}, true).await
+}
+
+async fn boot(pool: PgPool, f: impl FnOnce(&mut Config), flaky: bool) -> Harness {
     let runner_dir = tempfile::tempdir().unwrap();
     let rs = RunnerState::new(RunnerConfig::for_tests(runner_dir.path().to_path_buf()));
     let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let runner_url = format!("http://{}", rl.local_addr().unwrap());
+    let mut runner_url = format!("http://{}", rl.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(rl, queued_runner::router(rs)).await.unwrap() });
+    let mut exec_count = None;
+    if flaky {
+        let (url, count) = flaky_proxy(runner_url).await;
+        runner_url = url;
+        exec_count = Some(count);
+    }
 
     let app_dir = tempfile::tempdir().unwrap();
-    let cfg = Config::for_tests(
+    let mut cfg = Config::for_tests(
         "unused",
         app_dir.path().to_path_buf(),
         &runner_url,
         "test-token",
     );
+    f(&mut cfg);
     let st = AppState::new(cfg, pool).unwrap();
     queued::start_worker(&st).await.unwrap();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -45,8 +76,79 @@ pub async fn start(pool: PgPool) -> Harness {
         base,
         st,
         runner_dir,
+        exec_count,
         _app_dir: app_dir,
     }
+}
+
+/// Reverse proxy in front of the runner. Everything is forwarded; the body of
+/// the first `/v1/exec` response is aborted right after the first frame that
+/// carries token usage.
+async fn flaky_proxy(upstream: String) -> (String, Arc<AtomicUsize>) {
+    use axum::{body::Body, extract::Request, response::Response};
+    let count = Arc::new(AtomicUsize::new(0));
+    let client = reqwest::Client::new();
+    let c2 = count.clone();
+    let app = axum::Router::new().fallback(move |req: Request| {
+        let (client, upstream, count) = (client.clone(), upstream.clone(), c2.clone());
+        async move {
+            let path = req
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_default();
+            let cut = path == "/v1/exec" && count.fetch_add(1, Ordering::SeqCst) == 0;
+            let mut fwd = client.request(req.method().clone(), format!("{upstream}{path}"));
+            for (k, v) in req.headers() {
+                if k != "host" && k != "content-length" {
+                    fwd = fwd.header(k, v);
+                }
+            }
+            let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let resp = fwd.body(body).send().await.unwrap();
+            let mut out = Response::builder().status(resp.status().as_u16());
+            for (k, v) in resp.headers() {
+                out = out.header(k, v);
+            }
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(64);
+            tokio::spawn(async move {
+                let mut s = resp.bytes_stream();
+                let mut buf: Vec<u8> = vec![];
+                while let Some(Ok(chunk)) = s.next().await {
+                    if !cut {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    buf.extend_from_slice(&chunk);
+                    while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                        let line: Vec<u8> = buf.drain(..=pos).collect();
+                        let usage = String::from_utf8_lossy(&line).contains("input_tokens");
+                        let _ = tx.send(Ok(line)).await;
+                        if usage {
+                            // Let the frame reach the client before the reset.
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            let _ = tx
+                                .send(Err(std::io::Error::other("connection reset (test)")))
+                                .await;
+                            return; // drops the upstream body → the runner cancels the run
+                        }
+                    }
+                }
+            });
+            out.body(Body::from_stream(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ))
+            .unwrap()
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    (url, count)
 }
 
 impl Harness {
@@ -129,6 +231,42 @@ impl Client {
         let (code, p) = self.post("/api/projects", body).await;
         assert_eq!(code, 200, "{p}");
         p["id"].as_str().unwrap().to_string()
+    }
+
+    pub async fn task_with(&self, project: &str, prompt: &str, extra: Value) -> String {
+        let mut body = json!({"project_id": project, "prompt": prompt});
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (code, t) = self.post("/api/tasks", body).await;
+        assert_eq!(code, 200, "{t}");
+        t["id"].as_str().unwrap().to_string()
+    }
+
+    pub async fn limit(&self, provider: &str) -> Value {
+        self.get("/api/limits")
+            .await
+            .1
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["provider"] == provider)
+            .unwrap()
+            .clone()
+    }
+
+    pub async fn events_of(&self, id: &str) -> Vec<(String, String)> {
+        self.task_json(id).await["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["kind"].as_str().unwrap().to_string(),
+                    e["content"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
     }
 
     pub async fn task(&self, project: &str, prompt: &str) -> String {

@@ -52,8 +52,10 @@ pub async fn put(
             .map_err(|_| AppError::bad_request("expected the JSON file content"))?;
     }
     queue::store_credential(&st, u.id, &provider, &c.kind, secret).await?;
+    // New credentials lift a pause caused by an authentication/billing failure.
+    crate::budget::clear_pause(&st.db, u.id, &provider, false).await?;
     // Clear a stale limit and let the scheduler retry blocked work.
-    sqlx::query("UPDATE tasks SET status='queued', error=NULL, updated_at=now() WHERE user_id=$1 AND provider=$2 AND status='blocked' AND error LIKE 'Keine Zugangsdaten%'")
+    sqlx::query("UPDATE tasks SET status='queued', error=NULL, failure_class=NULL, updated_at=now() WHERE user_id=$1 AND provider=$2 AND status='blocked' AND error LIKE 'Keine Zugangsdaten%'")
         .bind(u.id)
         .bind(&provider)
         .execute(&st.db)

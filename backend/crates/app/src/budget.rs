@@ -53,6 +53,9 @@ pub struct ProviderStatus {
     pub budget_reason: Option<String>,
     pub observed_limit_tokens: Option<i64>,
     pub observed_at: Option<DateTime<Utc>>,
+    /// Paused by an authentication/billing failure until credentials are
+    /// updated or the user resumes the provider.
+    pub paused_reason: Option<String>,
     pub blocked: bool,
 }
 
@@ -177,19 +180,26 @@ pub async fn set_budget(db: &PgPool, user: Uuid, provider: &str, b: &Budget) -> 
 pub async fn status(db: &PgPool, user: Uuid, provider: &str) -> sqlx::Result<ProviderStatus> {
     let w = window(db, user, provider).await?;
     let b = get_budget(db, user, provider).await?;
-    let lim: Option<(Option<DateTime<Utc>>, Option<i64>, Option<DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT CASE WHEN limited_until > now() THEN limited_until END, observed_limit_tokens, observed_at
+    let lim: Option<(
+        Option<DateTime<Utc>>,
+        Option<i64>,
+        Option<DateTime<Utc>>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT CASE WHEN limited_until > now() THEN limited_until END, observed_limit_tokens, observed_at, paused_reason
          FROM provider_limits WHERE user_id=$1 AND provider=$2",
     )
     .bind(user)
     .bind(provider)
     .fetch_optional(db)
     .await?;
-    let (limited_until, observed_limit_tokens, observed_at) = lim.unwrap_or((None, None, None));
+    let (limited_until, observed_limit_tokens, observed_at, paused_reason) =
+        lim.unwrap_or((None, None, None, None));
     let ev = evaluate(&w, &b, Utc::now());
     Ok(ProviderStatus {
         provider: provider.to_string(),
-        blocked: limited_until.is_some() || ev.is_some(),
+        blocked: limited_until.is_some() || paused_reason.is_some() || ev.is_some(),
+        paused_reason,
         budget_until: ev.as_ref().map(|e| e.0),
         budget_reason: ev.map(|e| e.1),
         window: w,
@@ -238,6 +248,45 @@ pub async fn set_limited(
     .execute(db)
     .await?;
     Ok(())
+}
+
+/// Authentication/billing failure: pause the provider until credentials are
+/// updated or the user resumes it explicitly.
+pub async fn set_paused(db: &PgPool, user: Uuid, provider: &str, reason: &str) -> sqlx::Result<()> {
+    let reason: String = reason.chars().take(500).collect();
+    sqlx::query(
+        "INSERT INTO provider_limits (user_id, provider, paused_reason) VALUES ($1,$2,$3)
+         ON CONFLICT (user_id, provider) DO UPDATE SET paused_reason=EXCLUDED.paused_reason",
+    )
+    .bind(user)
+    .bind(provider)
+    .bind(reason)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Lifts an auth pause (and with `with_limit` also a detected subscription
+/// limit). Returns whether anything was paused.
+pub async fn clear_pause(
+    db: &PgPool,
+    user: Uuid,
+    provider: &str,
+    with_limit: bool,
+) -> sqlx::Result<bool> {
+    Ok(sqlx::query(
+        "UPDATE provider_limits SET paused_reason=NULL,
+                limited_until = CASE WHEN $3 THEN NULL ELSE limited_until END
+         WHERE user_id=$1 AND provider=$2
+           AND (paused_reason IS NOT NULL OR ($3 AND limited_until > now()))",
+    )
+    .bind(user)
+    .bind(provider)
+    .bind(with_limit)
+    .execute(db)
+    .await?
+    .rows_affected()
+        > 0)
 }
 
 /// Reset estimate when the CLI didn't say: the oldest usage leaves the 5h window.

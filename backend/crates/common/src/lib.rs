@@ -122,6 +122,15 @@ pub struct ExecRequest {
     #[serde(default)]
     pub stdin: Option<String>,
     pub timeout_secs: u64,
+    /// Stop the run when it produced no stdout/stderr line for this many
+    /// seconds (stall detection). `None` = off.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+    /// Files written to `<workspace>/.queue/<name>` before the start (e.g. the
+    /// result JSON schema for CLIs that take it as a file). Names must pass
+    /// [`valid_queue_file_name`].
+    #[serde(default)]
+    pub queue_files: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -140,6 +149,12 @@ pub enum ExecFrame {
         cancelled: bool,
         #[serde(default)]
         files: Vec<(String, String)>,
+        /// Stopped by the runner because no output arrived for `idle_timeout_secs`.
+        #[serde(default)]
+        stalled: bool,
+        /// The process ignored SIGINT for the grace period and was SIGKILLed.
+        #[serde(default)]
+        killed: bool,
     },
     /// The runner could not start/finish the process.
     Fail {
@@ -157,6 +172,17 @@ pub fn valid_name(s: &str) -> bool {
         && s.len() <= 64
         && s.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Name of a file the app may place in the workspace's `.queue/` directory:
+/// `^[a-z0-9][a-z0-9._-]{0,63}$` without `..` (no paths, no traversal).
+pub fn valid_queue_file_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit())
+        && s.len() <= 64
+        && !s.contains("..")
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
 #[cfg(test)]
@@ -178,6 +204,17 @@ mod tests {
                 timed_out: false,
                 cancelled: false,
                 files: vec![("a".into(), "b".into())],
+                stalled: false,
+                killed: false,
+            },
+            ExecFrame::Exit {
+                success: false,
+                code: None,
+                timed_out: false,
+                cancelled: false,
+                files: vec![],
+                stalled: true,
+                killed: true,
             },
             ExecFrame::Fail { error: "x".into() },
         ];
@@ -200,6 +237,67 @@ mod tests {
             token: None,
         };
         assert!(!serde_json::to_string(&r).unwrap().contains("token"));
+    }
+
+    #[test]
+    fn exit_frame_from_older_runner_still_parses() {
+        let f: ExecFrame = serde_json::from_str(
+            r#"{"t":"exit","success":true,"code":0,"timed_out":false,"cancelled":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            f,
+            ExecFrame::Exit {
+                success: true,
+                code: Some(0),
+                timed_out: false,
+                cancelled: false,
+                files: vec![],
+                stalled: false,
+                killed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn exec_request_new_fields_default_and_roundtrip() {
+        let old: ExecRequest =
+            serde_json::from_str(r#"{"name":"n","workspace":"w","program":"sh","timeout_secs":5}"#)
+                .unwrap();
+        assert_eq!(old.idle_timeout_secs, None);
+        assert!(old.queue_files.is_empty());
+        let mut r = old.clone();
+        r.idle_timeout_secs = Some(30);
+        r.queue_files = vec![("result.schema.json".into(), "{}".into())];
+        let back: ExecRequest = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.idle_timeout_secs, Some(30));
+        assert_eq!(back.queue_files, r.queue_files);
+    }
+
+    #[test]
+    fn validates_queue_file_names() {
+        for ok in [
+            "result.schema.json",
+            "review.schema.json",
+            "a",
+            "x_1-2.json",
+        ] {
+            assert!(valid_queue_file_name(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".hidden",
+            "../x",
+            "a/b",
+            "a..b",
+            "Result.json",
+            "-x",
+            "a b",
+            &"a".repeat(65),
+        ] {
+            assert!(!valid_queue_file_name(bad), "{bad}");
+        }
+        assert!(valid_queue_file_name(&"a".repeat(64)));
     }
 
     #[test]

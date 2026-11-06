@@ -1,13 +1,34 @@
 //! Task persistence helpers shared by API, runner and scheduler.
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::{
     agent::Credential,
     crypto,
-    models::{Settings, Task, Usage},
+    models::{FailureClass, Settings, Task, Usage},
     state::AppState,
 };
+
+/// Task-level limit overrides (NULL = project default / global).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TaskLimits {
+    pub max_runtime_secs: Option<i32>,
+    pub max_cost_usd: Option<f64>,
+    pub max_tokens: Option<i64>,
+    pub max_turns: Option<i32>,
+}
+
+impl TaskLimits {
+    pub fn of(t: &Task) -> Self {
+        Self {
+            max_runtime_secs: t.max_runtime_secs,
+            max_cost_usd: t.max_cost_usd,
+            max_tokens: t.max_tokens,
+            max_turns: t.max_turns,
+        }
+    }
+}
 
 pub struct NewTask {
     pub user_id: Uuid,
@@ -25,15 +46,18 @@ pub struct NewTask {
     pub created_by_agent: bool,
     /// Insert at the head of the user's queue.
     pub front: bool,
+    pub limits: TaskLimits,
 }
 
 pub async fn insert_task(st: &AppState, t: NewTask) -> sqlx::Result<Task> {
     let task = sqlx::query_as::<_, Task>(
         "INSERT INTO tasks (id, user_id, project_id, parent_id, kind, title, prompt, context, provider, model, status,
-                            attempt, depth, created_by_agent, position)
+                            attempt, depth, created_by_agent, position,
+                            max_runtime_secs, max_cost_usd, max_tokens, max_turns)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
                  CASE WHEN $15 THEN (SELECT COALESCE(MIN(position), 0) - 1 FROM tasks WHERE user_id = $2 AND status = 'queued')
-                      ELSE nextval('task_position_seq') END)
+                      ELSE nextval('task_position_seq') END,
+                 $16,$17,$18,$19)
          RETURNING *",
     )
     .bind(Uuid::new_v4())
@@ -51,6 +75,10 @@ pub async fn insert_task(st: &AppState, t: NewTask) -> sqlx::Result<Task> {
     .bind(t.depth)
     .bind(t.created_by_agent)
     .bind(t.front)
+    .bind(t.limits.max_runtime_secs)
+    .bind(t.limits.max_cost_usd)
+    .bind(t.limits.max_tokens)
+    .bind(t.limits.max_turns)
     .fetch_one(&st.db)
     .await?;
     st.emit(task.user_id, json!({"type": "task", "task": task}));
@@ -97,12 +125,15 @@ pub struct Finish<'a> {
     pub review: Option<Value>,
     pub questions: Option<Value>,
     pub usage: &'a Usage,
+    /// `None` for a normal end (done / waiting for input).
+    pub failure_class: Option<FailureClass>,
 }
 
 pub async fn finish(st: &AppState, id: Uuid, f: Finish<'_>) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE tasks SET status=$2, summary=COALESCE($3, summary), handoff=COALESCE($4, handoff), error=$5,
-                review=COALESCE($6, review), questions=$7, usage=$8, finished_at=now(), updated_at=now()
+                review=COALESCE($6, review), questions=$7, usage=$8, failure_class=$9, not_before=NULL,
+                finished_at=now(), updated_at=now()
          WHERE id=$1",
     )
     .bind(id)
@@ -113,10 +144,55 @@ pub async fn finish(st: &AppState, id: Uuid, f: Finish<'_>) -> sqlx::Result<()> 
     .bind(f.review)
     .bind(f.questions)
     .bind(serde_json::to_value(f.usage).unwrap_or_default())
+    .bind(f.failure_class.map(FailureClass::as_str))
     .execute(&st.db)
     .await?;
     emit_task(st, id).await;
     Ok(())
+}
+
+/// Puts a running task back into the queue without consuming a fix attempt.
+/// `note` (for the next agent) is appended to the context only once.
+pub struct Requeue<'a> {
+    pub class: FailureClass,
+    /// New value of `transient_retries`.
+    pub transient_retries: i32,
+    pub not_before: Option<DateTime<Utc>>,
+    pub note: Option<&'a str>,
+    pub error: Option<String>,
+    pub usage: &'a Usage,
+}
+
+pub async fn requeue(st: &AppState, id: Uuid, r: Requeue<'_>) -> sqlx::Result<bool> {
+    let n = sqlx::query(
+        "UPDATE tasks SET status='queued', started_at=NULL, updated_at=now(), failure_class=$2,
+                transient_retries=$3, not_before=$4, error=$5, usage=$6,
+                context = CASE WHEN $7::text IS NULL OR position($7 in context) > 0 THEN context
+                               ELSE context || $7 END
+         WHERE id=$1 AND status='running'",
+    )
+    .bind(id)
+    .bind(r.class.as_str())
+    .bind(r.transient_retries)
+    .bind(r.not_before)
+    .bind(r.error)
+    .bind(serde_json::to_value(r.usage).unwrap_or_default())
+    .bind(r.note.map(|n| format!("\n\n{n}")))
+    .execute(&st.db)
+    .await?
+    .rows_affected();
+    emit_task(st, id).await;
+    if let Some(t) = r.not_before {
+        // Wake the scheduler when the backoff is over (it polls only every TICK_SECS).
+        let wake = st.wake.clone();
+        let d = (t - Utc::now()).to_std().unwrap_or_default();
+        tokio::spawn(async move {
+            tokio::time::sleep(d).await;
+            wake.notify_one();
+        });
+    }
+    st.wake.notify_one();
+    Ok(n > 0)
 }
 
 pub async fn load_settings(st: &AppState, user_id: Uuid) -> sqlx::Result<Settings> {

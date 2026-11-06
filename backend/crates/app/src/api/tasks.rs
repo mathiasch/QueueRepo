@@ -6,12 +6,15 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::projects::{require, runner_err, Role};
+use super::{
+    limits::TaskLimitFields,
+    projects::{require, runner_err, Role},
+};
 use crate::{
     auth::AuthUser,
     error::{ApiResult, AppError},
     models::{status, Task, TaskEvent},
-    queue::{self, NewTask},
+    queue::{self, NewTask, TaskLimits},
     state::AppState,
 };
 
@@ -51,6 +54,8 @@ pub struct CreateTask {
     parent_id: Option<Uuid>,
     #[serde(default)]
     front: bool,
+    #[serde(flatten)]
+    limits: TaskLimitFields,
 }
 
 pub async fn create(
@@ -62,6 +67,7 @@ pub async fn create(
     if c.prompt.trim().is_empty() {
         return Err(AppError::bad_request("prompt required"));
     }
+    let lim = c.limits.check()?;
     let settings = queue::load_settings(&st, u.id).await?;
     let provider = c
         .provider
@@ -108,6 +114,12 @@ pub async fn create(
             depth: 0,
             created_by_agent: false,
             front: c.front,
+            limits: TaskLimits {
+                max_runtime_secs: lim.max_runtime_secs.flatten(),
+                max_cost_usd: lim.max_cost_usd.flatten(),
+                max_tokens: lim.max_tokens.flatten(),
+                max_turns: lim.max_turns.flatten(),
+            },
         },
     )
     .await?;
@@ -141,6 +153,8 @@ pub struct UpdateTask {
     context: Option<String>,
     provider: Option<String>,
     model: Option<String>,
+    #[serde(flatten)]
+    limits: TaskLimitFields,
 }
 
 pub async fn update(
@@ -164,9 +178,15 @@ pub async fn update(
             return Err(AppError::bad_request("unknown provider"));
         }
     }
+    let lim = c.limits.check()?;
     sqlx::query(
         "UPDATE tasks SET title=COALESCE($2,title), prompt=COALESCE($3,prompt), context=COALESCE($4,context),
-                provider=COALESCE($5,provider), model=CASE WHEN $6::text IS NULL THEN model ELSE NULLIF($6,'') END, updated_at=now()
+                provider=COALESCE($5,provider), model=CASE WHEN $6::text IS NULL THEN model ELSE NULLIF($6,'') END,
+                max_runtime_secs = CASE WHEN $7 THEN $8 ELSE max_runtime_secs END,
+                max_cost_usd = CASE WHEN $9 THEN $10 ELSE max_cost_usd END,
+                max_tokens = CASE WHEN $11 THEN $12 ELSE max_tokens END,
+                max_turns = CASE WHEN $13 THEN $14 ELSE max_turns END,
+                updated_at=now()
          WHERE id=$1",
     )
     .bind(id)
@@ -175,6 +195,14 @@ pub async fn update(
     .bind(c.context)
     .bind(c.provider)
     .bind(c.model)
+    .bind(lim.max_runtime_secs.is_some())
+    .bind(lim.max_runtime_secs.flatten())
+    .bind(lim.max_cost_usd.is_some())
+    .bind(lim.max_cost_usd.flatten())
+    .bind(lim.max_tokens.is_some())
+    .bind(lim.max_tokens.flatten())
+    .bind(lim.max_turns.is_some())
+    .bind(lim.max_turns.flatten())
     .execute(&st.db)
     .await?;
     queue::emit_task(&st, id).await;
@@ -239,6 +267,7 @@ pub async fn retry(
     }
     sqlx::query(
         "UPDATE tasks SET status='queued', attempt=0, error=NULL, finished_at=NULL, updated_at=now(),
+                transient_retries=0, not_before=NULL, failure_class=NULL, usage=NULL,
                 position=nextval('task_position_seq') WHERE id=$1",
     )
     .bind(id)

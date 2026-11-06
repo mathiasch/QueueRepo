@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use super::limits::{self, double_option};
 use crate::{
     auth::AuthUser,
     crypto,
@@ -240,6 +241,17 @@ pub struct UpdateProject {
     /// New token; empty string removes it; absent keeps it.
     git_token: Option<String>,
     auto_push: Option<bool>,
+    /// Limits per task run: absent = unchanged, `null` = back to the default.
+    #[serde(default, deserialize_with = "double_option")]
+    max_runtime_secs: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    stall_timeout_secs: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    max_cost_usd: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    max_tokens: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    max_turns: Option<Option<i64>>,
 }
 
 pub async fn update(
@@ -249,6 +261,20 @@ pub async fn update(
     Json(p): Json<UpdateProject>,
 ) -> ApiResult<Json<Project>> {
     require(&st, id, u.id, Role::Editor).await?;
+    limits::int(
+        "Max. Laufzeit (Sekunden)",
+        p.max_runtime_secs.flatten(),
+        limits::RUNTIME,
+    )?;
+    limits::int(
+        "Stillstand (Sekunden)",
+        p.stall_timeout_secs.flatten(),
+        limits::STALL,
+    )?;
+    limits::int("Max. Tokens", p.max_tokens.flatten(), limits::TOKENS)?;
+    limits::int("Max. Turns", p.max_turns.flatten(), limits::TURNS)?;
+    limits::cost(p.max_cost_usd.flatten())?;
+    let narrow = |v: Option<Option<i64>>| v.flatten().map(|x| x as i32);
     let trim = |s: Option<String>| s.map(|v| v.trim().to_string());
     if let Some(url) = p
         .git_remote_url
@@ -280,7 +306,12 @@ pub async fn update(
             git_remote_url = CASE WHEN $9::text IS NULL THEN git_remote_url ELSE NULLIF($9, '') END,
             git_branch = COALESCE(NULLIF($10, ''), git_branch),
             git_token_enc = CASE WHEN $11 THEN $12 ELSE git_token_enc END,
-            auto_push = COALESCE($13, auto_push)
+            auto_push = COALESCE($13, auto_push),
+            max_runtime_secs = CASE WHEN $14 THEN $15 ELSE max_runtime_secs END,
+            stall_timeout_secs = CASE WHEN $16 THEN $17 ELSE stall_timeout_secs END,
+            max_cost_usd = CASE WHEN $18 THEN $19 ELSE max_cost_usd END,
+            max_tokens = CASE WHEN $20 THEN $21 ELSE max_tokens END,
+            max_turns = CASE WHEN $22 THEN $23 ELSE max_turns END
          WHERE id=$1 RETURNING *",
     )
     .bind(id)
@@ -296,8 +327,19 @@ pub async fn update(
     .bind(token_set)
     .bind(token_enc)
     .bind(p.auto_push)
+    .bind(p.max_runtime_secs.is_some())
+    .bind(narrow(p.max_runtime_secs))
+    .bind(p.stall_timeout_secs.is_some())
+    .bind(narrow(p.stall_timeout_secs))
+    .bind(p.max_cost_usd.is_some())
+    .bind(p.max_cost_usd.flatten())
+    .bind(p.max_tokens.is_some())
+    .bind(p.max_tokens.flatten())
+    .bind(p.max_turns.is_some())
+    .bind(narrow(p.max_turns))
     .fetch_one(&st.db)
     .await?;
+    st.wake.notify_one();
     Ok(Json(project))
 }
 

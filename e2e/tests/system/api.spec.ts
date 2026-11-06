@@ -55,6 +55,34 @@ test("budget pauses the queue across processes", async ({ request }) => {
   await waitTask(request, t2, "done");
 });
 
+test("transient provider error is retried across processes without a fix task", async ({ request }) => {
+  await apiUser(request, "transient");
+  const p = await apiProject(request, { name: "Transient" });
+  const t = (await (await request.post("/api/tasks", { data: { project_id: p, prompt: "MOCK_TRANSIENT flaky" } })).json()).id;
+  const d = await waitTask(request, t, "done");
+  expect(d.task.attempt).toBe(0);
+  expect(d.task.transient_retries).toBe(1);
+  expect(d.task.failure_class).toBeNull();
+  expect(d.events.some((e) => e.kind === "retry")).toBe(true);
+  const tasks = await (await request.get(`/api/projects/${p}/tasks`)).json();
+  expect(tasks.filter((x: any) => x.kind === "fix")).toHaveLength(0);
+});
+
+test("SIGINT cancel flushes usage across processes", async ({ request }) => {
+  await apiUser(request, "sigint");
+  const p = await apiProject(request, { name: "Sigint" });
+  const t = (await (await request.post("/api/tasks", { data: { project_id: p, prompt: "MOCK_TRAP long" } })).json()).id;
+  await expect
+    .poll(async () => (await (await request.get(`/api/tasks/${t}`)).json()).events.some((e: any) => e.content === "waiting for SIGINT"), { timeout: 30_000 })
+    .toBe(true);
+  const started = Date.now();
+  await request.post(`/api/tasks/${t}/cancel`);
+  const c = await waitTask(request, t, "cancelled");
+  expect(Date.now() - started).toBeLessThan(10_000);
+  expect(c.task.usage.input_tokens).toBe(2400);
+  expect(c.events.some((e) => e.content === "interrupted cleanly")).toBe(true);
+});
+
 test("cancel crosses the process boundary", async ({ request }) => {
   await apiUser(request, "cancel");
   const p = await apiProject(request, { name: "Cancel" });

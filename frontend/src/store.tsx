@@ -103,7 +103,7 @@ export function StoreProvider({ me, meta, children }: { me: User; meta: Meta; ch
           case "notification": {
             const n: Notification = { ...msg.notification, read_at: null, created_at: new Date().toISOString() };
             setNotifications((ns) => [n, ...ns]);
-            toast({ title: n.title, body: n.body, taskId: n.task_id, tone: ["blocked", "task_failed"].includes(n.kind) ? "error" : "info" });
+            toast({ title: n.title, body: n.body, taskId: n.task_id, tone: ["blocked", "task_failed", "provider_paused"].includes(n.kind) ? "error" : "info" });
             break;
           }
           case "resync":

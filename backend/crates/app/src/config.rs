@@ -17,8 +17,16 @@ pub struct Config {
     pub allow_registration: bool,
     pub runner_url: String,
     pub runner_token: String,
+    /// Default runtime limit per agent run (project/task limits override it).
     pub task_timeout_min: u64,
     pub verify_timeout_min: u64,
+    /// Stop a run after this many seconds without any output (0 = off).
+    /// Env: `STALL_TIMEOUT_MIN`.
+    pub stall_timeout_secs: u64,
+    /// Re-queues for transient provider/infra/stall failures before a task is blocked.
+    pub transient_max_retries: i32,
+    pub backoff_base_secs: u64,
+    pub backoff_max_secs: u64,
     /// Fallback pause when a rate limit is detected but no reset time could be parsed.
     pub limit_fallback_min: i64,
     pub enable_mock_provider: bool,
@@ -66,6 +74,10 @@ impl Config {
             runner_token: var("RUNNER_TOKEN").context("RUNNER_TOKEN is required")?,
             task_timeout_min: num("TASK_TIMEOUT_MIN", 60),
             verify_timeout_min: num("VERIFY_TIMEOUT_MIN", 15),
+            stall_timeout_secs: num::<u64>("STALL_TIMEOUT_MIN", 20).saturating_mul(60),
+            transient_max_retries: num::<i32>("TRANSIENT_MAX_RETRIES", 5).max(0),
+            backoff_base_secs: num::<u64>("TRANSIENT_BACKOFF_BASE_SECS", 30).max(1),
+            backoff_max_secs: num::<u64>("TRANSIENT_BACKOFF_MAX_SECS", 900).max(1),
             limit_fallback_min: num("LIMIT_FALLBACK_MIN", 60),
             enable_mock_provider: flag("ENABLE_MOCK_PROVIDER", false),
             vapid_subject: var("VAPID_SUBJECT").unwrap_or_else(|| "mailto:admin@localhost".into()),
@@ -95,6 +107,11 @@ impl Config {
             runner_token: runner_token.into(),
             task_timeout_min: 1,
             verify_timeout_min: 1,
+            // Off, so long-running mock scenarios (MOCK_SLOW) behave as before.
+            stall_timeout_secs: 0,
+            transient_max_retries: 2,
+            backoff_base_secs: 1,
+            backoff_max_secs: 2,
             limit_fallback_min: 60,
             enable_mock_provider: true,
             vapid_subject: "mailto:test@localhost".into(),

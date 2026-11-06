@@ -161,6 +161,7 @@ h2 { font-size: 18px; } h3 { font-size: 15px; } h4 { font-size: 13px; text-trans
 .tag.agent { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
 .tag.ok { color: var(--ok); }
 .tag.err { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, transparent); }
+.tag.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
 .chip.err { border-color: var(--err); color: var(--err); }
 .clamp1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bar-wrap { display: flex; flex-direction: column; gap: 3px; }
@@ -199,7 +200,8 @@ h2 { font-size: 18px; } h3 { font-size: 15px; } h4 { font-size: 13px; text-trans
 .ev .content { white-space: pre-wrap; word-break: break-word; }
 .ev-tool .content { color: var(--accent); }
 .ev-error .content, .ev-stderr .content { color: var(--err); }
-.ev-limit .content { color: var(--warn); }
+.ev-limit .content, .ev-retry .content, .ev-guard .content { color: var(--warn); }
+.ev-contract .content { color: var(--muted); }
 .ev-review .content, .ev-verify .content { color: var(--ok); }
 .diff { background: var(--panel-2); border-radius: 8px; padding: 8px 0; overflow-x: auto; margin: 0; max-height: 520px; }
 .diff div { padding: 0 12px; white-space: pre; }

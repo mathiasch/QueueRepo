@@ -153,6 +153,11 @@ mod tests {
             git_branch: "main".into(),
             git_token_enc: None,
             auto_push: false,
+            max_runtime_secs: None,
+            stall_timeout_secs: None,
+            max_cost_usd: None,
+            max_tokens: None,
+            max_turns: None,
         }
     }
 
@@ -185,6 +190,13 @@ mod tests {
             started_at: None,
             finished_at: None,
             updated_at: Utc::now(),
+            max_runtime_secs: None,
+            max_cost_usd: None,
+            max_tokens: None,
+            max_turns: None,
+            failure_class: None,
+            transient_retries: 0,
+            not_before: None,
         }
     }
 

@@ -44,7 +44,28 @@ export type Task = {
   started_at: string | null;
   finished_at: string | null;
   updated_at: string;
+  max_runtime_secs: number | null;
+  max_cost_usd: number | null;
+  max_tokens: number | null;
+  max_turns: number | null;
+  failure_class: FailureClass | null;
+  transient_retries: number;
+  not_before: string | null;
 };
+
+export type FailureClass =
+  | "task"
+  | "rate_limit"
+  | "provider_transient"
+  | "infra"
+  | "stalled"
+  | "provider_auth"
+  | "config"
+  | "limit_runtime"
+  | "limit_cost"
+  | "limit_tokens"
+  | "limit_turns"
+  | "cancelled";
 
 export type TaskEvent = { id: number; ts: string; kind: string; content: string };
 
@@ -67,6 +88,11 @@ export type Project = {
   auto_push: boolean;
   has_git_token: boolean;
   role: "owner" | "editor" | "viewer";
+  max_runtime_secs: number | null;
+  stall_timeout_secs: number | null;
+  max_cost_usd: number | null;
+  max_tokens: number | null;
+  max_turns: number | null;
 };
 
 export type Settings = {
@@ -96,6 +122,7 @@ export type Limit = {
   budget_reason: string | null;
   observed_limit_tokens: number | null;
   observed_at: string | null;
+  paused_reason: string | null;
   blocked: boolean;
 };
 
@@ -115,7 +142,11 @@ export type Meta = {
   credential_kinds: Record<string, string[]>;
   oidc: { id: string; name: string }[];
   allow_registration: boolean;
+  provider_capabilities?: Record<string, ProviderCapabilities>;
+  cli_versions?: Record<string, string>;
 };
+
+export type ProviderCapabilities = { structured_output: boolean; max_turns: boolean; max_cost: boolean; live_usage: boolean };
 
 export type User = { id: string; email: string; name: string; is_admin: boolean };
 
@@ -198,11 +229,73 @@ export function budgetUsage(l: Limit): number | null {
 
 export function limitChip(l: Limit): { text: string; tone: "" | "warn" | "err" } {
   const name = providerLabel(l.provider);
+  if (l.paused_reason) return { text: `${name} ⏸ pausiert (Anmeldung)`, tone: "err" };
   if (l.limited_until) return { text: `${name} ⏸ Abo-Limit bis ${fmtTime(l.limited_until)}`, tone: "err" };
   if (l.budget_until) return { text: `${name} ⏸ Budget bis ${fmtTime(l.budget_until)}`, tone: "err" };
   const u = budgetUsage(l);
   if (u !== null) return { text: `${name} ${Math.round(u * 100)} %`, tone: u >= 0.8 ? "warn" : "" };
   return { text: `${name} ${fmtTokens(l.used_5h)}`, tone: "" };
+}
+
+export const FAILURE_LABEL: Record<FailureClass, string> = {
+  task: "Task-Fehler",
+  rate_limit: "Abo-Limit",
+  provider_transient: "Provider gestört",
+  infra: "Infrastruktur",
+  stalled: "Stillstand",
+  provider_auth: "Anmeldung/Abrechnung",
+  config: "Konfiguration",
+  limit_runtime: "Limit: Laufzeit",
+  limit_cost: "Limit: Kosten",
+  limit_tokens: "Limit: Tokens",
+  limit_turns: "Limit: Turns",
+  cancelled: "Abgebrochen",
+};
+
+/** Queue-row tag for runs that ended for a reason other than a plain task failure (those show "Fix"). */
+export function failureTag(t: Pick<Task, "failure_class" | "status">): { text: string; tone: "warn" | "err" } | null {
+  const c = t.failure_class;
+  if (!c || c === "task" || c === "cancelled" || t.status === "done") return null;
+  return { text: FAILURE_LABEL[c], tone: t.status === "blocked" ? "err" : "warn" };
+}
+
+/** "wartet bis 14:05:10 (Wiederholung 2)" for a re-queued task in backoff. */
+export function retryHint(t: Pick<Task, "status" | "not_before" | "transient_retries">, now: Date = new Date()): string | null {
+  if (t.status !== "queued" || !t.not_before) return null;
+  const at = new Date(t.not_before);
+  if (at.getTime() <= now.getTime()) return null;
+  const hhmm = at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return `wartet bis ${hhmm}${t.transient_retries > 0 ? ` (Wiederholung ${t.transient_retries})` : ""}`;
+}
+
+/** Seconds → minutes for an input field ("" = not set). */
+export const secsToMin = (s: number | null | undefined) => (s === null || s === undefined ? "" : String(Math.round((s / 60) * 100) / 100));
+
+/** Minutes from an input field → seconds (null = not set). Throws on invalid input. */
+export function minToSecs(v: string): number | null {
+  const n = numOrNull(v);
+  if (n === null) return null;
+  if (n < 0) throw new Error(`Ungültige Minutenangabe: ${v}`);
+  return Math.round(n * 60);
+}
+
+/** Number from an input field (null = not set, comma allowed). Throws on invalid input. */
+export function numOrNull(v: string): number | null {
+  const t = v.trim().replace(",", ".");
+  if (t === "") return null;
+  const n = Number(t);
+  if (!Number.isFinite(n)) throw new Error(`Ungültige Zahl: ${v}`);
+  return n;
+}
+
+/** Limits set directly on a task, human-readable. */
+export function taskLimits(t: Pick<Task, "max_runtime_secs" | "max_cost_usd" | "max_tokens" | "max_turns">): string[] {
+  const out: string[] = [];
+  if (t.max_runtime_secs) out.push(`Laufzeit ${secsToMin(t.max_runtime_secs)} Min.`);
+  if (t.max_cost_usd) out.push(`Kosten $${t.max_cost_usd}`);
+  if (t.max_tokens) out.push(`Tokens ${fmtTokens(t.max_tokens)}`);
+  if (t.max_turns) out.push(`Turns ${t.max_turns}`);
+  return out;
 }
 
 export function b64ToBytes(b64: string) {

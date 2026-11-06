@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, duration, fmtTime, STATUS_LABEL, type Task } from "./api";
+import { api, ApiError, duration, failureTag, fmtTime, retryHint, STATUS_LABEL, type Task } from "./api";
 import { useStore } from "./store";
 
 export function QueueView({ goProjects }: { goProjects: () => void }) {
@@ -244,6 +244,8 @@ function TaskRow({ t, index, count }: { t: Task; index?: number; count?: number 
   const { setOpenTask, projects, lastEvent } = useStore();
   const project = projects.find((p) => p.id === t.project_id);
   const ev = lastEvent[t.id];
+  const ftag = failureTag(t);
+  const hint = retryHint(t);
   const act = (path: string, body?: unknown) => (e: React.MouseEvent) => {
     e.stopPropagation();
     api.post(`/tasks/${t.id}/${path}`, body);
@@ -258,6 +260,11 @@ function TaskRow({ t, index, count }: { t: Task; index?: number; count?: number 
             {t.kind === "fix" && <span className="tag fix">Fix</span>}
             {t.kind === "onempty" && <span className="tag auto">Auto</span>}
             {t.created_by_agent && t.kind === "task" && <span className="tag agent">Agent</span>}
+            {ftag && (
+              <span className={`tag ${ftag.tone}`} data-testid="failure-tag">
+                {ftag.text}
+              </span>
+            )}
             {t.title}
           </div>
           <div className="meta muted">
@@ -265,6 +272,7 @@ function TaskRow({ t, index, count }: { t: Task; index?: number; count?: number 
             {t.model ? `/${t.model}` : ""}
             {t.status === "running" && ` · ${duration(t.started_at, null)}`}
             {t.finished_at && ` · ${fmtTime(t.finished_at)}`}
+            {hint && ` · ${hint}`}
             {t.status === "running" && ev && <span className="live"> · {ev.content.split("\n")[0].slice(0, 120)}</span>}
             {(t.status === "done" || t.status === "failed" || t.status === "blocked") && t.summary && <span> · {t.summary.split("\n")[0].slice(0, 120)}</span>}
           </div>

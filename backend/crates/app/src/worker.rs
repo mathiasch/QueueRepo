@@ -16,17 +16,55 @@ use crate::{
     state::AppState,
 };
 
+/// Note for the next agent after an app restart interrupted its run.
+pub const RESTART_NOTE: &str = "(Note: a previous run was interrupted by a server restart; the workspace may contain partial changes.)";
+
+/// Tasks that were running when the app stopped: re-queued as `infra`
+/// failure (counts as a transient retry, never as a fix attempt); blocked
+/// once the retries are exhausted.
 pub async fn recover(st: &AppState) -> Result<()> {
+    let blocked: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+        "UPDATE tasks SET status='blocked', failure_class='infra', transient_retries=transient_retries+1,
+                error=$2, finished_at=now(), updated_at=now()
+         WHERE status='running' AND transient_retries + 1 > $1
+         RETURNING id, user_id, title",
+    )
+    .bind(st.cfg.transient_max_retries)
+    .bind(format!(
+        "Nach {} Wiederholungen aufgegeben: Lauf durch Server-Neustart unterbrochen.",
+        st.cfg.transient_max_retries
+    ))
+    .fetch_all(&st.db)
+    .await?;
+    for (id, user, title) in &blocked {
+        crate::notify::notify(
+            st,
+            *user,
+            crate::notify::Note {
+                kind: "blocked",
+                title: format!("Blockiert: {title}"),
+                body: "Zu viele unterbrochene Läufe (Server-Neustart).".into(),
+                task_id: Some(*id),
+                push: true,
+            },
+        )
+        .await;
+    }
     let n = sqlx::query(
-        "UPDATE tasks SET status='queued', started_at=NULL, updated_at=now(),
-                context = context || E'\\n\\n(Note: a previous run was interrupted by a server restart; the workspace may contain partial changes.)'
+        "UPDATE tasks SET status='queued', started_at=NULL, updated_at=now(), failure_class='infra',
+                transient_retries=transient_retries+1, not_before=now(),
+                context = CASE WHEN position($1 in context) > 0 THEN context ELSE context || $1 END
          WHERE status='running'",
     )
+    .bind(format!("\n\n{RESTART_NOTE}"))
     .execute(&st.db)
     .await?
     .rows_affected();
-    if n > 0 {
-        tracing::info!("re-queued {n} interrupted task(s)");
+    if n > 0 || !blocked.is_empty() {
+        tracing::info!(
+            "re-queued {n} interrupted task(s), blocked {}",
+            blocked.len()
+        );
     }
     Ok(())
 }
@@ -85,13 +123,15 @@ async fn tick(st: &AppState) -> Result<()> {
 }
 
 /// Claims the next runnable task. `blocked` = providers paused by a
-/// subscription limit or an exhausted token budget.
+/// subscription limit, an auth failure or an exhausted token budget. Tasks
+/// in backoff (`not_before` in the future) are skipped.
 async fn claim_next(st: &AppState, user_id: Uuid, blocked: &[String]) -> Result<Option<Task>> {
     Ok(sqlx::query_as::<_, Task>(
-        "UPDATE tasks SET status='running', started_at=now(), updated_at=now(), error=NULL
+        "UPDATE tasks SET status='running', started_at=now(), updated_at=now(), error=NULL, not_before=NULL
          WHERE id = (
             SELECT t.id FROM tasks t
             WHERE t.user_id = $1 AND t.status = 'queued'
+              AND (t.not_before IS NULL OR t.not_before <= now())
               AND NOT EXISTS (SELECT 1 FROM tasks r WHERE r.project_id = t.project_id AND r.status = 'running')
               AND NOT (t.provider = ANY($2))
             ORDER BY t.position
@@ -179,6 +219,7 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
             depth: 0,
             created_by_agent: true,
             front: false,
+            limits: Default::default(),
         },
     )
     .await?;

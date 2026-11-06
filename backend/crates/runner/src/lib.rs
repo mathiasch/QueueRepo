@@ -36,6 +36,9 @@ pub struct RunnerConfig {
     pub docker_user: Option<String>,
     /// Extra bind-mount options, e.g. `Z` for SELinux hosts.
     pub volume_opts: String,
+    /// Seconds a process gets after SIGINT (cancel/timeout/stall) to finish
+    /// its turn and flush output before it is SIGKILLed.
+    pub kill_grace_secs: u64,
 }
 
 impl RunnerConfig {
@@ -54,6 +57,7 @@ impl RunnerConfig {
             cpus: "1".into(),
             docker_user: None,
             volume_opts: String::new(),
+            kill_grace_secs: 2,
         }
     }
 }
@@ -484,6 +488,8 @@ mod tests {
             read_back: vec![],
             stdin: None,
             timeout_secs: 10,
+            idle_timeout_secs: None,
+            queue_files: vec![("result.schema.json".into(), "{\"type\":\"object\"}".into())],
         };
         let body = c
             .post(format!("{a}/v1/exec"))
@@ -503,7 +509,18 @@ mod tests {
         assert!(frames.contains(&ExecFrame::Err { line: "b".into() }));
         assert!(matches!(
             frames.last().unwrap(),
-            ExecFrame::Exit { success: true, .. }
+            ExecFrame::Exit {
+                success: true,
+                stalled: false,
+                killed: false,
+                ..
+            }
         ));
+        assert_eq!(
+            std::fs::read_to_string(_t.path().join("workspaces/w1/.queue/result.schema.json"))
+                .unwrap(),
+            "{\"type\":\"object\"}",
+            "queue files are written into the workspace before the start"
+        );
     }
 }

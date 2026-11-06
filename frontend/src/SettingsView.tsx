@@ -283,7 +283,16 @@ function Bar({ used, limit, label }: { used: number; limit: number | null; label
 }
 
 function BudgetRow({ l }: { l: Limit }) {
-  const { toast, reload } = useStore();
+  const { toast, reload, meta } = useStore();
+  const resume = async () => {
+    try {
+      await api.post(`/limits/${l.provider}/resume`);
+      await reload();
+      toast({ title: `${providerLabel(l.provider)} läuft wieder` });
+    } catch (e) {
+      toast({ title: "Fehler", body: e instanceof ApiError ? e.message : String(e), tone: "error" });
+    }
+  };
   const [b5, setB5] = useState(l.limit_5h_tokens?.toString() ?? "");
   const [b7, setB7] = useState(l.limit_7d_tokens?.toString() ?? "");
   const [usd, setUsd] = useState(l.limit_30d_usd?.toString() ?? "");
@@ -301,9 +310,16 @@ function BudgetRow({ l }: { l: Limit }) {
     <div className="cred" data-testid={`budget-${l.provider}`}>
       <div className="row">
         <strong className="grow">{providerLabel(l.provider)}</strong>
+        {l.paused_reason && <span className="tag err">pausiert: {l.paused_reason}</span>}
         {l.limited_until && <span className="tag err">Abo-Limit bis {fmtTime(l.limited_until)}</span>}
         {l.budget_until && <span className="tag err">Budget erschöpft bis {fmtTime(l.budget_until)}</span>}
+        {(l.paused_reason || l.limited_until) && (
+          <button className="small ghost" onClick={resume}>
+            Pause aufheben
+          </button>
+        )}
       </div>
+      {meta.cli_versions?.[l.provider] && <div className="muted small">CLI-Version im Agent-Image: {meta.cli_versions[l.provider]}</div>}
       <Bar used={l.used_5h} limit={l.limit_5h_tokens} label={`5 Std.: ${fmtTokens(l.used_5h)} Tokens · ${l.runs_5h} Runs · Cache ${fmtTokens(l.cache_read_5h)}`} />
       <Bar used={l.used_7d} limit={l.limit_7d_tokens} label={`7 Tage: ${fmtTokens(l.used_7d)} Tokens`} />
       <Bar used={l.cost_30d} limit={l.limit_30d_usd} label={`30 Tage: $${l.cost_30d.toFixed(2)}`} />

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, ApiError, duration, fmtTime, fmtTokens, STATUS_LABEL, type Task, type TaskEvent } from "./api";
+import { api, ApiError, duration, FAILURE_LABEL, fmtTime, fmtTokens, STATUS_LABEL, taskLimits, type Task, type TaskEvent } from "./api";
 import { useStore } from "./store";
 import { StatusDot } from "./Queue";
 
@@ -119,6 +119,23 @@ export function TaskDrawer({ id, onClose }: { id: string; onClose: () => void })
             </div>
           ) : (
             <>
+              {task.failure_class && task.failure_class !== "task" && task.failure_class !== "cancelled" && task.status !== "done" && (
+                <div data-testid="abort-reason">
+                  <Block
+                    title="Abbruchgrund"
+                    tone={task.status === "blocked" ? "error" : undefined}
+                    text={[
+                      FAILURE_LABEL[task.failure_class],
+                      task.transient_retries > 0 ? `Wiederholungen: ${task.transient_retries}` : "",
+                      task.not_before && task.status === "queued" ? `Nächster Versuch: ${fmtTime(task.not_before)}` : "",
+                      "Kein Fix-Versuch verbraucht.",
+                    ]
+                      .filter(Boolean)
+                      .join("\n")}
+                  />
+                </div>
+              )}
+              {taskLimits(task).length > 0 && <Block title="Limits dieses Auftrags" text={taskLimits(task).join(" · ")} />}
               {task.error && <Block title="Fehler" tone="error" text={task.error} />}
               {task.questions && task.questions.length > 0 && <Block title="Rückfragen" text={task.questions.map((q) => `• ${q}`).join("\n")} />}
               {task.summary && <Block title="Zusammenfassung" text={task.summary} />}

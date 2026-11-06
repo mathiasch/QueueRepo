@@ -97,3 +97,29 @@ test("toasts stay above the home indicator", async ({ page }) => {
   const vp = page.viewportSize()!;
   expect(t.y + t.height).toBeLessThanOrEqual(vp.height - (landscape ? 21 : 34));
 });
+
+test("project settings with limits: 16px inputs, no horizontal scrolling, clear of safe areas", async ({ page }) => {
+  const landscape = await simulateInsets(page);
+  await uiRegister(page, "mlimits");
+  await apiProject(page.request, { name: "MLimits" });
+  await page.reload();
+  await page.getByRole("button", { name: "Projekte" }).click();
+  await page.locator(".project-card", { hasText: "MLimits" }).click();
+  await page.locator(".seg").getByRole("button", { name: "Einstellungen" }).click();
+  const limits = page.getByTestId("project-limits");
+  await limits.scrollIntoViewIfNeeded();
+  const inputs = limits.locator("input");
+  await expect(inputs).toHaveCount(5);
+  const vp = page.viewportSize()!;
+  for (let i = 0; i < 5; i++) {
+    const el = inputs.nth(i);
+    await el.scrollIntoViewIfNeeded();
+    expect(await el.evaluate((e) => parseFloat(getComputedStyle(e).fontSize)), "iOS zooms into inputs < 16px").toBeGreaterThanOrEqual(16);
+    const b = (await el.boundingBox())!;
+    expect(b.x).toBeGreaterThanOrEqual(landscape ? 59 : 0);
+    expect(b.x + b.width).toBeLessThanOrEqual(vp.width - (landscape ? 59 : 0));
+  }
+  await inputs.first().fill("5");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(vp.width);
+  await page.screenshot({ path: test.info().outputPath(`${landscape ? "landscape" : "portrait"}-limits.png`), fullPage: true });
+});

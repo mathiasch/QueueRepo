@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"t-1"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"bash -lc 'cargo test'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"bash -lc 'cargo test'","aggregated_output":"ok","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"file_change","changes":[{"path":"src/lib.rs","kind":"update"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"{\"status\": \"done\", \"summary\": \"fixed\", \"handoff\": \"h\", \"questions\": [], \"follow_up_tasks\": []}"}}
+{"type":"turn.completed","usage":{"input_tokens":24000,"cached_input_tokens":20000,"output_tokens":900}}

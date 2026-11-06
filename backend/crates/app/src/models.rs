@@ -41,6 +41,14 @@ pub struct Task {
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    pub max_runtime_secs: Option<i32>,
+    pub max_cost_usd: Option<f64>,
+    pub max_tokens: Option<i64>,
+    pub max_turns: Option<i32>,
+    /// [`FailureClass`] of the last run that did not finish normally.
+    pub failure_class: Option<String>,
+    pub transient_retries: i32,
+    pub not_before: Option<DateTime<Utc>>,
 }
 
 pub mod status {
@@ -71,7 +79,88 @@ pub struct Project {
     #[serde(skip_serializing)]
     pub git_token_enc: Option<Vec<u8>>,
     pub auto_push: bool,
+    pub max_runtime_secs: Option<i32>,
+    pub stall_timeout_secs: Option<i32>,
+    pub max_cost_usd: Option<f64>,
+    pub max_tokens: Option<i64>,
+    pub max_turns: Option<i32>,
 }
+
+/// Why a run did not finish normally. Only [`FailureClass::Task`] consumes a
+/// fix attempt; everything else is re-queued, pauses the provider or blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FailureClass {
+    /// The agent's work is wrong (contract `failed`, verify/review failed …) → fix task.
+    Task,
+    /// Subscription/API rate limit → provider paused until reset, task re-queued.
+    RateLimit,
+    /// Overloaded / 5xx / network → re-queued with backoff.
+    ProviderTransient,
+    /// Runner unreachable, stream broken, orchestration error → re-queued with backoff.
+    Infra,
+    /// No output for the stall timeout → re-queued with backoff.
+    Stalled,
+    /// Authentication / billing → provider paused until credentials change.
+    ProviderAuth,
+    /// Unknown model, invalid request, broken credential → blocked.
+    Config,
+    LimitRuntime,
+    LimitCost,
+    LimitTokens,
+    LimitTurns,
+    Cancelled,
+}
+
+impl FailureClass {
+    pub const ALL: [FailureClass; 12] = [
+        Self::Task,
+        Self::RateLimit,
+        Self::ProviderTransient,
+        Self::Infra,
+        Self::Stalled,
+        Self::ProviderAuth,
+        Self::Config,
+        Self::LimitRuntime,
+        Self::LimitCost,
+        Self::LimitTokens,
+        Self::LimitTurns,
+        Self::Cancelled,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::RateLimit => "rate_limit",
+            Self::ProviderTransient => "provider_transient",
+            Self::Infra => "infra",
+            Self::Stalled => "stalled",
+            Self::ProviderAuth => "provider_auth",
+            Self::Config => "config",
+            Self::LimitRuntime => "limit_runtime",
+            Self::LimitCost => "limit_cost",
+            Self::LimitTokens => "limit_tokens",
+            Self::LimitTurns => "limit_turns",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == s)
+    }
+
+    /// Re-queued with backoff and counted in `transient_retries`.
+    pub fn is_transient(self) -> bool {
+        matches!(self, Self::ProviderTransient | Self::Infra | Self::Stalled)
+    }
+}
+
+/// JSON schema of [`AgentResult`] for CLIs that enforce structured output
+/// (Claude `--json-schema`, Codex `--output-schema`). Strict: every property
+/// is required and no others are allowed (OpenAI structured-output rules).
+pub const RESULT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["status","summary","handoff","questions","follow_up_tasks"],"properties":{"status":{"type":"string","enum":["done","failed","needs_input"]},"summary":{"type":"string","description":"max 5 lines, what changed"},"handoff":{"type":"string","description":"max 15 lines for the next agent: current state, decisions, open points, relevant files"},"questions":{"type":"array","items":{"type":"string"}},"follow_up_tasks":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["title","prompt"],"properties":{"title":{"type":"string"},"prompt":{"type":"string"}}}}}}"#;
+
+/// JSON schema of [`ReviewResult`] (strict, see [`RESULT_SCHEMA`]).
+pub const REVIEW_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["approved","issues"],"properties":{"approved":{"type":"boolean"},"issues":{"type":"array","items":{"type":"string"}}}}"#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Settings {
@@ -99,7 +188,7 @@ pub struct TaskEvent {
 }
 
 /// Token usage of one or more agent runs.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -118,8 +207,9 @@ impl Usage {
     }
 }
 
-/// Contract between queue and agent: written by the agent to `.queue/result.json`.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Contract between queue and agent: structured output of the CLI or
+/// `.queue/result.json` written by the agent.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AgentResult {
     pub status: Option<String>,
@@ -129,7 +219,7 @@ pub struct AgentResult {
     pub follow_up_tasks: Vec<FollowUp>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct FollowUp {
     pub title: String,
@@ -142,4 +232,97 @@ pub struct FollowUp {
 pub struct ReviewResult {
     pub approved: bool,
     pub issues: Vec<String>,
+}
+
+impl AgentResult {
+    /// A contract counts only with a known status.
+    pub fn has_valid_status(&self) -> bool {
+        matches!(
+            self.status.as_deref(),
+            Some("done" | "failed" | "needs_input")
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Strictness required by OpenAI structured outputs, checked recursively.
+    fn assert_strict(v: &Value, path: &str) {
+        if v["type"] == "object" {
+            assert_eq!(
+                v["additionalProperties"], false,
+                "{path}: additionalProperties"
+            );
+            let props = v["properties"].as_object().expect("properties");
+            let mut keys: Vec<&String> = props.keys().collect();
+            let mut req: Vec<&str> = v["required"]
+                .as_array()
+                .expect("required")
+                .iter()
+                .map(|r| r.as_str().unwrap())
+                .collect();
+            keys.sort();
+            req.sort();
+            assert_eq!(keys, req, "{path}: every property must be required");
+            for (k, p) in props {
+                assert_strict(p, &format!("{path}.{k}"));
+            }
+        }
+        if v["type"] == "array" {
+            assert_strict(&v["items"], &format!("{path}[]"));
+        }
+    }
+
+    #[test]
+    fn schemas_are_strict_and_match_structs() {
+        for s in [RESULT_SCHEMA, REVIEW_SCHEMA] {
+            let v: Value = serde_json::from_str(s).expect("valid JSON");
+            assert_strict(&v, "$");
+        }
+        let example = serde_json::json!({
+            "status": "needs_input", "summary": "s", "handoff": "h",
+            "questions": ["q?"], "follow_up_tasks": [{"title": "t", "prompt": "p"}]
+        });
+        let r: AgentResult = serde_json::from_value(example).unwrap();
+        assert!(r.has_valid_status());
+        assert_eq!(r.questions, vec!["q?"]);
+        assert_eq!(r.follow_up_tasks[0].prompt, "p");
+        let rv: ReviewResult =
+            serde_json::from_value(serde_json::json!({"approved": false, "issues": ["x"]}))
+                .unwrap();
+        assert!(!rv.approved);
+        let schema: Value = serde_json::from_str(RESULT_SCHEMA).unwrap();
+        assert_eq!(
+            schema["properties"]["status"]["enum"],
+            serde_json::json!(["done", "failed", "needs_input"])
+        );
+    }
+
+    #[test]
+    fn failure_class_roundtrip_matches_db_check() {
+        let sql = include_str!("../migrations/0003_cli_contract_limits.sql");
+        for c in FailureClass::ALL {
+            assert_eq!(FailureClass::parse(c.as_str()), Some(c));
+            assert!(
+                sql.contains(&format!("'{}'", c.as_str())),
+                "{c:?} missing in CHECK"
+            );
+        }
+        assert_eq!(FailureClass::parse("nope"), None);
+        assert!(FailureClass::Stalled.is_transient());
+        assert!(!FailureClass::Task.is_transient());
+        assert!(!FailureClass::RateLimit.is_transient());
+    }
+
+    #[test]
+    fn contract_status_must_be_known() {
+        assert!(!AgentResult::default().has_valid_status());
+        let r = AgentResult {
+            status: Some("maybe".into()),
+            ..Default::default()
+        };
+        assert!(!r.has_valid_status());
+    }
 }

@@ -46,7 +46,17 @@ async fn main() -> Result<()> {
         #[cfg(not(unix))]
         docker_user: var("RUNNER_DOCKER_USER"),
         volume_opts: var("RUNNER_VOLUME_OPTS").unwrap_or_default(),
+        kill_grace_secs: match var("RUNNER_KILL_GRACE_SECS") {
+            Some(v) => v
+                .parse()
+                .context("RUNNER_KILL_GRACE_SECS must be a number of seconds")?,
+            None => 15,
+        },
     };
+    if cfg.kill_grace_secs > 60 {
+        // The app's exec HTTP timeout allows for at most 60 s of grace.
+        bail!("RUNNER_KILL_GRACE_SECS must be at most 60");
+    }
     if cfg.token.len() < 24 {
         bail!("RUNNER_TOKEN must be at least 24 characters");
     }

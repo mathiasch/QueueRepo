@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { b64ToBytes, budgetUsage, duration, fmtTokens, limitChip, providerLabel, type Limit } from "./api";
+import { b64ToBytes, budgetUsage, duration, FAILURE_LABEL, failureTag, fmtTokens, limitChip, minToSecs, numOrNull, providerLabel, retryHint, secsToMin, taskLimits, type Limit } from "./api";
 
 const limit = (p: Partial<Limit> = {}): Limit => ({
   provider: "claude",
@@ -16,6 +16,7 @@ const limit = (p: Partial<Limit> = {}): Limit => ({
   budget_reason: null,
   observed_limit_tokens: null,
   observed_at: null,
+  paused_reason: null,
   blocked: false,
   ...p,
 });
@@ -51,6 +52,53 @@ describe("budgets", () => {
     expect(limitChip(limit({ used_5h: 85, limit_5h_tokens: 100 }))).toEqual({ text: "Claude 85 %", tone: "warn" });
     expect(limitChip(limit({ used_5h: 10, limit_5h_tokens: 100 })).tone).toBe("");
     expect(limitChip(limit({ provider: "codex", used_5h: 2000 })).text).toBe("Codex (GPT) 2k");
+  });
+});
+
+describe("failure classes and limits", () => {
+  it("chip shows an auth pause before anything else", () => {
+    const c = limitChip(limit({ paused_reason: "Invalid API key", limited_until: "2026-01-01T10:00:00Z" }));
+    expect(c).toEqual({ text: "Claude ⏸ pausiert (Anmeldung)", tone: "err" });
+  });
+
+  it("tags only non-task failures of unfinished tasks", () => {
+    expect(failureTag({ failure_class: null, status: "queued" })).toBeNull();
+    expect(failureTag({ failure_class: "task", status: "failed" })).toBeNull();
+    expect(failureTag({ failure_class: "cancelled", status: "cancelled" })).toBeNull();
+    expect(failureTag({ failure_class: "provider_transient", status: "done" })).toBeNull();
+    expect(failureTag({ failure_class: "provider_transient", status: "queued" })).toEqual({ text: "Provider gestört", tone: "warn" });
+    expect(failureTag({ failure_class: "limit_tokens", status: "blocked" })).toEqual({ text: "Limit: Tokens", tone: "err" });
+    expect(FAILURE_LABEL.stalled).toBe("Stillstand");
+  });
+
+  it("retry hint only while the backoff is pending", () => {
+    const now = new Date("2026-01-01T10:00:00Z");
+    const t = { status: "queued" as const, not_before: "2026-01-01T10:00:30Z", transient_retries: 2 };
+    expect(retryHint(t, now)).toMatch(/^wartet bis .+ \(Wiederholung 2\)$/);
+    expect(retryHint({ ...t, not_before: "2026-01-01T09:59:59Z" }, now)).toBeNull();
+    expect(retryHint({ ...t, status: "running" }, now)).toBeNull();
+    expect(retryHint({ ...t, not_before: null }, now)).toBeNull();
+    expect(retryHint({ ...t, transient_retries: 0 }, now)).not.toContain("Wiederholung");
+  });
+
+  it("converts minutes and numbers from inputs", () => {
+    expect(secsToMin(null)).toBe("");
+    expect(secsToMin(90)).toBe("1.5");
+    expect(secsToMin(0)).toBe("0");
+    expect(minToSecs("")).toBeNull();
+    expect(minToSecs("1,5")).toBe(90);
+    expect(minToSecs("0")).toBe(0);
+    expect(() => minToSecs("-1")).toThrow();
+    expect(() => minToSecs("abc")).toThrow();
+    expect(numOrNull(" 2000 ")).toBe(2000);
+    expect(numOrNull("0,25")).toBe(0.25);
+    expect(numOrNull("")).toBeNull();
+    expect(() => numOrNull("1e")).toThrow();
+  });
+
+  it("lists task limits", () => {
+    expect(taskLimits({ max_runtime_secs: 120, max_cost_usd: 0.5, max_tokens: 20000, max_turns: 3 })).toEqual(["Laufzeit 2 Min.", "Kosten $0.5", "Tokens 20k", "Turns 3"]);
+    expect(taskLimits({ max_runtime_secs: null, max_cost_usd: null, max_tokens: null, max_turns: null })).toEqual([]);
   });
 });
 

@@ -1,4 +1,5 @@
 mod credentials;
+pub mod limits;
 mod projects;
 mod tasks;
 
@@ -40,6 +41,7 @@ pub fn router(st: AppState) -> Router {
         )
         .route("/settings", get(get_settings).put(put_settings))
         .route("/limits", get(get_limits))
+        .route("/limits/{provider}/resume", post(resume_provider))
         .route("/budgets/{provider}", put(put_budget))
         .route("/credentials", get(credentials::list))
         .route(
@@ -104,7 +106,23 @@ async fn meta(State(st): State<AppState>) -> Json<Value> {
         "credential_kinds": st.cfg.providers().iter().map(|p| (p.to_string(), crate::agent::credential_kinds(p))).collect::<std::collections::HashMap<_, _>>(),
         "oidc": st.cfg.oidc.iter().map(|p| json!({"id": p.id, "name": p.name})).collect::<Vec<_>>(),
         "allow_registration": st.cfg.allow_registration,
+        "provider_capabilities": st.cfg.providers().iter().map(|p| (p.to_string(), crate::agent::capabilities(p))).collect::<std::collections::HashMap<_, _>>(),
+        "cli_versions": crate::agent::CLI_VERSIONS.iter().map(|(p, v)| (p.to_string(), v.to_string())).collect::<std::collections::HashMap<_, _>>(),
     }))
+}
+
+/// Lifts an auth pause and a detected subscription limit of `provider`.
+async fn resume_provider(
+    State(st): State<AppState>,
+    AuthUser(u): AuthUser,
+    Path(provider): Path<String>,
+) -> ApiResult<Json<budget::ProviderStatus>> {
+    if !st.cfg.providers().contains(&provider.as_str()) {
+        return Err(AppError::bad_request("unknown provider"));
+    }
+    budget::clear_pause(&st.db, u.id, &provider, true).await?;
+    st.wake.notify_one();
+    Ok(Json(budget::status(&st.db, u.id, &provider).await?))
 }
 
 async fn get_settings(

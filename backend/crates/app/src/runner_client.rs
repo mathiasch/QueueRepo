@@ -211,7 +211,8 @@ impl RunnerClient {
             .stream
             .post(format!("{}/exec", self.base))
             .bearer_auth(&self.token)
-            .timeout(Duration::from_secs(req.timeout_secs + 120))
+            // Runtime + SIGINT grace (runner side, ≤ 60 s) + slack for setup/cleanup.
+            .timeout(Duration::from_secs(req.timeout_secs + 180))
             .json(req)
             .send()
             .await

@@ -115,3 +115,75 @@ test("drag-free reordering with buttons and cancel", async ({ page }) => {
   await page.locator(".item.running", { hasText: "blocker" }).getByTitle("Abbrechen").click();
   await expect(page.locator(".item.done", { hasText: "beta" })).toBeVisible({ timeout: 30_000 });
 });
+
+async function openProjectSettings(page: import("@playwright/test").Page, name: string) {
+  await page.getByRole("button", { name: "Projekte" }).click();
+  await page.locator(".project-card", { hasText: name }).click();
+  await page.locator(".seg").getByRole("button", { name: "Einstellungen" }).click();
+  return page.getByTestId("project-limits");
+}
+
+test("project limits are saved, survive a reload and the token limit stops a run", async ({ page }) => {
+  await uiRegister(page, "limits");
+  await createProject(page, "Limits");
+  let limits = await openProjectSettings(page, "Limits");
+  await limits.getByLabel("Max. Tokens").fill("2000");
+  await limits.getByLabel("Max. Laufzeit (Min.)").fill("10");
+  await page.getByRole("button", { name: "Speichern" }).click();
+  await expect(page.locator(".toast", { hasText: "Gespeichert" })).toBeVisible();
+  await page.reload();
+  limits = await openProjectSettings(page, "Limits");
+  await expect(limits.getByLabel("Max. Tokens")).toHaveValue("2000");
+  await expect(limits.getByLabel("Max. Laufzeit (Min.)")).toHaveValue("10");
+  await expect(limits.getByLabel("Max. Turns")).toHaveValue("");
+
+  await page.getByRole("button", { name: "← Projekte" }).click();
+  await page.getByRole("button", { name: /^Queue/ }).click();
+  await enqueue(page, "MOCK_TOKENS burn");
+  const row = page.locator(".item.blocked", { hasText: "MOCK_TOKENS burn" });
+  await expect(row).toBeVisible({ timeout: 30_000 });
+  await expect(row.getByTestId("failure-tag")).toHaveText("Limit: Tokens");
+  await expect(page.locator(".item", { hasText: "Fix #1" })).toHaveCount(0);
+  await row.click();
+  const drawer = page.locator(".drawer");
+  await expect(drawer.getByTestId("abort-reason")).toContainText("Limit: Tokens");
+  await expect(drawer.getByTestId("abort-reason")).toContainText("Kein Fix-Versuch verbraucht");
+  await expect(drawer.getByText("Limit überschritten: Tokens 2000").first()).toBeVisible();
+  await expect(drawer.locator(".ev-guard").first()).toBeVisible();
+});
+
+test("transient provider error is retried without a fix attempt", async ({ page }) => {
+  await uiRegister(page, "transientui");
+  await createProject(page, "Transient");
+  await enqueue(page, "MOCK_TRANSIENT flaky");
+  const row = page.locator(".item.done", { hasText: "MOCK_TRANSIENT flaky" });
+  await expect(row).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(".item", { hasText: "Fix #1" })).toHaveCount(0);
+  await row.click();
+  const drawer = page.locator(".drawer");
+  await expect(drawer.locator(".ev-retry").first()).toContainText("overloaded");
+  await expect(drawer.getByText(/Erneut eingereiht \(Provider gestört\)/)).toBeVisible();
+});
+
+test("provider pause after an auth failure is shown and can be lifted", async ({ page }) => {
+  await uiRegister(page, "pause");
+  await createProject(page, "Pause");
+  await enqueue(page, "MOCK_AUTH login");
+  await page.getByRole("button", { name: "Einstellungen" }).click();
+  const row = page.getByTestId("budget-mock");
+  await expect(row.locator(".tag.err", { hasText: "pausiert: Invalid API key" })).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(".chip.err", { hasText: "pausiert" })).toBeVisible();
+  // The paused task stays queued; drop it so it does not trip the pause again.
+  const tasks = await (await page.request.get("/api/tasks")).json();
+  const authTask = tasks.find((t: any) => t.title === "MOCK_AUTH login");
+  expect(authTask.status).toBe("queued");
+  expect(authTask.failure_class).toBe("provider_auth");
+  expect(authTask.attempt).toBe(0);
+  await page.request.post(`/api/tasks/${authTask.id}/cancel`);
+  await row.getByRole("button", { name: "Pause aufheben" }).click();
+  await expect(page.locator(".toast", { hasText: "läuft wieder" })).toBeVisible();
+  await expect(row.locator(".tag.err", { hasText: "pausiert" })).toHaveCount(0);
+  await page.getByRole("button", { name: /^Queue/ }).click();
+  await enqueue(page, "after pause");
+  await expect(page.locator(".item.done", { hasText: "after pause" })).toBeVisible({ timeout: 30_000 });
+});

@@ -2,7 +2,15 @@
 //!   podman – rootless Podman (container root = runner uid, no host root at all)
 //!   docker – Docker, container process runs as the runner's uid:gid
 //!   none   – plain child process (development only)
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{
+    path::Path,
+    process::Stdio,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use queued_common::{ExecFrame, ExecRequest};
@@ -10,6 +18,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::mpsc,
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -127,6 +136,58 @@ fn safe_rel(rel: &str) -> bool {
             .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signal {
+    /// Polite stop: the agent CLI finishes its turn (Claude still emits its
+    /// `result` event with usage).
+    Int,
+    /// Hard stop after the grace period.
+    Kill,
+}
+
+fn engine_bin(engine: Engine) -> &'static str {
+    if engine == Engine::Podman {
+        "podman"
+    } else {
+        "docker"
+    }
+}
+
+/// Command that delivers `sig` to a run. `None` engine: the whole process
+/// group (`pid` is its leader). Containers: SIGINT goes to the container's
+/// init (`--init` forwards it to the agent), SIGKILL = `rm -f`.
+/// Returns `None` if there is nothing to signal (no pid for engine `none`).
+pub fn stop_command(
+    engine: Engine,
+    name: &str,
+    pid: Option<u32>,
+    sig: Signal,
+) -> Option<(String, Vec<String>)> {
+    let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    match engine {
+        Engine::None => {
+            let pid = pid?;
+            let flag = if sig == Signal::Int { "-INT" } else { "-KILL" };
+            Some(("kill".into(), v(&[flag, "--", &format!("-{pid}")])))
+        }
+        Engine::Podman | Engine::Docker => Some((
+            engine_bin(engine).into(),
+            match sig {
+                Signal::Int => v(&["kill", "--signal", "SIGINT", name]),
+                Signal::Kill => v(&["rm", "-f", name]),
+            },
+        )),
+    }
+}
+
+async fn send(engine: Engine, name: &str, pid: Option<u32>, sig: Signal) {
+    if let Some((prog, args)) = stop_command(engine, name, pid, sig) {
+        if let Err(e) = Command::new(&prog).args(&args).output().await {
+            tracing::warn!("{prog} {args:?} failed: {e}");
+        }
+    }
+}
+
 /// Runs the process; frames go to `tx`. Always ends with Exit or Fail.
 pub async fn run(
     cfg: &RunnerConfig,
@@ -137,30 +198,48 @@ pub async fn run(
     let run_dir = cfg.data_dir.join("runs").join(&req.name);
     let res = run_inner(cfg, &req, &run_dir, &cancel, &tx).await;
     let _ = tokio::fs::remove_dir_all(&run_dir).await;
-    if cfg.engine != Engine::None
-        && (cancel.is_cancelled()
-            || matches!(
-                res,
-                Ok(ExecFrame::Exit {
-                    timed_out: true,
-                    ..
-                })
-            ))
-    {
-        let bin = if cfg.engine == Engine::Podman {
-            "podman"
-        } else {
-            "docker"
-        };
-        let _ = Command::new(bin)
-            .args(["rm", "-f", &req.name])
-            .output()
-            .await;
+    let stopped = matches!(
+        res,
+        Ok(ExecFrame::Exit {
+            timed_out: true,
+            ..
+        }) | Ok(ExecFrame::Exit { stalled: true, .. })
+            | Ok(ExecFrame::Exit {
+                cancelled: true,
+                ..
+            })
+    );
+    if cfg.engine != Engine::None && (cancel.is_cancelled() || stopped) {
+        // Make sure no container outlives a stopped run.
+        send(cfg.engine, &req.name, None, Signal::Kill).await;
     }
     let frame = res.unwrap_or_else(|e| ExecFrame::Fail {
         error: format!("{e:#}"),
     });
     let _ = tx.send(frame).await;
+}
+
+async fn write_queue_files(workspace: &Path, files: &[(String, String)]) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let dir = workspace.join(".queue");
+    tokio::fs::create_dir_all(&dir).await?;
+    for (name, content) in files {
+        anyhow::ensure!(
+            queued_common::valid_queue_file_name(name),
+            "invalid queue file name"
+        );
+        tokio::fs::write(dir.join(name), content).await?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StopReason {
+    Timeout,
+    Cancel,
+    Stall,
 }
 
 async fn run_inner(
@@ -188,10 +267,12 @@ async fn run_inner(
             let _ = tokio::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).await;
         }
     }
+    write_queue_files(&workspace, &req.queue_files).await?;
 
     let mut child = build_command(cfg, req, &workspace, &home)
         .spawn()
         .with_context(|| format!("failed to start {}", req.program))?;
+    let pid = child.id();
     if let (Some(input), Some(mut stdin)) = (req.stdin.clone(), child.stdin.take()) {
         tokio::spawn(async move {
             let _ = stdin.write_all(input.as_bytes()).await;
@@ -200,45 +281,69 @@ async fn run_inner(
     }
     let out = child.stdout.take().context("no stdout")?;
     let err = child.stderr.take().context("no stderr")?;
-    let (t1, t2) = (tx.clone(), tx.clone());
-    let r1 = tokio::spawn(async move {
-        let mut l = BufReader::new(out).lines();
-        while let Ok(Some(line)) = l.next_line().await {
-            if t1.send(ExecFrame::Out { line }).await.is_err() {
-                break;
+    // Milliseconds since `started` at which the last output line arrived.
+    let started = Instant::now();
+    let last_output = Arc::new(AtomicU64::new(0));
+    let reader = |stream: Box<dyn tokio::io::AsyncRead + Send + Unpin>, is_err: bool| {
+        let tx = tx.clone();
+        let last = last_output.clone();
+        tokio::spawn(async move {
+            let mut l = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = l.next_line().await {
+                last.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                let f = if is_err {
+                    ExecFrame::Err { line }
+                } else {
+                    ExecFrame::Out { line }
+                };
+                if tx.send(f).await.is_err() {
+                    break;
+                }
             }
-        }
-    });
-    let r2 = tokio::spawn(async move {
-        let mut l = BufReader::new(err).lines();
-        while let Ok(Some(line)) = l.next_line().await {
-            if t2.send(ExecFrame::Err { line }).await.is_err() {
-                break;
-            }
-        }
-    });
+        })
+    };
+    let r1 = reader(Box::new(out), false);
+    let r2 = reader(Box::new(err), true);
 
-    let (mut success, mut code, mut timed_out, mut cancelled) = (false, None, false, false);
-    tokio::select! {
-        status = child.wait() => {
-            let status = status?;
-            success = status.success();
-            code = status.code();
-        }
-        _ = tokio::time::sleep(Duration::from_secs(req.timeout_secs.max(1))) => { timed_out = true; }
-        _ = cancel.cancelled() => { cancelled = true; }
-    }
-    if timed_out || cancelled {
-        #[cfg(unix)]
-        if cfg.engine == Engine::None {
-            if let Some(pid) = child.id() {
-                let _ = Command::new("kill")
-                    .args(["-KILL", "--", &format!("-{pid}")])
-                    .output()
-                    .await;
+    let idle_ms = req.idle_timeout_secs.filter(|s| *s > 0).map(|s| s * 1000);
+    let deadline = tokio::time::sleep(Duration::from_secs(req.timeout_secs.max(1)));
+    tokio::pin!(deadline);
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut status = None;
+    let mut reason = None;
+    while status.is_none() && reason.is_none() {
+        tokio::select! {
+            s = child.wait() => status = Some(s?),
+            _ = &mut deadline => reason = Some(StopReason::Timeout),
+            _ = cancel.cancelled() => reason = Some(StopReason::Cancel),
+            _ = tick.tick(), if idle_ms.is_some() => {
+                let idle = started.elapsed().as_millis() as u64 - last_output.load(Ordering::Relaxed);
+                if idle >= idle_ms.unwrap_or(u64::MAX) {
+                    reason = Some(StopReason::Stall);
+                }
             }
         }
-        let _ = child.kill().await;
+    }
+
+    let mut killed = false;
+    if reason.is_some() {
+        // 1) SIGINT, 2) keep streaming while waiting for the grace period, 3) SIGKILL.
+        send(cfg.engine, &req.name, pid, Signal::Int).await;
+        match tokio::time::timeout(Duration::from_secs(cfg.kill_grace_secs), child.wait()).await {
+            Ok(Ok(s)) => status = Some(s),
+            Ok(Err(e)) => tracing::warn!("wait after SIGINT failed: {e}"),
+            Err(_) => {
+                killed = true;
+                send(cfg.engine, &req.name, pid, Signal::Kill).await;
+                let _ = child.kill().await;
+            }
+        }
+    }
+    #[cfg(unix)]
+    if cfg.engine == Engine::None && (reason.is_some() || status.is_none()) {
+        // Stragglers of the process group (e.g. background jobs that ignore
+        // SIGINT) would otherwise keep the output pipes open.
+        send(cfg.engine, &req.name, pid, Signal::Kill).await;
     }
     for mut r in [r1, r2] {
         if tokio::time::timeout(Duration::from_secs(5), &mut r)
@@ -258,10 +363,13 @@ async fn run_inner(
         }
     }
     Ok(ExecFrame::Exit {
-        success,
-        code,
-        timed_out,
-        cancelled,
+        // A stopped run never counts as a natural success, whatever its exit code.
+        success: reason.is_none() && status.map(|s| s.success()).unwrap_or(false),
+        code: status.and_then(|s| s.code()),
+        timed_out: reason == Some(StopReason::Timeout),
+        cancelled: reason == Some(StopReason::Cancel),
+        stalled: reason == Some(StopReason::Stall),
+        killed,
         files,
     })
 }
@@ -288,6 +396,8 @@ mod tests {
             read_back: vec![".cfg/auth.json".into()],
             stdin: Some("from-stdin".into()),
             timeout_secs: 10,
+            idle_timeout_secs: None,
+            queue_files: vec![],
         }
     }
 
@@ -395,6 +505,169 @@ mod tests {
         )
         .await;
         assert!(matches!(f.last().unwrap(), ExecFrame::Fail { .. }));
+    }
+
+    fn exit_of(f: &[ExecFrame]) -> (bool, bool, bool, bool, bool, Option<i32>) {
+        match f.last().unwrap() {
+            ExecFrame::Exit {
+                success,
+                timed_out,
+                cancelled,
+                stalled,
+                killed,
+                code,
+                ..
+            } => (*success, *timed_out, *cancelled, *stalled, *killed, *code),
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn detects_stall_and_sends_sigint_first() {
+        let t = tempfile::tempdir().unwrap();
+        let c = cfg(t.path(), Engine::None);
+        let mut r = req(
+            "sh",
+            &[
+                "-c",
+                "trap 'echo stopped-politely; exit 130' INT; echo start; sleep 30 & wait $!",
+            ],
+        );
+        r.idle_timeout_secs = Some(1);
+        let started = Instant::now();
+        let f = collect(&c, r, CancellationToken::new()).await;
+        let (success, timed_out, cancelled, stalled, killed, code) = exit_of(&f);
+        assert!(
+            stalled && !timed_out && !cancelled && !killed && !success,
+            "{f:?}"
+        );
+        assert_eq!(code, Some(130));
+        assert!(f.contains(&ExecFrame::Out {
+            line: "stopped-politely".into()
+        }));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "background sleep must not hold the pipes"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_resets_the_stall_timer() {
+        let t = tempfile::tempdir().unwrap();
+        let c = cfg(t.path(), Engine::None);
+        let mut r = req(
+            "sh",
+            &["-c", "for i in 1 2 3 4; do echo $i; sleep 0.6; done"],
+        );
+        r.idle_timeout_secs = Some(1);
+        let f = collect(&c, r, CancellationToken::new()).await;
+        let (success, _, _, stalled, _, _) = exit_of(&f);
+        assert!(success && !stalled, "{f:?}");
+    }
+
+    #[tokio::test]
+    async fn sigint_then_grace_lets_process_flush() {
+        let t = tempfile::tempdir().unwrap();
+        let c = cfg(t.path(), Engine::None);
+        let mut r = req(
+            "sh",
+            &[
+                "-c",
+                "trap 'echo flushed-after-int; exit 130' INT; sleep 30 & wait $!",
+            ],
+        );
+        r.timeout_secs = 1;
+        let f = collect(&c, r, CancellationToken::new()).await;
+        let (success, timed_out, _, stalled, killed, _) = exit_of(&f);
+        assert!(timed_out && !killed && !stalled && !success, "{f:?}");
+        assert!(f.contains(&ExecFrame::Out {
+            line: "flushed-after-int".into()
+        }));
+    }
+
+    #[tokio::test]
+    async fn sigkill_after_grace_when_int_ignored() {
+        let t = tempfile::tempdir().unwrap();
+        let c = cfg(t.path(), Engine::None);
+        let tok = CancellationToken::new();
+        let t2 = tok.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            t2.cancel();
+        });
+        let started = Instant::now();
+        let f = collect(&c, req("sh", &["-c", "trap '' INT; sleep 30"]), tok).await;
+        let (_, _, cancelled, _, killed, _) = exit_of(&f);
+        assert!(cancelled && killed, "{f:?}");
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(300) + Duration::from_secs(c.kill_grace_secs)
+                && took < Duration::from_secs(10),
+            "{took:?}"
+        );
+    }
+
+    #[test]
+    fn stop_commands_for_engines() {
+        let s = |e, sig| stop_command(e, "q-run", Some(42), sig).unwrap();
+        assert_eq!(
+            s(Engine::None, Signal::Int),
+            (
+                "kill".to_string(),
+                vec!["-INT".into(), "--".into(), "-42".into()]
+            )
+        );
+        assert_eq!(
+            s(Engine::None, Signal::Kill),
+            (
+                "kill".to_string(),
+                vec!["-KILL".into(), "--".into(), "-42".into()]
+            )
+        );
+        assert!(stop_command(Engine::None, "q-run", None, Signal::Int).is_none());
+        for (e, bin) in [(Engine::Podman, "podman"), (Engine::Docker, "docker")] {
+            assert_eq!(
+                stop_command(e, "q-run", None, Signal::Int).unwrap(),
+                (
+                    bin.to_string(),
+                    vec![
+                        "kill".into(),
+                        "--signal".into(),
+                        "SIGINT".into(),
+                        "q-run".into()
+                    ]
+                )
+            );
+            assert_eq!(
+                stop_command(e, "q-run", Some(1), Signal::Kill).unwrap(),
+                (
+                    bin.to_string(),
+                    vec!["rm".into(), "-f".into(), "q-run".into()]
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn writes_queue_files_and_rejects_bad_names() {
+        let t = tempfile::tempdir().unwrap();
+        let c = cfg(t.path(), Engine::None);
+        let mut r = req("sh", &["-c", "cat .queue/result.schema.json"]);
+        r.queue_files = vec![("result.schema.json".into(), "{\"s\":1}".into())];
+        let f = collect(&c, r, CancellationToken::new()).await;
+        assert!(
+            f.contains(&ExecFrame::Out {
+                line: "{\"s\":1}".into()
+            }),
+            "{f:?}"
+        );
+        for bad in ["../evil", "a/b", ".x"] {
+            let mut r = req("true", &[]);
+            r.queue_files = vec![(bad.into(), "x".into())];
+            let f = collect(&c, r, CancellationToken::new()).await;
+            assert!(matches!(f.last().unwrap(), ExecFrame::Fail { .. }), "{bad}");
+        }
+        assert!(!c.workspaces().join("evil").exists());
     }
 
     #[test]

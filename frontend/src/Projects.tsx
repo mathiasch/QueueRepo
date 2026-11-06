@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, ApiError, fmtTime, STATUS_LABEL, type Commit, type Project, type Task } from "./api";
+import { api, ApiError, fmtTime, minToSecs, numOrNull, providerLabel, secsToMin, STATUS_LABEL, type Commit, type Project, type Task } from "./api";
 import { useStore } from "./store";
 
 export function ProjectsView() {
@@ -149,9 +149,30 @@ function ProjectSettings({ p, canEdit, onSaved, onDelete }: { p: Project; canEdi
     auto_push: p.auto_push,
   });
   const [token, setToken] = useState<string | null>(null);
+  const [lim, setLim] = useState({
+    runtime: secsToMin(p.max_runtime_secs),
+    stall: secsToMin(p.stall_timeout_secs),
+    cost: p.max_cost_usd?.toString() ?? "",
+    tokens: p.max_tokens?.toString() ?? "",
+    turns: p.max_turns?.toString() ?? "",
+  });
+  const caps = meta.provider_capabilities ?? {};
+  const notEnforced = (k: "max_cost" | "max_turns") =>
+    Object.entries(caps)
+      .filter(([name, c]) => !c[k] && name !== "mock")
+      .map(([name]) => providerLabel(name))
+      .join(", ");
   const save = async () => {
     try {
-      await api.patch(`/projects/${p.id}`, token === null ? f : { ...f, git_token: token });
+      const limits = {
+        max_runtime_secs: minToSecs(lim.runtime),
+        stall_timeout_secs: minToSecs(lim.stall),
+        max_cost_usd: numOrNull(lim.cost),
+        max_tokens: numOrNull(lim.tokens),
+        max_turns: numOrNull(lim.turns),
+      };
+      const body = { ...f, ...limits };
+      await api.patch(`/projects/${p.id}`, token === null ? body : { ...body, git_token: token });
       setToken(null);
       toast({ title: "Gespeichert" });
       onSaved();
@@ -199,6 +220,37 @@ function ProjectSettings({ p, canEdit, onSaved, onDelete }: { p: Project; canEdi
             <input disabled={!canEdit} value={f.review_model} onChange={(e) => setF({ ...f, review_model: e.target.value })} placeholder="Standard" />
           </label>
         </div>
+      )}
+      <h4>Limits pro Auftrag</h4>
+      <p className="muted small">Leer = Standard. Aufträge können eigene Limits setzen. Laufzeit und Stillstand gelten je Lauf, Kosten und Tokens für den ganzen Auftrag.</p>
+      <div className="row wrap" data-testid="project-limits">
+        <label>
+          Max. Laufzeit (Min.)
+          <input disabled={!canEdit} inputMode="decimal" name="max_runtime" placeholder="Standard" value={lim.runtime} onChange={(e) => setLim({ ...lim, runtime: e.target.value })} />
+        </label>
+        <label>
+          Stillstand nach (Min., 0 = aus)
+          <input disabled={!canEdit} inputMode="decimal" name="stall_timeout" placeholder="Standard" value={lim.stall} onChange={(e) => setLim({ ...lim, stall: e.target.value })} />
+        </label>
+        <label>
+          Max. Kosten (USD)
+          <input disabled={!canEdit} inputMode="decimal" name="max_cost" placeholder="unbegrenzt" value={lim.cost} onChange={(e) => setLim({ ...lim, cost: e.target.value })} />
+        </label>
+        <label>
+          Max. Tokens
+          <input disabled={!canEdit} inputMode="numeric" name="max_tokens" placeholder="unbegrenzt" value={lim.tokens} onChange={(e) => setLim({ ...lim, tokens: e.target.value })} />
+        </label>
+        <label>
+          Max. Turns
+          <input disabled={!canEdit} inputMode="numeric" name="max_turns" placeholder="unbegrenzt" value={lim.turns} onChange={(e) => setLim({ ...lim, turns: e.target.value })} />
+        </label>
+      </div>
+      {(notEnforced("max_cost") || notEnforced("max_turns")) && (
+        <p className="muted small">
+          {notEnforced("max_cost") && <>Kostenlimit wird von {notEnforced("max_cost")} nicht erzwungen (keine Kostenangabe der CLI). </>}
+          {notEnforced("max_turns") && <>Turn-Limit wird von {notEnforced("max_turns")} nicht unterstützt. </>}
+          Tokens dieser Provider werden erst nach dem Lauf geprüft. Kosten sind Schätzungen der CLI.
+        </p>
       )}
       <h4>Git</h4>
       <div className="row wrap">
