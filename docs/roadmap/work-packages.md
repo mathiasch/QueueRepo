@@ -128,7 +128,16 @@ Copilot/Claude/Codex/Jules: Output als PR, Iteration über PR-Kommentare und CI.
 - Preview: Dev-Server im Sandbox-Container starten (Projekt-Einstellung), Screenshots per Headless-Browser nach UI-Änderungen, im Task anzeigen.
 - Modell-Routing: Regeln pro Projekt (z. B. Plan/Review mit anderem Modell als Umsetzung, günstiges Modell für kleine Tasks).
 
-## WP14 – Kommerzielles Angebot: Zugang gegen Bezahlung (Reihenfolge: ganz am Schluss, nach WP12)
+## WP15 – Intelligenter Modell-Chooser (Reihenfolge: nach WP12, vor WP14)
+Nutzerwunsch: ein "richtig schlauer" Chooser, der jede Aufgabe dem passenden Modell gibt. Baut auf WP13 (Connectoren, Preistabelle, Routing-Presets, Eval-Set) und WP10 (Analytics) auf.
+- **Task-Analyse:** Merkmale aus Prompt, Anhängen und Repo (Aufgabentyp wie Bugfix/Feature/Refactor/Doku/Tests/Recherche/UI, geschätzte Grösse, Komplexität, Risiko z. B. Security/Migration/Infra, benötigte Fähigkeiten wie Vision, Long-Context, Web-Recherche, Sprache/Framework, betroffene Dateien/Zeilen). Heuristik + günstige Klassifikation (billiges Modell oder lokale Embeddings), Kosten des Choosers selbst werden gezählt und bleiben vernachlässigbar.
+- **Entscheidung:** Kandidaten = verfügbare Connectoren/Modelle des Users, gefiltert nach harten Constraints (Budget/Limits/Pausen, Datenstandort EU/CH, Nutzer- und Projektregeln, Fähigkeiten, Kontextlänge). Bewertung nach erwarteten Kosten pro *akzeptiertem* Task = Kosten pro Versuch / Erfolgswahrscheinlichkeit, inkl. Eskalationskette; Qualität-vs-Kosten-Regler pro Projekt.
+- **Lernen aus Ergebnissen:** Erfolgswahrscheinlichkeiten pro (Aufgabenkategorie × Modell) aus Eval-Set und echten Läufen (first-pass Verify, Review-Ergebnis, Fix-Tasks, Kosten, Dauer) – kontextueller Bandit (z. B. Thompson Sampling mit Priors aus dem Eval-Set) mit kontrollierter Exploration, Zerfall alter Daten, Mindeststichprobe.
+- **Schritt-spezifisch:** eigene Wahl für Plan, Agent-Loop, Review (nie schwächer als der Ausführer, bevorzugt anderer Provider gegen Self-Preference-Bias) und OnEmptyQueue-Analyse; Batch/Flex automatisch, wenn kein Zeitdruck.
+- **Transparenz & Kontrolle:** Begründung pro Task in der UI ("Gewählt: X, weil …, erwartete Kosten …, Alternativen …"), manuelles Override, Feedback des Users fliesst ins Lernen ein; Admin-Sicht auf Chooser-Statistiken.
+- **Absicherung:** Offline-Evaluation gegen historische Läufe (Replay), Vergleich mit statischen Presets (muss Kosten pro akzeptiertem Task nachweislich senken oder Qualität halten), Fallback auf Preset bei fehlenden Daten, deterministische Tests der Entscheidungslogik.
+
+## WP14 – Kommerzielles Angebot: Zugang gegen Bezahlung (Reihenfolge: ganz am Schluss, nach WP15)
 Nutzerwunsch: das Produkt für Kunden zugänglich machen, die dafür bezahlen.
 - Hinweis: Das ausgeklammerte Lizenz-/ToS-Thema wird hier zwingend relevant (Weiterverkauf/Vermittlung von Modellnutzung). Das Abrechnungsmodell so bauen, dass es konfigurierbar ist (z. B. Plattformgebühr mit eigenem API-Key des Kunden vs. nutzungsbasierte Abrechnung über eigene Provider-Verträge); die Entscheidung trifft der Betreiber vor dem Go-live.
 - Pläne/Tarife (z. B. Free/Trial, Pro, Team) mit Limits (Tasks, Projekte, parallele Agenten, Token-Kontingent), Feature-Gates, Upgrade/Downgrade, Testphase.
