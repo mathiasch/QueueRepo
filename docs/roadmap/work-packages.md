@@ -50,6 +50,7 @@ Quelle: `reports/Kostenoptimale Modellanbieter für Queue.md`. Nutzer: keine zei
 - **Batch-Connector** für Einzelschritte (Plan, OnEmptyQueue-Analyse, optional Review) über Anthropic Message Batches bzw. OpenAI Batch – asynchron mit Polling, Scheduler kann darauf warten (keine Zeitkritik); Cache-Hygiene (stabile Prompt-Präfixe, 1-h-Cache für Batch).
 - **UI:** Anbieter-/Modellwahl mit geschätzten Kosten pro Task (aus Preistabelle + historischen Token-Profilen), Preset-Auswahl, Hinweis auf Datenstandort (EU/CH/US).
 - Externe APIs sind hier nicht live erreichbar: gegen lokale Fake-Server testen; Fixtures für Batch-/Flex-/opencode-Events mit Herkunftsangabe.
+- **Vollständigkeit (Nutzerwunsch):** alle im Kostenbericht beschriebenen Anbindungen bauen, nicht nur eine Auswahl: Anthropic API direkt, Bedrock (EU-Profile), Vertex (EU-Multi-Region), OpenAI API inkl. Flex und Batch, Azure OpenAI/Foundry (EU Data Zone / Switzerland North), Mistral (inkl. EU-Endpoint), Infomaniak (CH) und beliebige OpenAI-kompatible Endpoints (selbst gehostetes vLLM/Ollama), OpenRouter, LiteLLM-Gateway, opencode-Harness; dazu ein kleines Eval-Set (repräsentative Tasks gegen den Mock + optional echte Provider), um Erfolgsquoten pro Modell/Route zu messen und die Routing-Presets zu kalibrieren.
 
 ## WP01 – Strukturierte CLI-Integration & Fehlerklassifikation
 Wettbewerb nutzt strukturierte Signale statt Text-Parsing.
@@ -126,3 +127,16 @@ Copilot/Claude/Codex/Jules: Output als PR, Iteration über PR-Kommentare und CI.
 - Best-of-N: ein Task als N parallele Versuche (gleicher oder verschiedene Provider), Vergleichsansicht der Diffs/Ergebnisse, Auswahl → Merge; optional automatische Auswahl per Review-Agent.
 - Preview: Dev-Server im Sandbox-Container starten (Projekt-Einstellung), Screenshots per Headless-Browser nach UI-Änderungen, im Task anzeigen.
 - Modell-Routing: Regeln pro Projekt (z. B. Plan/Review mit anderem Modell als Umsetzung, günstiges Modell für kleine Tasks).
+
+## WP14 – Kommerzielles Angebot: Zugang gegen Bezahlung (Reihenfolge: ganz am Schluss, nach WP12)
+Nutzerwunsch: das Produkt für Kunden zugänglich machen, die dafür bezahlen.
+- Hinweis: Das ausgeklammerte Lizenz-/ToS-Thema wird hier zwingend relevant (Weiterverkauf/Vermittlung von Modellnutzung). Das Abrechnungsmodell so bauen, dass es konfigurierbar ist (z. B. Plattformgebühr mit eigenem API-Key des Kunden vs. nutzungsbasierte Abrechnung über eigene Provider-Verträge); die Entscheidung trifft der Betreiber vor dem Go-live.
+- Pläne/Tarife (z. B. Free/Trial, Pro, Team) mit Limits (Tasks, Projekte, parallele Agenten, Token-Kontingent), Feature-Gates, Upgrade/Downgrade, Testphase.
+- Zahlungsanbieter: Stripe (Checkout, Customer Portal, Subscriptions, Usage-based Metering, Webhooks mit Signaturprüfung, Idempotenz) als primärer Adapter; Schnittstelle so, dass weitere Anbieter (z. B. Payrexx/TWINT für CH) ergänzbar sind.
+- Nutzungsmessung: Abrechnung aus der eigenen Kostenrechnung (WP13) mit Marge/Preisliste pro Plan, Kontingent-Warnungen, harte Limits, Überziehung optional.
+- Rechnungen/Steuern: CH-MWST (8.1 %) und EU-USt (Reverse Charge, OSS-Hinweise) über Stripe Tax o. ä., Rechnungsadresse/UID, Rechnungsarchiv.
+- Mahnwesen (fehlgeschlagene Zahlungen → Gnadenfrist → Sperre), Kündigung, Datenexport und Löschung (DSG/GDPR).
+- Kunden-Onboarding: Landingpage mit Preisseite, Registrierung → Plan wählen → bezahlen → Onboarding; Admin-Sicht auf Kunden, Umsatz, MRR, Churn.
+- Rechtstexte als Vorlagen mit klarer Markierung "vom Betreiber zu prüfen": AGB, Datenschutzerklärung, AVV/DPA, Impressum.
+- Tests gegen Stripe-Testmodus-Fixtures/Fake-Server (Webhooks signiert), E2E des Kaufflows.
+
