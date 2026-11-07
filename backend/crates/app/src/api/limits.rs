@@ -1,19 +1,9 @@
 //! Validation of per-task limit fields shared by the project and task APIs.
 //! Ranges are checked here (400 with a German message) before SQL, so the
 //! DB CHECK constraints are only the last line of defence.
-use serde::{Deserialize, Deserializer};
-
 use crate::error::{ApiResult, AppError};
 
-/// For PATCH semantics: field absent → `None` (unchanged), `null` →
-/// `Some(None)` (back to the default), value → `Some(Some(v))`.
-pub fn double_option<'de, T, D>(d: D) -> Result<Option<Option<T>>, D::Error>
-where
-    T: Deserialize<'de>,
-    D: Deserializer<'de>,
-{
-    Option::<T>::deserialize(d).map(Some)
-}
+pub use queued_api::{double_option, TaskLimitFields};
 
 pub const RUNTIME: (i64, i64) = (1, 86_400);
 pub const STALL: (i64, i64) = (0, 86_400);
@@ -39,19 +29,6 @@ pub fn cost(v: Option<f64>) -> ApiResult<Option<f64>> {
     }
 }
 
-/// Task-level limit fields (as in POST/PATCH /api/tasks).
-#[derive(Debug, Default, Deserialize)]
-pub struct TaskLimitFields {
-    #[serde(default, deserialize_with = "double_option")]
-    pub max_runtime_secs: Option<Option<i64>>,
-    #[serde(default, deserialize_with = "double_option")]
-    pub max_cost_usd: Option<Option<f64>>,
-    #[serde(default, deserialize_with = "double_option")]
-    pub max_tokens: Option<Option<i64>>,
-    #[serde(default, deserialize_with = "double_option")]
-    pub max_turns: Option<Option<i64>>,
-}
-
 /// Validated task limits: outer `Option` = field present.
 #[derive(Debug, Default, PartialEq)]
 pub struct CheckedTaskLimits {
@@ -66,8 +43,13 @@ fn narrow(v: Option<Option<i64>>) -> Option<Option<i32>> {
     v.map(|o| o.map(|x| x as i32))
 }
 
-impl TaskLimitFields {
-    pub fn check(self) -> ApiResult<CheckedTaskLimits> {
+/// Range checks of the task-level limit fields.
+pub trait CheckLimits {
+    fn check(self) -> ApiResult<CheckedTaskLimits>;
+}
+
+impl CheckLimits for TaskLimitFields {
+    fn check(self) -> ApiResult<CheckedTaskLimits> {
         let flat = |v: Option<Option<i64>>| v.flatten();
         int(
             "Max. Laufzeit (Sekunden)",

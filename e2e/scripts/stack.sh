@@ -20,7 +20,7 @@ trap cleanup EXIT INT TERM
 
 if [[ "${E2E_SKIP_BUILD:-}" != "1" ]]; then
   (cd "$ROOT/backend" && cargo build --quiet --bin queued --bin queued-runner)
-  (cd "$ROOT/frontend" && npm run --silent build >/dev/null)
+  (cd "$ROOT/frontend" && trunk build --release >/dev/null)
 fi
 psql "$ADMIN_URL" -qc "CREATE DATABASE $DB" >/dev/null
 DB_URL="${ADMIN_URL%/*}/$DB"

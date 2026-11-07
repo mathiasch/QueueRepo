@@ -11,10 +11,10 @@ Artefakte pro Paket in `docs/roadmap/`: `WPxx-plan.md`, `WPxx-impl.md` (Umsetzun
 - Haltung: unfreundlicher, extrem kritischer Senior-Entwickler. Keine Schönfärberei, keine Abkürzungen, keine TODOs/Stubs/"später", keine toten Feature-Flags, keine Behauptung ohne Beleg (Testlauf, Befehlsausgabe). Annahmen anderer Agenten werden geprüft, nicht übernommen.
 - Repo: `/home/user/QueueRepo`, Branch `mvp`. **Nicht committen, nicht pushen** – das macht der Koordinator.
 - Architektur nicht aufweichen: `queued` (App) hat keine Host-Rechte; Datei-/Prozess-/Git-Arbeit gehört in `queued-runner`; Protokoll in `queued-common`. Neue DB-Änderungen nur als neue Migration (`backend/crates/app/migrations/00NN_*.sql`), bestehende Migrationen nie ändern.
-- Qualität: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` sauber; Frontend `npm run build` (tsc) sauber.
+- Qualität: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` sauber; Frontend (seit WP00 Rust/Leptos in `frontend/`, eigener Workspace): `cargo fmt --all -- --check`, `cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings` und `cargo clippy --all-targets -- -D warnings` sauber, `trunk build --release` ok.
 - Tests laufen lassen (Postgres: `service postgresql start`, `DATABASE_URL=postgres://queued:queued@localhost/queued`):
   - `cd backend && DATABASE_URL=… cargo test --workspace`
-  - `cd frontend && npm run build && npm test`
+  - `cd frontend && cargo test` (Logik; seit WP00, vorher `npm test`)
   - `cd e2e && npx playwright test` (startet den kompletten Stack selbst; Chromium unter `/opt/pw-browsers`)
 - Externe Dienste (GitHub/GitLab/Linear/Slack/Jira-APIs, echte Agent-CLIs) sind hier nicht live erreichbar: gegen lokale Fake-Server im Test (axum/wiremock-artig, eigene Implementierung im Test) testen und das im Bericht klar sagen. Der Mock-Provider (`backend/crates/app/src/agent.rs`, `MOCK_*`-Keywords) darf für neue Szenarien erweitert werden.
 - Docker-Daemon ist ggf. startbar (`dockerd &`), Podman fehlt; Sandbox-Engine in Tests ist `none`.

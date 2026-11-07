@@ -10,6 +10,7 @@ use axum::{
     Form, Json,
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+use queued_api::{LoginRequest, RegisterRequest};
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -114,18 +115,10 @@ async fn hash_password(pw: String) -> ApiResult<String> {
     .map_err(Into::into)
 }
 
-#[derive(Deserialize)]
-pub struct RegisterReq {
-    email: String,
-    password: String,
-    #[serde(default)]
-    name: String,
-}
-
 pub async fn register(
     State(st): State<AppState>,
     jar: CookieJar,
-    Json(r): Json<RegisterReq>,
+    Json(r): Json<RegisterRequest>,
 ) -> ApiResult<impl IntoResponse> {
     if !st.cfg.allow_registration {
         return Err(AppError::forbidden());
@@ -147,16 +140,10 @@ pub async fn register(
     Ok((jar, Json(json!({"ok": true}))))
 }
 
-#[derive(Deserialize)]
-pub struct LoginReq {
-    email: String,
-    password: String,
-}
-
 pub async fn login(
     State(st): State<AppState>,
     jar: CookieJar,
-    Json(r): Json<LoginReq>,
+    Json(r): Json<LoginRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let row: Option<(Uuid, Option<String>)> =
         sqlx::query_as("SELECT id, password_hash FROM users WHERE email = $1")

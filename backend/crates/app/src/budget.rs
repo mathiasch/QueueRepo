@@ -10,54 +10,15 @@
 //! * When a real subscription limit is hit we store the tokens used in the 5h
 //!   window as `observed_limit_tokens` – an empirical value to calibrate budgets.
 use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::models::Usage;
+pub use queued_api::{Budget, ProviderStatus, Window};
 
 pub const WINDOW_5H: i64 = 5;
 pub const WINDOW_7D: i64 = 7 * 24;
 pub const WINDOW_30D: i64 = 30 * 24;
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct Budget {
-    pub limit_5h_tokens: Option<i64>,
-    pub limit_7d_tokens: Option<i64>,
-    pub limit_30d_usd: Option<f64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, PartialEq)]
-pub struct Window {
-    pub used_5h: i64,
-    pub used_7d: i64,
-    pub cost_30d: f64,
-    pub cache_read_5h: i64,
-    pub runs_5h: i64,
-    pub oldest_5h: Option<DateTime<Utc>>,
-    pub oldest_7d: Option<DateTime<Utc>>,
-    pub oldest_30d: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ProviderStatus {
-    pub provider: String,
-    #[serde(flatten)]
-    pub window: Window,
-    #[serde(flatten)]
-    pub budget: Budget,
-    /// Subscription limit reported by the CLI.
-    pub limited_until: Option<DateTime<Utc>>,
-    /// Own budget exhausted until (approx., rolling window).
-    pub budget_until: Option<DateTime<Utc>>,
-    pub budget_reason: Option<String>,
-    pub observed_limit_tokens: Option<i64>,
-    pub observed_at: Option<DateTime<Utc>>,
-    /// Paused by an authentication/billing failure until credentials are
-    /// updated or the user resumes the provider.
-    pub paused_reason: Option<String>,
-    pub blocked: bool,
-}
 
 pub fn counted(u: &Usage) -> i64 {
     u.input_tokens

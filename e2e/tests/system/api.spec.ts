@@ -133,3 +133,36 @@ test("resume only lifts the caller's own provider pause", async ({ playwright, b
   await a.dispose();
   await b.dispose();
 });
+
+test("web frontend: Trunk build is served gzip-compressed, SPA routes fall back to index.html, SSE stays uncompressed", async ({ request }) => {
+  const index = await request.get("/", { headers: { "Accept-Encoding": "gzip" } });
+  expect(index.status()).toBe(200);
+  const html = await index.text();
+  expect(html).toContain('lang="de"');
+  const wasm = html.match(/href="\/(queued-web-[0-9a-f]+_bg\.wasm)"/)?.[1];
+  expect(wasm, "index.html references the hashed wasm bundle").toBeTruthy();
+  const w = await request.get(`/${wasm}`, { headers: { "Accept-Encoding": "gzip" } });
+  expect(w.status()).toBe(200);
+  expect(w.headers()["content-type"]).toBe("application/wasm");
+  expect(w.headers()["content-encoding"]).toBe("gzip");
+  for (const f of ["/sw.js", "/manifest.webmanifest", "/icon-192.png", "/icon.svg"]) expect((await request.get(f)).status(), f).toBe(200);
+  // Client-side routes (deep links from push notifications) load the app.
+  for (const p of ["/projects/00000000-0000-0000-0000-000000000000?tab=git", "/inbox", "/settings"]) {
+    const r = await request.get(p);
+    expect(r.status(), p).toBe(200);
+    expect(await r.text()).toContain("queued-web-");
+  }
+  // Unknown API paths are not swallowed by the SPA fallback.
+  expect((await request.get("/api/does-not-exist")).status()).toBe(404);
+  // The live event stream must not be buffered by compression.
+  await apiUser(request, "sse");
+  const ctrl = new AbortController();
+  const res = await fetch(`${test.info().project.use.baseURL}/api/events`, {
+    headers: { "Accept-Encoding": "gzip", Cookie: (await request.storageState()).cookies.map((c) => `${c.name}=${c.value}`).join("; ") },
+    signal: ctrl.signal,
+  });
+  expect(res.status).toBe(200);
+  expect(res.headers.get("content-type")).toContain("text/event-stream");
+  expect(res.headers.get("content-encoding")).toBeNull();
+  ctrl.abort();
+});

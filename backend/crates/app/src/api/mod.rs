@@ -12,10 +12,16 @@ use axum::{
     Json, Router,
 };
 use futures::Stream;
+use queued_api::{
+    Meta, Notification, OidcProvider, PushKey, ServerEvent, SettingsUpdate, ONEMPTY_ACTIONS,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::{
+    compression::CompressionLayer,
+    services::{ServeDir, ServeFile},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -89,26 +95,54 @@ pub fn router(st: AppState) -> Router {
         .route("/tasks/{id}/answer", post(tasks::answer))
         .route("/tasks/{id}/move", post(tasks::move_task))
         .route("/tasks/{id}/diff", get(tasks::diff))
-        .route("/tasks/{id}/revert", post(tasks::revert));
+        .route("/tasks/{id}/revert", post(tasks::revert))
+        // Unknown API paths get a JSON 404 instead of the SPA's index.html.
+        .fallback(|| async { AppError::not_found() });
 
     let dir = st.cfg.frontend_dir.clone();
     let spa = ServeDir::new(&dir).fallback(ServeFile::new(dir.join("index.html")));
+    // The WebAssembly frontend is ~1.5 MB; gzip only the static files (the
+    // API and its SSE stream stay uncompressed).
+    let web = Router::new()
+        .fallback_service(spa)
+        .layer(CompressionLayer::new());
     Router::new()
         .nest("/api", api)
-        .fallback_service(spa)
+        .fallback_service(web)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(st)
 }
 
-async fn meta(State(st): State<AppState>) -> Json<Value> {
-    Json(json!({
-        "providers": st.cfg.providers(),
-        "credential_kinds": st.cfg.providers().iter().map(|p| (p.to_string(), crate::agent::credential_kinds(p))).collect::<std::collections::HashMap<_, _>>(),
-        "oidc": st.cfg.oidc.iter().map(|p| json!({"id": p.id, "name": p.name})).collect::<Vec<_>>(),
-        "allow_registration": st.cfg.allow_registration,
-        "provider_capabilities": st.cfg.providers().iter().map(|p| (p.to_string(), crate::agent::capabilities(p))).collect::<std::collections::HashMap<_, _>>(),
-        "cli_versions": crate::agent::CLI_VERSIONS.iter().map(|(p, v)| (p.to_string(), v.to_string())).collect::<std::collections::HashMap<_, _>>(),
-    }))
+async fn meta(State(st): State<AppState>) -> Json<Meta> {
+    let providers = st.cfg.providers();
+    Json(Meta {
+        providers: providers.iter().map(|p| p.to_string()).collect(),
+        credential_kinds: providers
+            .iter()
+            .map(|p| {
+                let kinds = crate::agent::credential_kinds(p);
+                (p.to_string(), kinds.iter().map(|k| k.to_string()).collect())
+            })
+            .collect(),
+        oidc: st
+            .cfg
+            .oidc
+            .iter()
+            .map(|p| OidcProvider {
+                id: p.id.clone(),
+                name: p.name.clone(),
+            })
+            .collect(),
+        allow_registration: st.cfg.allow_registration,
+        provider_capabilities: providers
+            .iter()
+            .map(|p| (p.to_string(), crate::agent::capabilities(p)))
+            .collect(),
+        cli_versions: crate::agent::CLI_VERSIONS
+            .iter()
+            .map(|(p, v)| (p.to_string(), v.to_string()))
+            .collect(),
+    })
 }
 
 /// Lifts an auth pause and a detected subscription limit of `provider`.
@@ -135,7 +169,7 @@ async fn get_settings(
 async fn put_settings(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
-    Json(s): Json<Settings>,
+    Json(s): Json<SettingsUpdate>,
 ) -> ApiResult<Json<Settings>> {
     if !st.cfg.providers().contains(&s.default_provider.as_str()) {
         return Err(AppError::bad_request("unknown provider"));
@@ -143,7 +177,7 @@ async fn put_settings(
     let actions: Vec<String> = s
         .onempty_actions
         .into_iter()
-        .filter(|a| ["review", "research", "improve"].contains(&a.as_str()))
+        .filter(|a| ONEMPTY_ACTIONS.contains(&a.as_str()))
         .collect();
     queue::load_settings(&st, u.id).await?;
     sqlx::query(
@@ -193,7 +227,7 @@ async fn put_budget(
 async fn list_notifications(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<Vec<Notification>>> {
     let rows: Vec<(Uuid, String, String, String, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>)> =
         sqlx::query_as(
             "SELECT id, kind, title, body, task_id, read_at, created_at FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100",
@@ -201,12 +235,21 @@ async fn list_notifications(
         .bind(u.id)
         .fetch_all(&st.db)
         .await?;
-    Ok(Json(json!(rows
-        .into_iter()
-        .map(|(id, kind, title, body, task_id, read_at, created_at)| json!({
-            "id": id, "kind": kind, "title": title, "body": body, "task_id": task_id, "read_at": read_at, "created_at": created_at
-        }))
-        .collect::<Vec<_>>())))
+    Ok(Json(
+        rows.into_iter()
+            .map(
+                |(id, kind, title, body, task_id, read_at, created_at)| Notification {
+                    id,
+                    kind,
+                    title,
+                    body,
+                    task_id,
+                    read_at,
+                    created_at,
+                },
+            )
+            .collect(),
+    ))
 }
 
 async fn read_all(State(st): State<AppState>, AuthUser(u): AuthUser) -> ApiResult<Json<Value>> {
@@ -230,8 +273,10 @@ async fn read_one(
     Ok(Json(json!({"ok": true})))
 }
 
-async fn push_key(State(st): State<AppState>) -> Json<Value> {
-    Json(json!({"public_key": st.vapid.public_b64}))
+async fn push_key(State(st): State<AppState>) -> Json<PushKey> {
+    Json(PushKey {
+        public_key: st.vapid.public_b64.clone(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -283,16 +328,21 @@ async fn push_test(State(st): State<AppState>, AuthUser(u): AuthUser) -> Json<Va
     Json(json!({"ok": true}))
 }
 
+fn sse_data(e: &ServerEvent) -> Event {
+    // Serializing these plain data types cannot fail.
+    Event::default().data(serde_json::to_string(e).unwrap_or_default())
+}
+
 async fn events(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let uid = u.id;
     let stream = BroadcastStream::new(st.bus.subscribe()).filter_map(move |m| match m {
-        Ok(ev) if ev.user_id == uid => Some(Ok(Event::default().data(ev.payload.to_string()))),
+        Ok(ev) if ev.user_id == uid => Some(Ok(sse_data(&ev.payload))),
         Ok(_) => None,
         // Lagged: tell the client to refetch.
-        Err(_) => Some(Ok(Event::default().data(r#"{"type":"resync"}"#))),
+        Err(_) => Some(Ok(sse_data(&ServerEvent::Resync))),
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }

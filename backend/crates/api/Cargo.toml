@@ -1,0 +1,16 @@
+[package]
+name = "queued-api"
+version.workspace = true
+edition.workspace = true
+description = "HTTP API types shared by the queue app (backend) and the web frontend (WASM)"
+
+[features]
+# Derives sqlx::FromRow for row types; only the backend enables it.
+sqlx = ["dep:sqlx"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
+sqlx = { version = "0.8", default-features = false, features = ["derive", "uuid", "chrono", "json"], optional = true }

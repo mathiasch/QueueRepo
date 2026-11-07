@@ -1,6 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
 
-use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::{broadcast, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
@@ -12,7 +11,7 @@ use crate::{config::Config, push::Vapid, runner_client::RunnerClient};
 #[derive(Clone, Debug)]
 pub struct BusEvent {
     pub user_id: Uuid,
-    pub payload: Value,
+    pub payload: queued_api::ServerEvent,
 }
 
 #[derive(Clone)]
@@ -48,7 +47,7 @@ impl AppState {
         })
     }
 
-    pub fn emit(&self, user_id: Uuid, payload: Value) {
+    pub fn emit(&self, user_id: Uuid, payload: queued_api::ServerEvent) {
         let _ = self.bus.send(BusEvent { user_id, payload });
     }
 }

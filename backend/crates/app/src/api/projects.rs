@@ -5,12 +5,16 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use queued_api::{
+    AddMember, Commit, CreatedProject, FileView, ImportResult, Member, NewProject, ProjectRole,
+    ProjectSummary, ProjectView, PushResult, UpdateProject,
+};
 use queued_common::{GitRemote, InitWorkspace};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::limits::{self, double_option};
+use super::limits;
 use crate::{
     auth::AuthUser,
     crypto,
@@ -26,6 +30,16 @@ pub enum Role {
     Viewer,
     Editor,
     Owner,
+}
+
+impl From<Role> for ProjectRole {
+    fn from(r: Role) -> Self {
+        match r {
+            Role::Owner => ProjectRole::Owner,
+            Role::Editor => ProjectRole::Editor,
+            Role::Viewer => ProjectRole::Viewer,
+        }
+    }
 }
 
 pub async fn role(st: &AppState, project_id: Uuid, user_id: Uuid) -> ApiResult<Option<Role>> {
@@ -87,7 +101,10 @@ fn valid_remote(st: &AppState, url: &str) -> bool {
         || (st.cfg.allow_local_remotes && (url.starts_with("file://") || url.starts_with('/')))
 }
 
-pub async fn list(State(st): State<AppState>, AuthUser(u): AuthUser) -> ApiResult<Json<Value>> {
+pub async fn list(
+    State(st): State<AppState>,
+    AuthUser(u): AuthUser,
+) -> ApiResult<Json<Vec<ProjectSummary>>> {
     let rows: Vec<(Uuid, String, String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT p.id, p.name, p.description, m.role, ou.name, p.git_remote_url FROM projects p
          JOIN project_members m ON m.project_id=p.id AND m.user_id=$1
@@ -97,27 +114,20 @@ pub async fn list(State(st): State<AppState>, AuthUser(u): AuthUser) -> ApiResul
     .bind(u.id)
     .fetch_all(&st.db)
     .await?;
-    Ok(Json(json!(rows
-        .into_iter()
-        .map(|(id, name, description, role, owner, remote)| json!({
-            "id": id, "name": name, "description": description, "role": role, "owner_name": owner, "git_remote_url": remote
-        }))
-        .collect::<Vec<_>>())))
-}
-
-#[derive(Deserialize)]
-pub struct NewProject {
-    name: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    goal: String,
-    #[serde(default)]
-    git_remote_url: Option<String>,
-    #[serde(default)]
-    git_branch: Option<String>,
-    #[serde(default)]
-    git_token: Option<String>,
+    Ok(Json(
+        rows.into_iter()
+            .map(
+                |(id, name, description, role, owner_name, git_remote_url)| ProjectSummary {
+                    id,
+                    name,
+                    description,
+                    role: ProjectRole::parse(&role).unwrap_or(ProjectRole::Viewer),
+                    owner_name,
+                    git_remote_url,
+                },
+            )
+            .collect(),
+    ))
 }
 
 /// Every project is a git repository: fresh (`git init`) or cloned from a remote.
@@ -125,7 +135,7 @@ pub async fn create(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
     Json(p): Json<NewProject>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<CreatedProject>> {
     if p.name.trim().is_empty() {
         return Err(AppError::bad_request("name required"));
     }
@@ -204,54 +214,19 @@ pub async fn create(
             AppError::bad_request(format!("Repository konnte nicht angelegt werden: {e}"))
         })?;
     tx.commit().await?;
-    let mut v = serde_json::to_value(project).map_err(anyhow::Error::from)?;
-    v["head"] = json!(head);
-    Ok(Json(v))
+    Ok(Json(CreatedProject {
+        project: project.view(ProjectRole::Owner),
+        head,
+    }))
 }
 
 pub async fn get(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<ProjectView>> {
     let role = role(&st, id, u.id).await?.ok_or_else(AppError::not_found)?;
-    let p = load(&st, id).await?;
-    let has_token = p.git_token_enc.is_some();
-    let mut v = serde_json::to_value(p).map_err(anyhow::Error::from)?;
-    v["role"] = json!(match role {
-        Role::Owner => "owner",
-        Role::Editor => "editor",
-        Role::Viewer => "viewer",
-    });
-    v["has_git_token"] = json!(has_token);
-    Ok(Json(v))
-}
-
-#[derive(Deserialize)]
-pub struct UpdateProject {
-    name: Option<String>,
-    description: Option<String>,
-    goal: Option<String>,
-    verify_command: Option<String>,
-    review_enabled: Option<bool>,
-    review_provider: Option<String>,
-    review_model: Option<String>,
-    git_remote_url: Option<String>,
-    git_branch: Option<String>,
-    /// New token; empty string removes it; absent keeps it.
-    git_token: Option<String>,
-    auto_push: Option<bool>,
-    /// Limits per task run: absent = unchanged, `null` = back to the default.
-    #[serde(default, deserialize_with = "double_option")]
-    max_runtime_secs: Option<Option<i64>>,
-    #[serde(default, deserialize_with = "double_option")]
-    stall_timeout_secs: Option<Option<i64>>,
-    #[serde(default, deserialize_with = "double_option")]
-    max_cost_usd: Option<Option<f64>>,
-    #[serde(default, deserialize_with = "double_option")]
-    max_tokens: Option<Option<i64>>,
-    #[serde(default, deserialize_with = "double_option")]
-    max_turns: Option<Option<i64>>,
+    Ok(Json(load(&st, id).await?.view(role.into())))
 }
 
 pub async fn update(
@@ -259,7 +234,7 @@ pub async fn update(
     AuthUser(u): AuthUser,
     Path(id): Path<Uuid>,
     Json(p): Json<UpdateProject>,
-) -> ApiResult<Json<Project>> {
+) -> ApiResult<Json<ProjectView>> {
     require(&st, id, u.id, Role::Editor).await?;
     limits::int(
         "Max. Laufzeit (Sekunden)",
@@ -340,7 +315,8 @@ pub async fn update(
     .fetch_one(&st.db)
     .await?;
     st.wake.notify_one();
-    Ok(Json(project))
+    let role = role(&st, id, u.id).await?.ok_or_else(AppError::not_found)?;
+    Ok(Json(project.view(role.into())))
 }
 
 pub async fn remove(
@@ -364,7 +340,7 @@ pub async fn members(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<Vec<Member>>> {
     require(&st, id, u.id, Role::Viewer).await?;
     let rows: Vec<(Uuid, String, String, String)> = sqlx::query_as(
         "SELECT u.id, u.email, u.name, m.role FROM project_members m JOIN users u ON u.id=m.user_id WHERE m.project_id=$1 ORDER BY m.role, u.name",
@@ -372,16 +348,16 @@ pub async fn members(
     .bind(id)
     .fetch_all(&st.db)
     .await?;
-    Ok(Json(json!(rows
-        .into_iter()
-        .map(|(id, email, name, role)| json!({"user_id": id, "email": email, "name": name, "role": role}))
-        .collect::<Vec<_>>())))
-}
-
-#[derive(Deserialize)]
-pub struct AddMember {
-    email: String,
-    role: String,
+    Ok(Json(
+        rows.into_iter()
+            .map(|(user_id, email, name, role)| Member {
+                user_id,
+                email,
+                name,
+                role: ProjectRole::parse(&role).unwrap_or(ProjectRole::Viewer),
+            })
+            .collect(),
+    ))
 }
 
 pub async fn add_member(
@@ -450,10 +426,13 @@ pub async fn file(
     AuthUser(u): AuthUser,
     Path(id): Path<Uuid>,
     Query(q): Query<FileQuery>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<FileView>> {
     require(&st, id, u.id, Role::Viewer).await?;
     let f = st.runner.file(id, &q.path).await.map_err(runner_err)?;
-    Ok(Json(json!({"path": f.path, "content": f.content})))
+    Ok(Json(FileView {
+        path: f.path,
+        content: f.content,
+    }))
 }
 
 pub async fn zip(
@@ -491,7 +470,7 @@ pub async fn import(
     AuthUser(u): AuthUser,
     Path(id): Path<Uuid>,
     body: Bytes,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<ImportResult>> {
     require(&st, id, u.id, Role::Editor).await?;
     ensure_idle(&st, id).await?;
     let r = st
@@ -499,27 +478,36 @@ pub async fn import(
         .import(id, body.to_vec(), &u.name, &u.email)
         .await
         .map_err(runner_err)?;
-    Ok(Json(json!({"files": r.files, "sha": r.sha})))
+    Ok(Json(ImportResult {
+        files: r.files,
+        sha: r.sha,
+    }))
 }
 
 pub async fn commits(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<Vec<Commit>>> {
     require(&st, id, u.id, Role::Viewer).await?;
-    Ok(Json(json!(st
-        .runner
-        .log(id, 100)
-        .await
-        .map_err(runner_err)?)))
+    let log = st.runner.log(id, 100).await.map_err(runner_err)?;
+    Ok(Json(
+        log.into_iter()
+            .map(|c| Commit {
+                sha: c.sha,
+                author: c.author,
+                date: c.date,
+                subject: c.subject,
+            })
+            .collect(),
+    ))
 }
 
 pub async fn push(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<PushResult>> {
     require(&st, id, u.id, Role::Editor).await?;
     let p = load(&st, id).await?;
     let remote =
@@ -528,7 +516,10 @@ pub async fn push(
     if !r.ok {
         return Err(AppError::bad_request(format!("push failed: {}", r.output)));
     }
-    Ok(Json(json!({"ok": true, "output": r.output})))
+    Ok(Json(PushResult {
+        ok: true,
+        output: r.output,
+    }))
 }
 
 pub async fn tasks(

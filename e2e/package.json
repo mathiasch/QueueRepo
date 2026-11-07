@@ -8,6 +8,7 @@
     "test:ui": "playwright test --project=desktop --project=iphone --project=iphone-landscape"
   },
   "devDependencies": {
+    "@axe-core/playwright": "4.14.0",
     "@playwright/test": "1.63.0",
     "@types/node": "22.10.5"
   }

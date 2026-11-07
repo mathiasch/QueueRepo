@@ -15,7 +15,6 @@ mod gemini;
 mod mock;
 
 use anyhow::{bail, Result};
-use serde::Serialize;
 use serde_json::Value;
 
 pub use classify::{classify_text, parse_reset, ErrorCategory};
@@ -61,15 +60,7 @@ pub struct RunLimits {
 }
 
 /// What a provider integration can enforce/report natively.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct Capabilities {
-    /// The CLI enforces the result schema (missing contract = task failure).
-    pub structured_output: bool,
-    pub max_turns: bool,
-    pub max_cost: bool,
-    /// Token usage arrives while the run is in progress (live token guard).
-    pub live_usage: bool,
-}
+pub use queued_api::ProviderCapabilities as Capabilities;
 
 pub fn capabilities(provider: &str) -> Capabilities {
     match provider {

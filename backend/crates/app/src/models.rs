@@ -1,55 +1,12 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sqlx::FromRow;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, FromRow)]
-pub struct User {
-    pub id: Uuid,
-    pub email: String,
-    pub name: String,
-    pub is_admin: bool,
-}
-
-#[derive(Debug, Clone, Serialize, FromRow)]
-pub struct Task {
-    pub id: Uuid,
-    pub user_id: Uuid,
-    pub project_id: Uuid,
-    pub parent_id: Option<Uuid>,
-    pub kind: String,
-    pub title: String,
-    pub prompt: String,
-    pub context: String,
-    pub provider: String,
-    pub model: Option<String>,
-    pub status: String,
-    pub position: i64,
-    pub attempt: i32,
-    pub depth: i32,
-    pub created_by_agent: bool,
-    pub questions: Option<Value>,
-    pub handoff: Option<String>,
-    pub summary: Option<String>,
-    pub error: Option<String>,
-    pub review: Option<Value>,
-    pub usage: Option<Value>,
-    pub snapshot_before: Option<String>,
-    pub snapshot_after: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub finished_at: Option<DateTime<Utc>>,
-    pub updated_at: DateTime<Utc>,
-    pub max_runtime_secs: Option<i32>,
-    pub max_cost_usd: Option<f64>,
-    pub max_tokens: Option<i64>,
-    pub max_turns: Option<i32>,
-    /// [`FailureClass`] of the last run that did not finish normally.
-    pub failure_class: Option<String>,
-    pub transient_retries: i32,
-    pub not_before: Option<DateTime<Utc>>,
-}
+// Wire types shared with the web frontend live in `queued-api`.
+pub use queued_api::{
+    FailureClass, ProjectRole, ProjectView, ReviewResult, Settings, Task, TaskEvent, Usage, User,
+};
 
 pub mod status {
     pub const PENDING_APPROVAL: &str = "pending_approval";
@@ -62,7 +19,8 @@ pub mod status {
     pub const CANCELLED: &str = "cancelled";
 }
 
-#[derive(Debug, Clone, Serialize, FromRow)]
+/// Database row of a project. Internal: the API returns [`ProjectView`].
+#[derive(Debug, Clone, FromRow)]
 pub struct Project {
     pub id: Uuid,
     pub owner_id: Uuid,
@@ -76,7 +34,6 @@ pub struct Project {
     pub created_at: DateTime<Utc>,
     pub git_remote_url: Option<String>,
     pub git_branch: String,
-    #[serde(skip_serializing)]
     pub git_token_enc: Option<Vec<u8>>,
     pub auto_push: bool,
     pub max_runtime_secs: Option<i32>,
@@ -86,71 +43,31 @@ pub struct Project {
     pub max_turns: Option<i32>,
 }
 
-/// Why a run did not finish normally. Only [`FailureClass::Task`] consumes a
-/// fix attempt; everything else is re-queued, pauses the provider or blocks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FailureClass {
-    /// The agent's work is wrong (contract `failed`, verify/review failed …) → fix task.
-    Task,
-    /// Subscription/API rate limit → provider paused until reset, task re-queued.
-    RateLimit,
-    /// Overloaded / 5xx / network → re-queued with backoff.
-    ProviderTransient,
-    /// Runner unreachable, stream broken, orchestration error → re-queued with backoff.
-    Infra,
-    /// No output for the stall timeout → re-queued with backoff.
-    Stalled,
-    /// Authentication / billing → provider paused until credentials change.
-    ProviderAuth,
-    /// Unknown model, invalid request, broken credential → blocked.
-    Config,
-    LimitRuntime,
-    LimitCost,
-    LimitTokens,
-    LimitTurns,
-    Cancelled,
-}
-
-impl FailureClass {
-    pub const ALL: [FailureClass; 12] = [
-        Self::Task,
-        Self::RateLimit,
-        Self::ProviderTransient,
-        Self::Infra,
-        Self::Stalled,
-        Self::ProviderAuth,
-        Self::Config,
-        Self::LimitRuntime,
-        Self::LimitCost,
-        Self::LimitTokens,
-        Self::LimitTurns,
-        Self::Cancelled,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Task => "task",
-            Self::RateLimit => "rate_limit",
-            Self::ProviderTransient => "provider_transient",
-            Self::Infra => "infra",
-            Self::Stalled => "stalled",
-            Self::ProviderAuth => "provider_auth",
-            Self::Config => "config",
-            Self::LimitRuntime => "limit_runtime",
-            Self::LimitCost => "limit_cost",
-            Self::LimitTokens => "limit_tokens",
-            Self::LimitTurns => "limit_turns",
-            Self::Cancelled => "cancelled",
+impl Project {
+    /// Public projection: the encrypted git token never leaves the backend.
+    pub fn view(&self, role: ProjectRole) -> ProjectView {
+        ProjectView {
+            id: self.id,
+            owner_id: self.owner_id,
+            name: self.name.clone(),
+            description: self.description.clone(),
+            goal: self.goal.clone(),
+            verify_command: self.verify_command.clone(),
+            review_enabled: self.review_enabled,
+            review_provider: self.review_provider.clone(),
+            review_model: self.review_model.clone(),
+            created_at: self.created_at,
+            git_remote_url: self.git_remote_url.clone(),
+            git_branch: self.git_branch.clone(),
+            auto_push: self.auto_push,
+            max_runtime_secs: self.max_runtime_secs,
+            stall_timeout_secs: self.stall_timeout_secs,
+            max_cost_usd: self.max_cost_usd,
+            max_tokens: self.max_tokens,
+            max_turns: self.max_turns,
+            role,
+            has_git_token: self.git_token_enc.is_some(),
         }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|c| c.as_str() == s)
-    }
-
-    /// Re-queued with backoff and counted in `transient_retries`.
-    pub fn is_transient(self) -> bool {
-        matches!(self, Self::ProviderTransient | Self::Infra | Self::Stalled)
     }
 }
 
@@ -161,53 +78,6 @@ pub const RESULT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false
 
 /// JSON schema of [`ReviewResult`] (strict, see [`RESULT_SCHEMA`]).
 pub const REVIEW_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["approved","issues"],"properties":{"approved":{"type":"boolean"},"issues":{"type":"array","items":{"type":"string"}}}}"#;
-
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct Settings {
-    #[serde(skip_deserializing)]
-    pub user_id: Uuid,
-    pub parallelism: i32,
-    pub default_provider: String,
-    pub onempty_enabled: bool,
-    pub onempty_actions: Vec<String>,
-    pub onempty_cooldown_minutes: i32,
-    pub max_auto_tasks: i32,
-    pub max_fix_attempts: i32,
-    pub ntfy_url: Option<String>,
-    #[serde(skip_deserializing)]
-    pub last_onempty_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, FromRow)]
-pub struct TaskEvent {
-    pub id: i64,
-    pub task_id: Uuid,
-    pub ts: DateTime<Utc>,
-    pub kind: String,
-    pub content: String,
-}
-
-/// Token usage of one or more agent runs.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct Usage {
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub cost_usd: f64,
-}
-
-impl Usage {
-    /// Saturating: sums over many runs must never overflow (debug panic,
-    /// release wrap-around into negative usage).
-    pub fn add(&mut self, o: &Usage) {
-        self.input_tokens = self.input_tokens.saturating_add(o.input_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(o.output_tokens);
-        self.cache_read_tokens = self.cache_read_tokens.saturating_add(o.cache_read_tokens);
-        self.cache_write_tokens = self.cache_write_tokens.saturating_add(o.cache_write_tokens);
-        self.cost_usd += o.cost_usd;
-    }
-}
 
 /// Contract between queue and agent: structured output of the CLI or
 /// `.queue/result.json` written by the agent.
@@ -228,14 +98,6 @@ pub struct FollowUp {
     pub prompt: String,
 }
 
-/// Written by the reviewer agent to `.queue/review.json`.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default)]
-pub struct ReviewResult {
-    pub approved: bool,
-    pub issues: Vec<String>,
-}
-
 impl AgentResult {
     /// A contract counts only with a known status.
     pub fn has_valid_status(&self) -> bool {
@@ -249,6 +111,7 @@ impl AgentResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     /// Strictness required by OpenAI structured outputs, checked recursively.
     fn assert_strict(v: &Value, path: &str) {

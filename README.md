@@ -28,8 +28,9 @@ Browser / iPhone-PWA ──HTTPS──► Cloudflare Tunnel ──► queued  (U
 | `queued` | `backend/crates/app` | API, Auth, Scheduler (`FOR UPDATE SKIP LOCKED`), Budgets, Prompts, Fix-Loop, OnEmptyQueue |
 | `queued-runner` | `backend/crates/runner` | Git (init/clone/commit/diff/revert/push), Sandbox-Exec mit NDJSON-Streaming, Cancel |
 | `queued-common` | `backend/crates/common` | Wire-Protokoll zwischen beiden |
-| Frontend | `frontend/` | React/Vite-PWA, Safe-Area-fähig (Notch/Dynamic Island), iOS-Tab-Bar |
-| Tests | `backend/**/tests`, `frontend/src/*.test.ts`, `e2e/` | siehe unten |
+| `queued-api` | `backend/crates/api` | HTTP-/SSE-Typen, geteilt von Backend und Frontend (kompiliert auch nach WASM) |
+| Frontend `queued-web` | `frontend/` | Rust/Leptos (CSR, WebAssembly, Build mit Trunk), PWA mit Web Push, Safe-Area-fähig (Notch/Dynamic Island), Tab-Leiste unten auf dem iPhone, hell/dunkel, WCAG 2.2 AA |
+| Tests | `backend/**/tests`, `frontend/src/**` (`cargo test`), `e2e/` | siehe unten |
 
 **Isolation in der Praxis verifiziert:** Ein Agent-Container läuft mit der UID des Runner-Users, `CapEff: 0`, `NoNewPrivs: 1`. Secrets kommen nur per Env in den Container, nie in argv. Der Runner verweigert den Start als Root und mit schwachem Token.
 
@@ -87,12 +88,13 @@ Die CLI-Versionen sind im Agent-Image gepinnt (`docker/agent.Dockerfile`, Build 
 |---|---|---|
 | Unit (Rust) | Git-Ops inkl. Clone/Push/Pull, atomarer Revert, Path-Traversal, Exec (Streaming, Timeout, Cancel, Prozessgruppe), Container-Flags, Parser aller Provider, Limit-Erkennung, Budget-Logik, Prompts, Crypto, OIDC/PKCE/Apple-JWT | `cd backend && cargo test --workspace --lib` |
 | Integration (Rust) | App + Runner in-process + echtes Postgres (frische DB pro Test): Auth, Tenant-Isolation, Rollen, kompletter Task-Lifecycle mit Git, Fix-Loop, Rückfragen, Freigaben, Abo-Limit, Budgets, Cancel, Revert, Credentials, OnEmptyQueue, Clone + Auto-Push, Parallelität, SSE-Isolation, ZIP | `DATABASE_URL=postgres://… cargo test --workspace` |
-| Unit (Frontend) | Formatierung, Budget-Anzeige, VAPID-Decoding | `cd frontend && npm test` |
+| Unit (Frontend) | Formatierung, Status-/Fehlertexte, Budget-Anzeige, Limit-Eingaben, Fortschrittsphasen, Diff, Tastaturkürzel, VAPID-Decoding | `cd frontend && cargo test` |
 | System | echte Binaries als getrennte Prozesse: Runner-Auth, Session-Pflicht, Flow über die Prozessgrenze, Budget, Cancel | `cd e2e && npx playwright test --project=system` |
-| E2E | Browser gegen echten Stack: Registrierung, Einreihen, Live-Status, Drawer/Diff/Git-Log, Rückfrage, Freigabe, Fix-Kette, Budget-UI, Reorder | `npx playwright test --project=desktop` |
-| E2E Mobile | iPhone 15 Pro hoch/quer mit simulierter **Dynamic Island**/Notch/Home-Indikator: nichts verdeckt, Tab-Bar ≥ 44pt, Inputs ≥ 16px (kein iOS-Zoom), kein horizontales Scrollen | `npx playwright test --project=iphone --project=iphone-landscape` |
+| E2E | Browser gegen echten Stack: Registrierung, Onboarding, Einreihen mit Limits, Live-Status, Details/Diff/Rückgängig/Bearbeiten, Rückfrage, Freigabe, Fix-Kette, Budget-UI, Reorder/Verwerfen/Wiederherstellen, Bestätigungsdialoge, Tastaturkürzel, Live-Region, Theme | `npx playwright test --project=desktop` |
+| E2E Mobile | iPhone 15 Pro hoch/quer mit simulierter **Dynamic Island**/Notch/Home-Indikator: nichts verdeckt, Tab-Bar und alle Bedienelemente ≥ 44pt, Inputs ≥ 16px (kein iOS-Zoom), kein horizontales Scrollen | `npx playwright test --project=iphone --project=iphone-landscape` |
+| Accessibility | axe-core (WCAG 2.0/2.1/2.2 A+AA) auf allen Hauptansichten, hell und dunkel, Desktop und iPhone; Screenshots nach `WP00_SCREENSHOTS_DIR` | `a11y.spec.ts`, `mobile-a11y.spec.ts` (Teil der Projekte oben) |
 
-Der Mock-Provider (`ENABLE_MOCK_PROVIDER=true`) macht alle Flows deterministisch und kostet keine Tokens. Er wird über Schlüsselwörter im Prompt gesteuert: `MOCK_FAIL`, `MOCK_ASK`, `MOCK_FOLLOWUPS`, `MOCK_LIMIT`, `MOCK_SLOW`, `MOCK_TRANSIENT` (scheitert transient, bis die Re-Queue-Notiz im Prompt steht), `MOCK_TRANSIENT_ALWAYS`, `MOCK_AUTH`, `MOCK_STRUCTURED`, `MOCK_STRUCTURED_BAD`, `MOCK_TOKENS`, `MOCK_TURNS`, `MOCK_TRAP` (wartet auf SIGINT und meldet dann Verbrauch), `MOCK_STDERR429`, `MOCK_REVIEW_LIMIT`, `MOCK_QUIET` (6 s ohne Ausgabe, dann Erfolg), `MOCK_USAGE_TOTAL` (Gesamtverbrauch erst am Ende, weit über den Live-Werten). CI (`.github/workflows/ci.yml`) führt fmt, clippy `-D warnings`, alle Rust-Tests, Frontend-Build und -Tests sowie Playwright aus.
+Der Mock-Provider (`ENABLE_MOCK_PROVIDER=true`) macht alle Flows deterministisch und kostet keine Tokens. Er wird über Schlüsselwörter im Prompt gesteuert: `MOCK_FAIL`, `MOCK_ASK`, `MOCK_FOLLOWUPS`, `MOCK_LIMIT`, `MOCK_SLOW`, `MOCK_TRANSIENT` (scheitert transient, bis die Re-Queue-Notiz im Prompt steht), `MOCK_TRANSIENT_ALWAYS`, `MOCK_AUTH`, `MOCK_STRUCTURED`, `MOCK_STRUCTURED_BAD`, `MOCK_TOKENS`, `MOCK_TURNS`, `MOCK_TRAP` (wartet auf SIGINT und meldet dann Verbrauch), `MOCK_STDERR429`, `MOCK_REVIEW_LIMIT`, `MOCK_QUIET` (6 s ohne Ausgabe, dann Erfolg), `MOCK_USAGE_TOTAL` (Gesamtverbrauch erst am Ende, weit über den Live-Werten). CI (`.github/workflows/ci.yml`) führt fmt, clippy `-D warnings` (Backend sowie Frontend für wasm32 und nativ), alle Rust-Tests, den Trunk-Build sowie Playwright aus.
 
 ## Betrieb (Hetzner/Mac mini/Linux-Box, ohne Root zur Laufzeit)
 
@@ -121,7 +123,9 @@ Die Zugänge werden mit AES-256-GCM verschlüsselt (`MASTER_KEY`). Rotierte OAut
 cd backend
 RUNNER_ALLOW_ROOT=1 RUNNER_ENGINE=none RUNNER_TOKEN=dev-token-dev-token-dev-token cargo run --bin queued-runner &
 DATABASE_URL=postgres://… RUNNER_TOKEN=dev-token-dev-token-dev-token ENABLE_MOCK_PROVIDER=true cargo run --bin queued
-cd frontend && npm install && npm run dev      # http://localhost:5173
+# Frontend: einmalig `rustup target add wasm32-unknown-unknown` und
+# `cargo install --locked trunk@0.22.1 wasm-bindgen-cli@0.2.130` (Version = wasm-bindgen in frontend/Cargo.toml)
+cd frontend && trunk serve                      # http://localhost:5173, /api wird an :8080 weitergereicht
 ```
 
 ## Bekannte Grenzen

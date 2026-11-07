@@ -21,12 +21,16 @@ install -d /opt/queued/deploy && cp "$ROOT/deploy/compose.yml" /opt/queued/deplo
 # Build as the service user from a private copy (no root-owned artifacts).
 SRC=/opt/queued/src
 rm -rf "$SRC" && mkdir -p "$SRC"
-tar -C "$ROOT" --exclude=./backend/target --exclude='./*/node_modules' --exclude=./.git -cf - . | tar -C "$SRC" -xf -
+tar -C "$ROOT" --exclude=./backend/target --exclude=./frontend/target --exclude=./frontend/dist --exclude='./*/node_modules' --exclude=./.git -cf - . | tar -C "$SRC" -xf -
 chown -R queued:queued "$SRC" /opt/queued/web
-command -v node >/dev/null || apt-get install -y --no-install-recommends nodejs npm
 sudo -u queued -H bash -lc "command -v cargo >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
 sudo -u queued -H bash -lc "cd $SRC/backend && ~/.cargo/bin/cargo build --release"
-sudo -u queued -H bash -lc "cd $SRC/frontend && npm ci --no-audit --no-fund && npm run build && cp -r dist/. /opt/queued/web/"
+# Web frontend (Rust/Leptos → WebAssembly). wasm-bindgen-cli must match the
+# version pinned in frontend/Cargo.toml; Trunk downloads wasm-opt (pinned in Trunk.toml).
+sudo -u queued -H bash -lc "~/.cargo/bin/rustup target add wasm32-unknown-unknown \
+  && ~/.cargo/bin/cargo install --locked trunk@0.22.1 wasm-bindgen-cli@0.2.130"
+rm -rf /opt/queued/web/*
+sudo -u queued -H bash -lc "cd $SRC/frontend && PATH=\$HOME/.cargo/bin:\$PATH trunk build --release && cp -r dist/. /opt/queued/web/"
 install -m 755 "$SRC/backend/target/release/queued" "$SRC/backend/target/release/queued-runner" /opt/queued/bin/
 
 # Agent sandbox image in the queued user's rootless storage.

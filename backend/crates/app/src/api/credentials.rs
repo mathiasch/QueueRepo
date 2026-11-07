@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use serde::Deserialize;
+use queued_api::{CredentialInfo, PutCredential};
 use serde_json::{json, Value};
 
 use crate::{
@@ -14,29 +14,31 @@ use crate::{
 };
 
 /// Secrets are write-only: only provider/kind/updated_at are ever returned.
-pub async fn list(State(st): State<AppState>, AuthUser(u): AuthUser) -> ApiResult<Json<Value>> {
+pub async fn list(
+    State(st): State<AppState>,
+    AuthUser(u): AuthUser,
+) -> ApiResult<Json<Vec<CredentialInfo>>> {
     let rows: Vec<(String, String, chrono::DateTime<chrono::Utc>)> =
         sqlx::query_as("SELECT provider, kind, updated_at FROM provider_credentials WHERE user_id=$1 ORDER BY provider")
             .bind(u.id)
             .fetch_all(&st.db)
             .await?;
-    Ok(Json(json!(rows
-        .into_iter()
-        .map(|(p, k, t)| json!({"provider": p, "kind": k, "updated_at": t}))
-        .collect::<Vec<_>>())))
-}
-
-#[derive(Deserialize)]
-pub struct PutCred {
-    kind: String,
-    secret: String,
+    Ok(Json(
+        rows.into_iter()
+            .map(|(provider, kind, updated_at)| CredentialInfo {
+                provider,
+                kind,
+                updated_at,
+            })
+            .collect(),
+    ))
 }
 
 pub async fn put(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
     Path(provider): Path<String>,
-    Json(c): Json<PutCred>,
+    Json(c): Json<PutCredential>,
 ) -> ApiResult<Json<Value>> {
     if !credential_kinds(&provider).contains(&c.kind.as_str()) {
         return Err(AppError::bad_request(format!(

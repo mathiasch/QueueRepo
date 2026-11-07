@@ -2,12 +2,15 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use serde::Deserialize;
+use queued_api::{
+    Answer, ApproveAllResult, CreateTask, DiffView, MoveTask, TaskDetail, UpdateTask, MOVE_BOTTOM,
+    MOVE_DOWN, MOVE_TOP, MOVE_UP,
+};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{
-    limits::TaskLimitFields,
+    limits::CheckLimits,
     projects::{require, runner_err, Role},
 };
 use crate::{
@@ -40,22 +43,6 @@ pub async fn list(State(st): State<AppState>, AuthUser(u): AuthUser) -> ApiResul
         .fetch_all(&st.db)
         .await?,
     ))
-}
-
-#[derive(Deserialize)]
-pub struct CreateTask {
-    project_id: Uuid,
-    title: Option<String>,
-    prompt: String,
-    #[serde(default)]
-    context: String,
-    provider: Option<String>,
-    model: Option<String>,
-    parent_id: Option<Uuid>,
-    #[serde(default)]
-    front: bool,
-    #[serde(flatten)]
-    limits: TaskLimitFields,
 }
 
 pub async fn create(
@@ -130,7 +117,7 @@ pub async fn get(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<TaskDetail>> {
     let t = queue::load_task(&st, id)
         .await?
         .ok_or_else(AppError::not_found)?;
@@ -143,18 +130,7 @@ pub async fn get(
     .bind(id)
     .fetch_all(&st.db)
     .await?;
-    Ok(Json(json!({"task": t, "events": events})))
-}
-
-#[derive(Deserialize)]
-pub struct UpdateTask {
-    title: Option<String>,
-    prompt: Option<String>,
-    context: Option<String>,
-    provider: Option<String>,
-    model: Option<String>,
-    #[serde(flatten)]
-    limits: TaskLimitFields,
+    Ok(Json(TaskDetail { task: t, events }))
 }
 
 pub async fn update(
@@ -291,7 +267,7 @@ pub async fn approve(
 pub async fn approve_all(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<ApproveAllResult>> {
     let ids: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE tasks SET status='queued', updated_at=now() WHERE user_id=$1 AND status='pending_approval' RETURNING id",
     )
@@ -302,12 +278,9 @@ pub async fn approve_all(
         queue::emit_task(&st, *id).await;
     }
     st.wake.notify_one();
-    Ok(Json(json!({"approved": ids.len()})))
-}
-
-#[derive(Deserialize)]
-pub struct Answer {
-    answer: String,
+    Ok(Json(ApproveAllResult {
+        approved: ids.len(),
+    }))
 }
 
 pub async fn answer(
@@ -344,16 +317,11 @@ pub async fn answer(
     Ok(Json(json!({"ok": true})))
 }
 
-#[derive(Deserialize)]
-pub struct Move {
-    direction: String,
-}
-
 pub async fn move_task(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
     Path(id): Path<Uuid>,
-    Json(m): Json<Move>,
+    Json(m): Json<MoveTask>,
 ) -> ApiResult<Json<Value>> {
     let t = own_task(&st, id, u.id).await?;
     if t.status != status::QUEUED {
@@ -361,8 +329,8 @@ pub async fn move_task(
     }
     let mut tx = st.db.begin().await?;
     match m.direction.as_str() {
-        "top" | "bottom" => {
-            let sql = if m.direction == "top" {
+        MOVE_TOP | MOVE_BOTTOM => {
+            let sql = if m.direction == MOVE_TOP {
                 "UPDATE tasks SET position = (SELECT COALESCE(MIN(position),0) - 1 FROM tasks WHERE user_id=$2 AND status='queued') WHERE id=$1"
             } else {
                 "UPDATE tasks SET position = (SELECT COALESCE(MAX(position),0) + 1 FROM tasks WHERE user_id=$2 AND status='queued') WHERE id=$1"
@@ -373,8 +341,8 @@ pub async fn move_task(
                 .execute(&mut *tx)
                 .await?;
         }
-        "up" | "down" => {
-            let sql = if m.direction == "up" {
+        MOVE_UP | MOVE_DOWN => {
+            let sql = if m.direction == MOVE_UP {
                 "SELECT id, position FROM tasks WHERE user_id=$1 AND status='queued' AND position < $2 ORDER BY position DESC LIMIT 1"
             } else {
                 "SELECT id, position FROM tasks WHERE user_id=$1 AND status='queued' AND position > $2 ORDER BY position ASC LIMIT 1"
@@ -412,7 +380,7 @@ pub async fn diff(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<DiffView>> {
     let t = queue::load_task(&st, id)
         .await?
         .ok_or_else(AppError::not_found)?;
@@ -420,14 +388,20 @@ pub async fn diff(
         require(&st, t.project_id, u.id, Role::Viewer).await?;
     }
     let (Some(a), Some(b)) = (&t.snapshot_before, &t.snapshot_after) else {
-        return Ok(Json(json!({"diff": ""})));
+        return Ok(Json(DiffView {
+            diff: String::new(),
+            changed: None,
+        }));
     };
     let d = st
         .runner
         .diff(t.project_id, a, b, 2_000_000)
         .await
         .map_err(runner_err)?;
-    Ok(Json(json!({"diff": d.diff, "changed": d.changed})))
+    Ok(Json(DiffView {
+        diff: d.diff,
+        changed: Some(d.changed),
+    }))
 }
 
 pub async fn revert(

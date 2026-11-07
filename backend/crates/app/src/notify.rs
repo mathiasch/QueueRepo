@@ -32,9 +32,16 @@ async fn notify_inner(st: &AppState, user_id: Uuid, n: &Note<'_>) -> anyhow::Res
         .await?;
     st.emit(
         user_id,
-        json!({"type": "notification", "notification": {
-            "id": id, "kind": n.kind, "title": n.title, "body": n.body, "task_id": n.task_id, "push": n.push
-        }}),
+        queued_api::ServerEvent::Notification {
+            notification: queued_api::NotificationPush {
+                id,
+                kind: n.kind.to_string(),
+                title: n.title.clone(),
+                body: n.body.clone(),
+                task_id: n.task_id,
+                push: n.push,
+            },
+        },
     );
     if !n.push {
         return Ok(());

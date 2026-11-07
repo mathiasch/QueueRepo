@@ -1,12 +1,13 @@
 //! Task persistence helpers shared by API, runner and scheduler.
 use chrono::{DateTime, Utc};
-use serde_json::{json, Value};
+use queued_api::ServerEvent;
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
     agent::Credential,
     crypto,
-    models::{FailureClass, Settings, Task, Usage},
+    models::{FailureClass, Settings, Task, TaskEvent, Usage},
     state::AppState,
 };
 
@@ -81,7 +82,12 @@ pub async fn insert_task(st: &AppState, t: NewTask) -> sqlx::Result<Task> {
     .bind(t.limits.max_turns)
     .fetch_one(&st.db)
     .await?;
-    st.emit(task.user_id, json!({"type": "task", "task": task}));
+    st.emit(
+        task.user_id,
+        ServerEvent::Task {
+            task: Box::new(task.clone()),
+        },
+    );
     st.wake.notify_one();
     Ok(task)
 }
@@ -95,7 +101,8 @@ pub async fn load_task(st: &AppState, id: Uuid) -> sqlx::Result<Option<Task>> {
 
 pub async fn emit_task(st: &AppState, id: Uuid) {
     if let Ok(Some(t)) = load_task(st, id).await {
-        st.emit(t.user_id, json!({"type": "task", "task": t}));
+        let user = t.user_id;
+        st.emit(user, ServerEvent::Task { task: Box::new(t) });
     }
 }
 
@@ -112,7 +119,16 @@ pub async fn event(st: &AppState, task: &Task, kind: &str, content: &str) {
     if let Ok((id, ts)) = res {
         st.emit(
             task.user_id,
-            json!({"type": "task_event", "task_id": task.id, "event": {"id": id, "ts": ts, "kind": kind, "content": content}}),
+            ServerEvent::TaskEvent {
+                task_id: task.id,
+                event: TaskEvent {
+                    id,
+                    task_id: task.id,
+                    ts,
+                    kind: kind.to_string(),
+                    content,
+                },
+            },
         );
     }
 }
