@@ -238,8 +238,34 @@ pub(crate) fn s(v: &Value, k: &str) -> String {
         .to_string()
 }
 
+/// Upper bound for one token count reported by a CLI (the stream is not
+/// trusted: negative or absurd values would corrupt budgets and limits, and
+/// overflow in sums).
+pub const MAX_REPORTED_TOKENS: i64 = 10_000_000_000;
+/// Upper bound for one cost value (USD) reported by a CLI.
+pub const MAX_REPORTED_COST_USD: f64 = 10_000.0;
+
+/// Non-negative count from the stream, capped at [`MAX_REPORTED_TOKENS`];
+/// missing, fractional, negative or non-numeric values count as 0.
 pub(crate) fn n(v: &Value, k: &str) -> i64 {
-    v.get(k).and_then(|x| x.as_i64()).unwrap_or(0)
+    match v.get(k) {
+        Some(x) if x.is_u64() => x
+            .as_u64()
+            .map_or(0, |u| u.min(MAX_REPORTED_TOKENS as u64) as i64),
+        _ => 0,
+    }
+}
+
+/// Retry counters for display (`n` is already non-negative).
+pub(crate) fn count(x: i64) -> u32 {
+    u32::try_from(x).unwrap_or(u32::MAX)
+}
+
+/// Cost in USD from the stream, clamped to `0..=MAX_REPORTED_COST_USD`.
+pub(crate) fn usd(v: &Value) -> f64 {
+    v.as_f64()
+        .filter(|c| c.is_finite() && *c > 0.0)
+        .map_or(0.0, |c| c.min(MAX_REPORTED_COST_USD))
 }
 
 /// Error message from a CLI's error channel → categorised failure or plain error.
@@ -346,6 +372,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn usages(ev: &[AgentEvent]) -> Vec<Usage> {
+        ev.iter()
+            .filter_map(|e| match e {
+                AgentEvent::UsageDelta(u) | AgentEvent::UsageTotal(u) => Some(u.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn plausible(u: &Usage) -> bool {
+        [
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_read_tokens,
+            u.cache_write_tokens,
+        ]
+        .iter()
+        .all(|t| (0..=MAX_REPORTED_TOKENS).contains(t))
+            && (0.0..=MAX_REPORTED_COST_USD).contains(&u.cost_usd)
+    }
+
+    /// The CLI stream is untrusted: negative, absurd or mistyped usage must
+    /// neither panic (overflow) nor lower/explode budgets and limits.
+    #[test]
+    fn implausible_usage_values_are_clamped() {
+        let huge = "99999999999999999999";
+        let cases: [(&str, String); 7] = [
+            ("claude", format!(r#"{{"type":"assistant","message":{{"id":"m1","usage":{{"input_tokens":-9223372036854775808,"output_tokens":{huge},"cache_creation_input_tokens":9223372036854775807}}}}}}"#)),
+            ("claude", r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":9223372036854775807,"output_tokens":-5}}}"#.into()),
+            ("claude", format!(r#"{{"type":"result","subtype":"success","result":"x","total_cost_usd":-3.5,"modelUsage":{{"a":{{"inputTokens":-100,"outputTokens":9223372036854775807,"costUSD":1e300}},"b":{{"inputTokens":9223372036854775807,"cacheCreationInputTokens":{huge}}}}}}}"#)),
+            ("codex", r#"{"type":"turn.completed","usage":{"input_tokens":-50,"cached_input_tokens":9223372036854775807,"output_tokens":-1}}"#.into()),
+            ("gemini", r#"{"type":"result","status":"success","stats":{"input_tokens":"lots","cached":-7,"output_tokens":1.5e30}}"#.into()),
+            ("mock", r#"{"type":"usage","input_tokens":-1200,"output_tokens":9223372036854775807,"cost_usd":-1}"#.into()),
+            ("mock", r#"{"type":"usage","input_tokens":12.7,"cost_usd":"0.5"}"#.into()),
+        ];
+        for (p, line) in &cases {
+            let mut st = ParseState::default();
+            let us = usages(&parse_line(p, line, &mut st));
+            assert!(!us.is_empty(), "{p}: {line}");
+            for u in &us {
+                assert!(plausible(u), "{p}: {u:?} from {line}");
+            }
+        }
+        // Codex sums turns: many maximal turns saturate instead of overflowing.
+        let mut st = ParseState::default();
+        let turn = r#"{"type":"turn.completed","usage":{"input_tokens":9223372036854775807,"output_tokens":9223372036854775807}}"#;
+        let mut last = Usage::default();
+        for _ in 0..2000 {
+            last = usages(&parse_line("codex", turn, &mut st)).pop().unwrap();
+        }
+        assert!(last.output_tokens > 0 && last.input_tokens >= 0, "{last:?}");
+        let mut acc = Usage {
+            input_tokens: i64::MAX - 1,
+            ..Default::default()
+        };
+        acc.add(&Usage {
+            input_tokens: 10,
+            ..Default::default()
+        });
+        assert_eq!(acc.input_tokens, i64::MAX);
+        assert_eq!(crate::budget::counted(&acc), i64::MAX);
     }
 
     #[test]

@@ -100,9 +100,9 @@ pub(super) fn parse(v: &Value) -> Vec<AgentEvent> {
         },
         "retry" => vec![AgentEvent::Retry(RetryInfo {
             category: ErrorCategory::from_claude(&s(v, "category"), status),
-            attempt: n(v, "attempt").max(0) as u32,
-            max: n(v, "max").max(0) as u32,
-            delay_ms: n(v, "delay_ms").max(0) as u64,
+            attempt: super::count(n(v, "attempt")),
+            max: super::count(n(v, "max")),
+            delay_ms: n(v, "delay_ms") as u64,
             status,
         })],
         "structured" => vec![AgentEvent::Structured(v["value"].clone())],
@@ -115,7 +115,7 @@ pub(super) fn parse(v: &Value) -> Vec<AgentEvent> {
             input_tokens: n(v, "input_tokens"),
             output_tokens: n(v, "output_tokens"),
             cache_read_tokens: n(v, "cache_read_tokens"),
-            cost_usd: v["cost_usd"].as_f64().unwrap_or(0.0),
+            cost_usd: super::usd(&v["cost_usd"]),
             ..Default::default()
         })],
         _ => vec![],

@@ -60,7 +60,9 @@ pub struct ProviderStatus {
 }
 
 pub fn counted(u: &Usage) -> i64 {
-    u.input_tokens + u.output_tokens + u.cache_write_tokens
+    u.input_tokens
+        .saturating_add(u.output_tokens)
+        .saturating_add(u.cache_write_tokens)
 }
 
 /// Pure decision: is the budget exhausted, and until when (rolling window:

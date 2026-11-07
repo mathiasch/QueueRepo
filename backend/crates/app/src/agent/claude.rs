@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use super::{
     classify::{epoch_value, ErrorCategory},
-    n, s, tool_summary, trunc, AgentEvent, Credential, Invocation, LimitKind, ParseState,
+    count, n, s, tool_summary, trunc, usd, AgentEvent, Credential, Invocation, LimitKind, ParseState,
     RetryInfo, RunKind, RunLimits,
 };
 use crate::models::{Usage, RESULT_SCHEMA, REVIEW_SCHEMA};
@@ -81,11 +81,13 @@ fn model_usage(m: &Value) -> Option<Usage> {
     let m = m.as_object().filter(|m| !m.is_empty())?;
     let mut u = Usage::default();
     for v in m.values() {
-        u.input_tokens += n(v, "inputTokens");
-        u.output_tokens += n(v, "outputTokens");
-        u.cache_read_tokens += n(v, "cacheReadInputTokens");
-        u.cache_write_tokens += n(v, "cacheCreationInputTokens");
-        u.cost_usd += v["costUSD"].as_f64().unwrap_or(0.0);
+        u.add(&Usage {
+            input_tokens: n(v, "inputTokens"),
+            output_tokens: n(v, "outputTokens"),
+            cache_read_tokens: n(v, "cacheReadInputTokens"),
+            cache_write_tokens: n(v, "cacheCreationInputTokens"),
+            cost_usd: usd(&v["costUSD"]),
+        });
     }
     Some(u)
 }
@@ -146,9 +148,9 @@ pub(super) fn parse(v: &Value, st: &mut ParseState) -> Vec<AgentEvent> {
             st.last_retry = Some(category.clone());
             out.push(AgentEvent::Retry(RetryInfo {
                 category,
-                attempt: n(v, "attempt").max(0) as u32,
-                max: n(v, "max_retries").max(0) as u32,
-                delay_ms: n(v, "retry_delay_ms").max(0) as u64,
+                attempt: count(n(v, "attempt")),
+                max: count(n(v, "max_retries")),
+                delay_ms: n(v, "retry_delay_ms") as u64,
                 status,
             }));
         }
@@ -173,8 +175,8 @@ pub(super) fn parse(v: &Value, st: &mut ParseState) -> Vec<AgentEvent> {
         }
         "result" => {
             let mut u = model_usage(&v["modelUsage"]).unwrap_or_else(|| usage_of(&v["usage"]));
-            if let Some(c) = v["total_cost_usd"].as_f64() {
-                u.cost_usd = c;
+            if v["total_cost_usd"].is_number() {
+                u.cost_usd = usd(&v["total_cost_usd"]);
             }
             out.push(AgentEvent::UsageTotal(u));
             if !v["structured_output"].is_null() {

@@ -11,6 +11,47 @@ use tokio::process::Command;
 
 pub const QUEUE_DIR: &str = ".queue";
 
+/// Contract files larger than this are ignored (agent-controlled content).
+const MAX_QUEUE_FILE: u64 = 1024 * 1024;
+
+/// Writes `<workspace>/.queue/<name>` without following symlinks the agent
+/// may have planted (`.queue` → elsewhere, or `.queue/<name>` → a host file):
+/// a symlinked/non-directory `.queue` is replaced by a real directory, an
+/// existing entry is removed and the file is created exclusively.
+pub async fn write_queue_file(workspace: &Path, name: &str, content: &str) -> Result<()> {
+    anyhow::ensure!(
+        queued_common::valid_queue_file_name(name),
+        "invalid queue file name"
+    );
+    let dir = workspace.join(QUEUE_DIR);
+    match tokio::fs::symlink_metadata(&dir).await {
+        Ok(m) if m.file_type().is_dir() => {}
+        Ok(_) => {
+            tokio::fs::remove_file(&dir).await?;
+            tokio::fs::create_dir(&dir).await?;
+        }
+        Err(_) => tokio::fs::create_dir(&dir).await?,
+    }
+    let path = dir.join(name);
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(m) if m.file_type().is_dir() => tokio::fs::remove_dir_all(&path).await?,
+        Ok(_) => tokio::fs::remove_file(&path).await?,
+        Err(_) => {}
+    }
+    let mut f = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .await
+        .with_context(|| format!("create .queue/{name}"))?;
+    use tokio::io::AsyncWriteExt;
+    f.write_all(content.as_bytes()).await?;
+    // tokio writes in the background: without flush the agent may start
+    // before the content is on disk.
+    f.flush().await?;
+    Ok(())
+}
+
 const DEFAULT_GITIGNORE: &str = "node_modules/\ntarget/\n.venv/\nvenv/\n__pycache__/\ndist/\nbuild/\n.next/\n.DS_Store\n*.log\n.env\n";
 
 pub struct Repo {
@@ -418,15 +459,25 @@ impl Repo {
         Ok(())
     }
 
+    /// Reads a contract file the agent wrote. The agent controls the
+    /// workspace, so symlinks (`.queue` itself or the file) are never
+    /// followed – otherwise any host file readable by the runner would be
+    /// handed to the app – and oversized files are ignored.
     pub async fn queue_file(&self, name: &str) -> Result<Option<String>> {
         if !matches!(name, "result.json" | "review.json") {
             bail!("unknown queue file");
         }
-        Ok(
-            tokio::fs::read_to_string(self.dir.join(QUEUE_DIR).join(name))
-                .await
-                .ok(),
-        )
+        let dir = self.dir.join(QUEUE_DIR);
+        let is_real_dir = tokio::fs::symlink_metadata(&dir)
+            .await
+            .is_ok_and(|m| m.file_type().is_dir());
+        let path = dir.join(name);
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(m) if is_real_dir && m.file_type().is_file() && m.len() <= MAX_QUEUE_FILE => {
+                Ok(tokio::fs::read_to_string(&path).await.ok())
+            }
+            _ => Ok(None),
+        }
     }
 
     pub async fn delete(&self) -> Result<()> {
@@ -502,6 +553,54 @@ mod tests {
         let r = Repo::new(t.path(), "p1");
         r.init(&InitWorkspace::default()).await.unwrap();
         (t, r)
+    }
+
+    /// The agent controls the workspace: planted symlinks must never make the
+    /// runner read or overwrite files outside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queue_files_never_follow_symlinks() {
+        let (t, r) = repo().await;
+        let outside = t.path().join("host-secret.json");
+        std::fs::write(&outside, r#"{"status":"done","summary":"stolen"}"#).unwrap();
+        let q = r.dir.join(QUEUE_DIR);
+        std::fs::create_dir_all(&q).unwrap();
+
+        // File symlink: not read, and writing replaces the link, not the target.
+        std::os::unix::fs::symlink(&outside, q.join("result.json")).unwrap();
+        assert_eq!(r.queue_file("result.json").await.unwrap(), None);
+        std::os::unix::fs::symlink(&outside, q.join("review.json")).unwrap();
+        write_queue_file(&r.dir, "review.json", "").await.unwrap();
+        assert!(std::fs::read_to_string(&outside).unwrap().contains("stolen"));
+        assert!(!std::fs::symlink_metadata(q.join("review.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // Directory symlink: `.queue` → elsewhere.
+        let elsewhere = t.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("result.json"), r#"{"status":"done"}"#).unwrap();
+        std::fs::remove_dir_all(&q).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &q).unwrap();
+        assert_eq!(r.queue_file("result.json").await.unwrap(), None);
+        write_queue_file(&r.dir, "result.schema.json", "{}")
+            .await
+            .unwrap();
+        assert!(!elsewhere.join("result.schema.json").exists());
+        assert!(std::fs::symlink_metadata(&q).unwrap().file_type().is_dir());
+        assert_eq!(
+            std::fs::read_to_string(q.join("result.schema.json")).unwrap(),
+            "{}"
+        );
+
+        // Oversized contract files are ignored.
+        std::fs::write(
+            q.join("result.json"),
+            " ".repeat(MAX_QUEUE_FILE as usize + 1),
+        )
+        .unwrap();
+        assert_eq!(r.queue_file("result.json").await.unwrap(), None);
     }
 
     #[tokio::test]

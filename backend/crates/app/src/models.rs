@@ -198,11 +198,13 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Saturating: sums over many runs must never overflow (debug panic,
+    /// release wrap-around into negative usage).
     pub fn add(&mut self, o: &Usage) {
-        self.input_tokens += o.input_tokens;
-        self.output_tokens += o.output_tokens;
-        self.cache_read_tokens += o.cache_read_tokens;
-        self.cache_write_tokens += o.cache_write_tokens;
+        self.input_tokens = self.input_tokens.saturating_add(o.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(o.output_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(o.cache_read_tokens);
+        self.cache_write_tokens = self.cache_write_tokens.saturating_add(o.cache_write_tokens);
         self.cost_usd += o.cost_usd;
     }
 }

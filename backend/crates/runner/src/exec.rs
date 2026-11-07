@@ -220,17 +220,8 @@ pub async fn run(
 }
 
 async fn write_queue_files(workspace: &Path, files: &[(String, String)]) -> Result<()> {
-    if files.is_empty() {
-        return Ok(());
-    }
-    let dir = workspace.join(".queue");
-    tokio::fs::create_dir_all(&dir).await?;
     for (name, content) in files {
-        anyhow::ensure!(
-            queued_common::valid_queue_file_name(name),
-            "invalid queue file name"
-        );
-        tokio::fs::write(dir.join(name), content).await?;
+        crate::git::write_queue_file(workspace, name, content).await?;
     }
     Ok(())
 }

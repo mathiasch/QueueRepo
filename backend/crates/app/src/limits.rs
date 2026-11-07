@@ -54,7 +54,7 @@ impl EffectiveLimits {
     /// Remaining (tokens, cost) budget after `used`; `None` = unlimited.
     pub fn remaining(&self, used: &Usage) -> (Option<i64>, Option<f64>) {
         (
-            self.tokens.map(|t| t - counted(used)),
+            self.tokens.map(|t| t.saturating_sub(counted(used))),
             self.cost_usd.map(|c| c - used.cost_usd),
         )
     }

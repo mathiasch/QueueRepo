@@ -176,21 +176,34 @@ pub fn parse_reset(text: &str) -> Option<DateTime<Utc>> {
         r"(?i)(?:try again|resets?|retry)\s+in\s+((?:\d+\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)[\s,and]*)+)",
     );
     if let Some(c) = rel.captures(text) {
-        let mut d = Duration::zero();
+        // The text comes from the CLI: never trust its numbers (chrono panics
+        // on out-of-range durations and date overflows).
+        let mut secs: i64 = 0;
         for p in re(&PART, r"(?i)(\d+)\s*([a-z]+)").captures_iter(&c[1]) {
-            let v: i64 = p[1].parse().unwrap_or(0);
-            d += match p[2].chars().next().unwrap_or('m') {
-                'd' => Duration::days(v),
-                'h' => Duration::hours(v),
-                's' => Duration::seconds(v),
-                _ => Duration::minutes(v),
+            let v: i64 = p[1].parse().unwrap_or(i64::MAX);
+            let unit = match p[2].chars().next().unwrap_or('m') {
+                'd' => 86_400,
+                'h' => 3_600,
+                's' => 1,
+                _ => 60,
             };
+            secs = secs.saturating_add(v.saturating_mul(unit));
         }
-        if d > Duration::zero() {
+        if secs > 0 {
+            let d = Duration::seconds(secs.min(MAX_RESET.num_seconds()));
             return Some(Utc::now() + d);
         }
     }
     None
+}
+
+/// Longest provider pause we accept from a reported reset (weekly limits
+/// plus slack); anything later is implausible and would stall the queue.
+pub const MAX_RESET: Duration = Duration::days(8);
+
+/// Caps a reported reset at [`MAX_RESET`] from `now`.
+pub fn cap_reset(t: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
+    t.min(now + MAX_RESET)
 }
 
 /// Unix seconds or milliseconds (number or numeric string), or RFC 3339.
@@ -215,6 +228,26 @@ mod tests {
     fn parses_epoch_reset() {
         let t = parse_reset("Claude AI usage limit reached|1900000000").unwrap();
         assert_eq!(t.timestamp(), 1_900_000_000);
+    }
+
+    #[test]
+    fn absurd_resets_never_panic_and_are_capped() {
+        for text in [
+            "try again in 999999999999999999 days",
+            "try again in 99999999999999999999999 hours",
+            "try again in 106751991167300 days 5 hours",
+            "resets in 9223372036854775807 seconds",
+        ] {
+            let t = parse_reset(text).expect(text);
+            assert!(t <= Utc::now() + MAX_RESET, "{text}");
+            assert!(t > Utc::now() + MAX_RESET - Duration::minutes(1), "{text}");
+        }
+        let now = Utc::now();
+        assert_eq!(cap_reset(now + Duration::days(400), now), now + MAX_RESET);
+        assert_eq!(
+            cap_reset(now + Duration::hours(5), now),
+            now + Duration::hours(5)
+        );
     }
 
     #[test]

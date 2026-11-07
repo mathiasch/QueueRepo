@@ -589,22 +589,9 @@ async fn run_inner(
             "Keine Zugangsdaten für '{}' hinterlegt (Einstellungen → Provider).",
             task.provider
         );
-        finish(
-            st,
-            task.id,
-            Finish {
-                status: status::BLOCKED,
-                summary: None,
-                handoff: None,
-                error: Some(msg.clone()),
-                review: None,
-                questions: None,
-                usage,
-                failure_class: Some(FailureClass::Config),
-            },
-        )
-        .await?;
-        notify_blocked(st, task, &msg).await;
+        if block_running(st, task.id, FailureClass::Config, &msg, usage).await {
+            notify_blocked(st, task, &msg).await;
+        }
         return Ok(());
     };
     if let Some(k) = lim.exhausted(usage) {
@@ -617,57 +604,8 @@ async fn run_inner(
     }
 
     let remote = project_remote(st, &project);
-    st.runner
-        .init(
-            project.id,
-            &queued_common::InitWorkspace {
-                remote: remote.clone(),
-                branch: Some(project.git_branch.clone()),
-            },
-        )
-        .await?;
-    let begin = st.runner.begin(project.id, remote.clone()).await?;
-    for w in &begin.warnings {
-        event(st, task, "status", &format!("git: {w}")).await;
-    }
-    let before = if continues_interrupted(task, &begin.head) {
-        task.snapshot_before.clone().unwrap_or(begin.head)
-    } else {
-        begin.head
-    };
-    sqlx::query("UPDATE tasks SET snapshot_before=$2 WHERE id=$1")
-        .bind(task.id)
-        .bind(&before)
-        .execute(&st.db)
-        .await?;
-
-    let prompt = if task.kind == "onempty" {
-        let history: Vec<(String, Option<String>)> = sqlx::query_as(
-            "SELECT title, summary FROM tasks WHERE project_id=$1 AND status='done' AND kind<>'onempty' ORDER BY finished_at DESC LIMIT 8",
-        )
-        .bind(project.id)
-        .fetch_all(&st.db)
-        .await?;
-        prompt::onempty(&project, &settings.onempty_actions, &history)
-    } else {
-        let parent = match task.parent_id {
-            Some(pid) => sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-                "SELECT title, handoff, summary FROM tasks WHERE id=$1",
-            )
-            .bind(pid)
-            .fetch_optional(&st.db)
-            .await?
-            .map(|(title, handoff, summary)| Parent {
-                title,
-                handoff,
-                summary,
-            }),
-            None => None,
-        };
-        prompt::task(task, &project, parent.as_ref())
-    };
-
-    let caps = agent::capabilities(&task.provider);
+    let before = prepare_workspace(st, task, &project, remote.clone()).await?;
+    let prompt = build_prompt(st, task, &project, &settings).await?;
     let out = agent_run(
         st,
         task,
@@ -684,18 +622,7 @@ async fn run_inner(
         cancel,
     )
     .await?;
-    let run_usage = out.usage();
-    usage.add(&run_usage);
-    budget::record_usage(
-        &st.db,
-        task.user_id,
-        &task.provider,
-        Some(task.id),
-        &run_usage,
-    )
-    .await?;
-    check_budget(st, task.user_id, &task.provider).await;
-    warn_post_hoc_overrun(st, task, &out, &lim, usage).await;
+    record_run_usage(st, task, &task.provider, &out, usage).await?;
 
     let commits = Committer {
         st,
@@ -704,9 +631,8 @@ async fn run_inner(
         author_name: &author_name,
         author_email: &author_email,
     };
-
     let user_cancel = cancel.is_cancelled();
-    let contract = if early(&out, user_cancel, &task.provider, &lim).is_none() {
+    let contract = if early(&out, user_cancel, &task.provider, &lim, usage).is_none() {
         let file = st.runner.queue_file(project.id, "result.json").await?;
         let (c, note) = load_contract(out.structured.as_ref(), file.as_deref());
         event(st, task, "contract", &note).await;
@@ -714,8 +640,9 @@ async fn run_inner(
     } else {
         None
     };
+    let caps = agent::capabilities(&task.provider);
     let (disposition, pause) =
-        classify_run(&out, user_cancel, &task.provider, caps, contract, &lim);
+        classify_run(&out, user_cancel, &task.provider, caps, contract, &lim, usage);
     match pause {
         Some(Pause::RateLimit(reset)) => {
             pause_rate_limited(st, task, &task.provider, reset).await;
@@ -723,50 +650,10 @@ async fn run_inner(
         Some(Pause::Auth(msg)) => pause_auth(st, task, &task.provider, &msg).await,
         None => {}
     }
-
     let Some(next) = interrupted(&commits, disposition, &lim, usage).await? else {
         return Ok(());
     };
-    let (result, failure): (AgentResult, Option<String>) = match next {
-        Continue::Contract(r) => {
-            let failure = (r.status.as_deref() == Some("failed")).then(|| {
-                let mut f = r
-                    .summary
-                    .clone()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| cut(&out.final_text, 1500));
-                if let Some(e) = &out.error {
-                    f.push_str(&format!("\n\nAgent error: {e}"));
-                }
-                if !out.stderr_tail.trim().is_empty() {
-                    f.push_str(&format!("\n\nstderr (tail):\n{}", out.stderr_tail));
-                }
-                f
-            });
-            (r, failure)
-        }
-        Continue::ExitFallback { success } => {
-            let failure = (!success).then(|| {
-                let mut f = cut(&out.final_text, 1500);
-                if let Some(e) = &out.error {
-                    f.push_str(&format!("\n\nAgent error: {e}"));
-                }
-                if !out.stderr_tail.trim().is_empty() {
-                    f.push_str(&format!("\n\nstderr (tail):\n{}", out.stderr_tail));
-                }
-                f
-            });
-            (AgentResult::default(), failure)
-        }
-        Continue::TaskFailure(f) => {
-            let mut f = f;
-            if !out.stderr_tail.trim().is_empty() {
-                f.push_str(&format!("\n\nstderr (tail):\n{}", out.stderr_tail));
-            }
-            (AgentResult::default(), Some(f))
-        }
-    };
-
+    let (result, mut failure) = next.into_result(&out);
     let summary = result
         .summary
         .clone()
@@ -811,7 +698,6 @@ async fn run_inner(
         return Ok(());
     }
 
-    let mut failure = failure;
     let mut review_json = None;
     if failure.is_none() && task.kind != "onempty" {
         if let Some(cmd) = project
@@ -823,29 +709,14 @@ async fn run_inner(
             let verdict = run_verify(st, task, cmd, cancel).await?;
             if cancel.is_cancelled() {
                 // A user cancel stops the verify command – not a task failure.
-                finish(
-                    st,
-                    task.id,
-                    Finish {
-                        status: status::CANCELLED,
-                        summary: Some(summary),
-                        handoff,
-                        error: Some("abgebrochen".into()),
-                        review: None,
-                        questions: None,
-                        usage,
-                        failure_class: Some(FailureClass::Cancelled),
-                    },
-                )
-                .await?;
+                finish_cancelled(st, task.id, Some(summary), handoff, usage).await?;
                 return Ok(());
             }
             if let Err(msg) = verdict {
                 failure = Some(format!("Verifikation `{cmd}` fehlgeschlagen:\n{msg}"));
             }
         }
-        let changed = before != after;
-        if failure.is_none() && project.review_enabled && changed {
+        if failure.is_none() && project.review_enabled && before != after {
             match run_review(
                 st, task, &project, &before, &after, &summary, cancel, usage, &lim,
             )
@@ -858,34 +729,15 @@ async fn run_inner(
                     review_json = Some(json!(r));
                 }
                 ReviewOutcome::Skipped(why) => {
-                    event(
-                        st,
-                        task,
-                        "review",
-                        &if why.is_empty() {
-                            "Review übersprungen".to_string()
-                        } else {
-                            format!("Review übersprungen: {why}")
-                        },
-                    )
-                    .await
+                    let msg = if why.is_empty() {
+                        "Review übersprungen".to_string()
+                    } else {
+                        format!("Review übersprungen: {why}")
+                    };
+                    event(st, task, "review", &msg).await
                 }
                 ReviewOutcome::Cancelled => {
-                    finish(
-                        st,
-                        task.id,
-                        Finish {
-                            status: status::CANCELLED,
-                            summary: Some(summary),
-                            handoff,
-                            error: Some("abgebrochen".into()),
-                            review: None,
-                            questions: None,
-                            usage,
-                            failure_class: Some(FailureClass::Cancelled),
-                        },
-                    )
-                    .await?;
+                    finish_cancelled(st, task.id, Some(summary), handoff, usage).await?;
                     return Ok(());
                 }
                 ReviewOutcome::Blocked(class, reason) => {
@@ -899,110 +751,252 @@ async fn run_inner(
         }
     }
 
+    let end = End {
+        summary,
+        handoff,
+        review: review_json,
+        usage,
+    };
     match failure {
         None => {
             if project.auto_push && before != after {
                 if let Some(r) = remote {
-                    let p = st.runner.push(project.id, r).await?;
-                    event(
-                        st,
-                        task,
-                        if p.ok { "status" } else { "error" },
-                        &format!("git push: {}", if p.ok { "ok" } else { &p.output }),
-                    )
-                    .await;
-                    if !p.ok {
-                        notify(
-                            st,
-                            task.user_id,
-                            Note {
-                                kind: "push_failed",
-                                title: format!("Push fehlgeschlagen: {}", project.name),
-                                body: cut(&p.output, 400),
-                                task_id: Some(task.id),
-                                push: false,
-                            },
-                        )
-                        .await;
-                    }
+                    push(st, task, &project, r).await?;
                 }
             }
-            finish(
-                st,
-                task.id,
-                Finish {
-                    status: status::DONE,
-                    summary: Some(summary.clone()),
-                    handoff,
-                    error: None,
-                    review: review_json,
-                    questions: None,
-                    usage,
-                    failure_class: None,
-                },
-            )
-            .await?;
-            event(st, task, "status", "Erledigt").await;
-            let created = create_followups(st, task, &settings, result.follow_up_tasks).await?;
-            if created == 0 && task.kind != "onempty" {
-                notify(
-                    st,
-                    task.user_id,
-                    Note {
-                        kind: "done",
-                        title: format!("Erledigt: {}", task.title),
-                        body: cut(&summary, 300),
-                        task_id: Some(task.id),
-                        push: false,
-                    },
-                )
-                .await;
-            }
+            finish_done(st, task, &settings, end, result.follow_up_tasks).await
         }
-        Some(f) => {
-            event(st, task, "error", &f).await;
-            let can_fix = task.kind != "onempty" && task.attempt < settings.max_fix_attempts;
-            let st_final = if can_fix {
+        Some(f) => finish_failed(st, task, &settings, end, &f).await,
+    }
+}
+
+/// `init` + `begin` (pull, WIP commit of leftovers) and the task's diff base.
+async fn prepare_workspace(
+    st: &AppState,
+    task: &Task,
+    project: &Project,
+    remote: Option<GitRemote>,
+) -> Result<String, RunError> {
+    st.runner
+        .init(
+            project.id,
+            &queued_common::InitWorkspace {
+                remote: remote.clone(),
+                branch: Some(project.git_branch.clone()),
+            },
+        )
+        .await?;
+    let begin = st.runner.begin(project.id, remote).await?;
+    for w in &begin.warnings {
+        event(st, task, "status", &format!("git: {w}")).await;
+    }
+    let before = if continues_interrupted(task, &begin.head) {
+        task.snapshot_before.clone().unwrap_or(begin.head)
+    } else {
+        begin.head
+    };
+    sqlx::query("UPDATE tasks SET snapshot_before=$2 WHERE id=$1")
+        .bind(task.id)
+        .bind(&before)
+        .execute(&st.db)
+        .await?;
+    Ok(before)
+}
+
+async fn build_prompt(
+    st: &AppState,
+    task: &Task,
+    project: &Project,
+    settings: &Settings,
+) -> sqlx::Result<String> {
+    if task.kind == "onempty" {
+        let history: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT title, summary FROM tasks WHERE project_id=$1 AND status='done' AND kind<>'onempty' ORDER BY finished_at DESC LIMIT 8",
+        )
+        .bind(project.id)
+        .fetch_all(&st.db)
+        .await?;
+        return Ok(prompt::onempty(project, &settings.onempty_actions, &history));
+    }
+    let parent = match task.parent_id {
+        Some(pid) => sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT title, handoff, summary FROM tasks WHERE id=$1",
+        )
+        .bind(pid)
+        .fetch_optional(&st.db)
+        .await?
+        .map(|(title, handoff, summary)| Parent {
+            title,
+            handoff,
+            summary,
+        }),
+        None => None,
+    };
+    Ok(prompt::task(task, project, parent.as_ref()))
+}
+
+/// Adds a run's usage to the task total, the usage log and the budget check.
+async fn record_run_usage(
+    st: &AppState,
+    task: &Task,
+    provider: &str,
+    out: &RunOutcome,
+    usage: &mut Usage,
+) -> sqlx::Result<()> {
+    let run_usage = out.usage();
+    usage.add(&run_usage);
+    budget::record_usage(&st.db, task.user_id, provider, Some(task.id), &run_usage).await?;
+    check_budget(st, task.user_id, provider).await;
+    Ok(())
+}
+
+async fn push(st: &AppState, task: &Task, project: &Project, r: GitRemote) -> anyhow::Result<()> {
+    let p = st.runner.push(project.id, r).await?;
+    event(
+        st,
+        task,
+        if p.ok { "status" } else { "error" },
+        &format!("git push: {}", if p.ok { "ok" } else { &p.output }),
+    )
+    .await;
+    if !p.ok {
+        notify(
+            st,
+            task.user_id,
+            Note {
+                kind: "push_failed",
+                title: format!("Push fehlgeschlagen: {}", project.name),
+                body: cut(&p.output, 400),
+                task_id: Some(task.id),
+                push: false,
+            },
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// What the end of the result flow records on the task.
+struct End<'a> {
+    summary: String,
+    handoff: Option<String>,
+    review: Option<Value>,
+    usage: &'a Usage,
+}
+
+async fn finish_cancelled(
+    st: &AppState,
+    id: Uuid,
+    summary: Option<String>,
+    handoff: Option<String>,
+    usage: &Usage,
+) -> sqlx::Result<()> {
+    finish(
+        st,
+        id,
+        Finish {
+            status: status::CANCELLED,
+            summary,
+            handoff,
+            error: Some("abgebrochen".into()),
+            review: None,
+            questions: None,
+            usage,
+            failure_class: Some(FailureClass::Cancelled),
+        },
+    )
+    .await
+}
+
+async fn finish_done(
+    st: &AppState,
+    task: &Task,
+    settings: &Settings,
+    end: End<'_>,
+    follow_ups: Vec<FollowUp>,
+) -> Result<(), RunError> {
+    finish(
+        st,
+        task.id,
+        Finish {
+            status: status::DONE,
+            summary: Some(end.summary.clone()),
+            handoff: end.handoff,
+            error: None,
+            review: end.review,
+            questions: None,
+            usage: end.usage,
+            failure_class: None,
+        },
+    )
+    .await?;
+    event(st, task, "status", "Erledigt").await;
+    let created = create_followups(st, task, settings, follow_ups).await?;
+    if created == 0 && task.kind != "onempty" {
+        notify(
+            st,
+            task.user_id,
+            Note {
+                kind: "done",
+                title: format!("Erledigt: {}", task.title),
+                body: cut(&end.summary, 300),
+                task_id: Some(task.id),
+                push: false,
+            },
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// Real task failure: fix task while attempts are left, else blocked.
+async fn finish_failed(
+    st: &AppState,
+    task: &Task,
+    settings: &Settings,
+    end: End<'_>,
+    f: &str,
+) -> Result<(), RunError> {
+    event(st, task, "error", f).await;
+    let can_fix = task.kind != "onempty" && task.attempt < settings.max_fix_attempts;
+    finish(
+        st,
+        task.id,
+        Finish {
+            status: if can_fix {
                 status::FAILED
             } else {
                 status::BLOCKED
-            };
-            finish(
-                st,
-                task.id,
-                Finish {
-                    status: st_final,
-                    summary: Some(summary),
-                    handoff,
-                    error: Some(cut(&f, 8000)),
-                    review: review_json,
-                    questions: None,
-                    usage,
-                    failure_class: Some(FailureClass::Task),
-                },
-            )
-            .await?;
-            if can_fix {
-                create_fix(st, task, &f).await?;
-            } else {
-                notify(
-                    st,
-                    task.user_id,
-                    Note {
-                        kind: "blocked",
-                        title: format!("Blockiert: {}", task.title),
-                        body: format!(
-                            "Nach {} Fix-Versuchen nicht gelöst:\n{}",
-                            task.attempt,
-                            cut(&f, 400)
-                        ),
-                        task_id: Some(task.id),
-                        push: true,
-                    },
-                )
-                .await;
-            }
-        }
+            },
+            summary: Some(end.summary),
+            handoff: end.handoff,
+            error: Some(cut(f, 8000)),
+            review: end.review,
+            questions: None,
+            usage: end.usage,
+            failure_class: Some(FailureClass::Task),
+        },
+    )
+    .await?;
+    if can_fix {
+        create_fix(st, task, f).await?;
+    } else {
+        notify(
+            st,
+            task.user_id,
+            Note {
+                kind: "blocked",
+                title: format!("Blockiert: {}", task.title),
+                body: format!(
+                    "Nach {} Fix-Versuchen nicht gelöst:\n{}",
+                    task.attempt,
+                    cut(f, 400)
+                ),
+                task_id: Some(task.id),
+                push: true,
+            },
+        )
+        .await;
     }
     Ok(())
 }
@@ -1215,8 +1209,11 @@ async fn pause_rate_limited(
     provider: &str,
     reset: Option<DateTime<Utc>>,
 ) -> DateTime<Utc> {
+    let now = Utc::now();
     let until = match reset {
-        Some(t) if t > Utc::now() => t,
+        // A reset from the stream is capped: a bogus far-future value must
+        // not pause the provider for years.
+        Some(t) if t > now => agent::classify::cap_reset(t, now),
         _ => {
             budget::fallback_reset(&st.db, task.user_id, provider, st.cfg.limit_fallback_min).await
         }
