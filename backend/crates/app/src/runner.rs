@@ -69,21 +69,9 @@ pub async fn run_task(st: AppState, task: Task, cancel: CancellationToken) {
     match run_inner(&st, &task, &cancel, &mut usage).await {
         Ok(()) => {}
         Err(_) if cancel.is_cancelled() => {
-            let _ = finish(
-                &st,
-                id,
-                Finish {
-                    status: status::CANCELLED,
-                    summary: None,
-                    handoff: None,
-                    error: Some("abgebrochen".into()),
-                    review: None,
-                    questions: None,
-                    usage: &usage,
-                    failure_class: Some(FailureClass::Cancelled),
-                },
-            )
-            .await;
+            if let Err(e) = finish_cancelled(&st, id, None, None, &usage).await {
+                tracing::error!("task {id}: could not mark cancelled: {e:#}");
+            }
         }
         Err(RunError::Config(msg)) => {
             tracing::warn!("task {id}: configuration error: {msg}");
@@ -346,12 +334,27 @@ fn limit_reason(k: LimitKind, l: &EffectiveLimits, by_cli: bool) -> String {
     )
 }
 
+fn usage_text(k: LimitKind, used: &Usage) -> String {
+    match k {
+        LimitKind::Cost => format!("verbraucht ${:.4}", used.cost_usd),
+        _ => format!("verbraucht {} Tokens", budget::counted(used)),
+    }
+}
+
 /// Decisions 1–5 of [`classify_run`] that do not need the result contract.
+///
+/// `used` is the task's usage including this run. A cumulative limit that is
+/// exceeded only according to the final usage report (codex/gemini report
+/// usage at the end, Claude's live deltas can under-count) blocks exactly
+/// like the live guard: a task over its limit never ends `done` and triggers
+/// no further paid step (review, fix task, follow-ups). Its changes are kept
+/// as a partial commit, visible in the task's diff.
 fn early(
     o: &RunOutcome,
     user_cancel: bool,
     provider: &str,
     l: &EffectiveLimits,
+    used: &Usage,
 ) -> Option<Disposition> {
     if user_cancel {
         return Some(Disposition::Cancelled);
@@ -360,6 +363,16 @@ fn early(
         return Some(Disposition::Blocked {
             class: limit_class(k),
             reason: limit_reason(k, l, false),
+        });
+    }
+    if let Some(k) = l.exhausted(used) {
+        return Some(Disposition::Blocked {
+            class: limit_class(k),
+            reason: format!(
+                "{} – erst nach dem Lauf gemeldet ({}); die Änderungen sind committet (Diff im Auftrag)",
+                limit_reason(k, l, false),
+                usage_text(k, used)
+            ),
         });
     }
     if o.timed_out {
@@ -405,8 +418,9 @@ pub(crate) fn classify_run(
     caps: Capabilities,
     contract: Option<AgentResult>,
     l: &EffectiveLimits,
+    used: &Usage,
 ) -> (Disposition, Option<Pause>) {
-    if let Some(d) = early(o, user_cancel, provider, l) {
+    if let Some(d) = early(o, user_cancel, provider, l, used) {
         return (d, None);
     }
     let pause = match &o.failure {
@@ -641,8 +655,15 @@ async fn run_inner(
         None
     };
     let caps = agent::capabilities(&task.provider);
-    let (disposition, pause) =
-        classify_run(&out, user_cancel, &task.provider, caps, contract, &lim, usage);
+    let (disposition, pause) = classify_run(
+        &out,
+        user_cancel,
+        &task.provider,
+        caps,
+        contract,
+        &lim,
+        usage,
+    );
     match pause {
         Some(Pause::RateLimit(reset)) => {
             pause_rate_limited(st, task, &task.provider, reset).await;
@@ -816,7 +837,11 @@ async fn build_prompt(
         .bind(project.id)
         .fetch_all(&st.db)
         .await?;
-        return Ok(prompt::onempty(project, &settings.onempty_actions, &history));
+        return Ok(prompt::onempty(
+            project,
+            &settings.onempty_actions,
+            &history,
+        ));
     }
     let parent = match task.parent_id {
         Some(pid) => sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
@@ -1067,21 +1092,7 @@ async fn interrupted(
     match disposition {
         Disposition::Cancelled => {
             c.partial(" (abgebrochen)".into()).await;
-            finish(
-                st,
-                task.id,
-                Finish {
-                    status: status::CANCELLED,
-                    summary: None,
-                    handoff: None,
-                    error: Some("abgebrochen".into()),
-                    review: None,
-                    questions: None,
-                    usage,
-                    failure_class: Some(FailureClass::Cancelled),
-                },
-            )
-            .await?;
+            finish_cancelled(st, task.id, None, None, usage).await?;
             Ok(None)
         }
         Disposition::Blocked { class, reason } => {
@@ -1193,6 +1204,41 @@ enum Continue {
     TaskFailure(String),
 }
 
+impl Continue {
+    /// The run's result and, for a real task failure, its description
+    /// (with the agent error and the stderr tail for the fix task).
+    fn into_result(self, out: &RunOutcome) -> (AgentResult, Option<String>) {
+        let details = |mut f: String, with_error: bool| {
+            if let Some(e) = out.error.as_ref().filter(|_| with_error) {
+                f.push_str(&format!("\n\nAgent error: {e}"));
+            }
+            if !out.stderr_tail.trim().is_empty() {
+                f.push_str(&format!("\n\nstderr (tail):\n{}", out.stderr_tail));
+            }
+            f
+        };
+        match self {
+            Continue::Contract(r) => {
+                let failure = (r.status.as_deref() == Some("failed")).then(|| {
+                    let base = r
+                        .summary
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| cut(&out.final_text, 1500));
+                    details(base, true)
+                });
+                (r, failure)
+            }
+            Continue::ExitFallback { success } => (
+                AgentResult::default(),
+                (!success).then(|| details(cut(&out.final_text, 1500), true)),
+            ),
+            // The classifier already included the agent error.
+            Continue::TaskFailure(f) => (AgentResult::default(), Some(details(f, false))),
+        }
+    }
+}
+
 async fn set_snapshot_after(st: &AppState, id: Uuid, sha: &str) -> sqlx::Result<()> {
     sqlx::query("UPDATE tasks SET snapshot_after=$2 WHERE id=$1")
         .bind(id)
@@ -1252,54 +1298,6 @@ async fn pause_auth(st: &AppState, task: &Task, provider: &str, msg: &str) {
         },
     )
     .await;
-}
-
-/// Providers without live usage report tokens only at the end: the run is
-/// not stopped, but an overrun is reported.
-async fn warn_post_hoc_overrun(
-    st: &AppState,
-    task: &Task,
-    out: &RunOutcome,
-    lim: &EffectiveLimits,
-    usage: &Usage,
-) {
-    if out.guard_limit.is_some() || out.cli_limit.is_some() {
-        return;
-    }
-    if let Some(msg) = post_hoc_overrun(lim, usage) {
-        event(st, task, "guard", &msg).await;
-        notify(
-            st,
-            task.user_id,
-            Note {
-                kind: "limit_exceeded",
-                title: format!("Limit überschritten: {}", task.title),
-                body: msg,
-                task_id: Some(task.id),
-                push: false,
-            },
-        )
-        .await;
-    }
-}
-
-pub(crate) fn post_hoc_overrun(lim: &EffectiveLimits, usage: &Usage) -> Option<String> {
-    let (tokens, cost) = lim.remaining(usage);
-    if tokens.is_some_and(|t| t < 0) {
-        Some(format!(
-            "Token-Limit überschritten ({} / {}) – vom Provider erst nach dem Lauf gemeldet, Ergebnis bleibt bestehen",
-            budget::counted(usage),
-            lim.tokens.unwrap_or_default()
-        ))
-    } else if cost.is_some_and(|c| c < 0.0) {
-        Some(format!(
-            "Kosten-Limit überschritten (${:.4} / ${:.4}) – erst nach dem Lauf gemeldet, Ergebnis bleibt bestehen",
-            usage.cost_usd,
-            lim.cost_usd.unwrap_or_default()
-        ))
-    } else {
-        None
-    }
 }
 
 async fn check_budget(st: &AppState, user: Uuid, provider: &str) {
@@ -1660,12 +1658,6 @@ async fn run_review(
     if budget::is_blocked(&st.db, task.user_id, &provider).await? {
         return Ok(ReviewOutcome::Skipped(String::new()));
     }
-    if let Some(k) = lim.exhausted(usage) {
-        return Ok(ReviewOutcome::Blocked(
-            limit_class(k),
-            format!("{} – kein Review-Lauf", limit_reason(k, lim, false)),
-        ));
-    }
     event(st, task, "review", &format!("Review via {provider}")).await;
     let diff = st
         .runner
@@ -1697,15 +1689,12 @@ async fn run_review(
         }
         Err(e) => return Err(e),
     };
-    let run_usage = out.usage();
-    usage.add(&run_usage);
-    budget::record_usage(&st.db, task.user_id, &provider, Some(task.id), &run_usage).await?;
-    check_budget(st, task.user_id, &provider).await;
+    record_run_usage(st, task, &provider, &out, usage).await?;
     if cancel.is_cancelled() {
         return Ok(ReviewOutcome::Cancelled);
     }
     let caps = agent::capabilities(&provider);
-    if let Some(d) = early(&out, false, &provider, lim) {
+    if let Some(d) = early(&out, false, &provider, lim, usage) {
         return Ok(match d {
             Disposition::Blocked { class, reason } => {
                 ReviewOutcome::Blocked(class, format!("{reason} (Review)"))
@@ -1942,7 +1931,15 @@ mod tests {
         provider: &str,
         c: Option<AgentResult>,
     ) -> (Disposition, Option<Pause>) {
-        classify_run(o, false, provider, agent::capabilities(provider), c, &lim())
+        classify_run(
+            o,
+            false,
+            provider,
+            agent::capabilities(provider),
+            c,
+            &lim(),
+            &o.usage(),
+        )
     }
 
     #[test]
@@ -1960,7 +1957,8 @@ mod tests {
                 "claude",
                 agent::capabilities("claude"),
                 Some(done()),
-                &lim()
+                &lim(),
+                &Usage::default()
             )
             .0,
             Disposition::Cancelled
@@ -2220,10 +2218,12 @@ mod tests {
         assert!(load_review(None, None).is_none());
     }
 
+    /// Reviewer decision on the open question of the test report: an overrun
+    /// that only shows up in the final usage report (codex/gemini, or
+    /// under-counted Claude deltas) blocks like the live guard, even with a
+    /// valid `done` contract – no done, no review, no fix task, no follow-ups.
     #[test]
-    fn post_hoc_token_overrun_warns_only() {
-        // codex/gemini: no live usage → the run completes; the classifier
-        // still decides by contract, the overrun is only reported.
+    fn post_hoc_overrun_blocks_even_with_a_contract() {
         let o = RunOutcome {
             success: true,
             usage_total: Some(Usage {
@@ -2232,23 +2232,82 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(
-            classify(&o, "codex", Some(done())).0,
-            Disposition::Contract(done())
-        );
-        let msg = post_hoc_overrun(&lim(), &o.usage()).unwrap();
-        assert!(
-            msg.contains("5000 / 1000") && msg.contains("Ergebnis bleibt"),
-            "{msg}"
-        );
-        assert!(post_hoc_overrun(&lim(), &Usage::default()).is_none());
-        let over_cost = Usage {
-            cost_usd: 2.0,
+        for p in ["codex", "gemini", "claude"] {
+            match classify(&o, p, Some(done())).0 {
+                Disposition::Blocked {
+                    class: FailureClass::LimitTokens,
+                    reason,
+                } => assert!(
+                    reason.contains("Tokens 1000")
+                        && reason.contains("verbraucht 5000 Tokens")
+                        && reason.contains("erst nach dem Lauf"),
+                    "{reason}"
+                ),
+                d => panic!("{p}: {d:?}"),
+            }
+        }
+        let over_cost = RunOutcome {
+            usage_total: Some(Usage {
+                cost_usd: 2.0,
+                ..Default::default()
+            }),
             ..Default::default()
         };
-        assert!(post_hoc_overrun(&lim(), &over_cost)
-            .unwrap()
-            .contains("Kosten"));
+        assert!(matches!(
+            classify(&over_cost, "codex", Some(done())).0,
+            Disposition::Blocked {
+                class: FailureClass::LimitCost,
+                ..
+            }
+        ));
+        // Below the limit the contract decides; the task total counts, not the run.
+        let small = RunOutcome {
+            usage_total: Some(Usage {
+                input_tokens: 999,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify(&small, "codex", Some(done())).0,
+            Disposition::Contract(done())
+        );
+        let earlier = Usage {
+            input_tokens: 600,
+            ..Default::default()
+        };
+        let mut total = earlier.clone();
+        total.add(&small.usage());
+        assert!(matches!(
+            classify_run(
+                &small,
+                false,
+                "codex",
+                agent::capabilities("codex"),
+                Some(done()),
+                &lim(),
+                &total
+            )
+            .0,
+            Disposition::Blocked {
+                class: FailureClass::LimitTokens,
+                ..
+            }
+        ));
+        // A user cancel still wins.
+        assert_eq!(
+            classify_run(
+                &o,
+                true,
+                "codex",
+                agent::capabilities("codex"),
+                Some(done()),
+                &lim(),
+                &o.usage()
+            )
+            .0,
+            Disposition::Cancelled
+        );
     }
 
     #[test]

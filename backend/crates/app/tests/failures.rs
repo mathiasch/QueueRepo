@@ -576,6 +576,61 @@ async fn token_limit_stops_run_live(pool: PgPool) {
     assert_eq!(fixes(&a.tasks().await), 0);
 }
 
+/// Reviewer decision (open point of WP01-test): a token limit that is only
+/// exceeded according to the final usage report (codex/gemini; mock via
+/// MOCK_USAGE_TOTAL) blocks the task like the live guard – even with a
+/// `done` contract and review enabled: no review run, no fix task, no
+/// follow-ups, the changes stay as a partial commit inside the task diff.
+#[sqlx::test(migrator = "queued::MIGRATOR")]
+async fn post_hoc_token_overrun_blocks_without_review_or_fix(pool: PgPool) {
+    let h = start(pool).await;
+    let a = h.user("a@x.ch").await;
+    let p = a.project(json!({"name": "Demo"})).await;
+    a.patch(
+        &format!("/api/projects/{p}"),
+        json!({"review_enabled": true, "review_provider": "mock"}),
+    )
+    .await;
+    let t = a
+        .task_with(&p, "MOCK_USAGE_TOTAL big", json!({"max_tokens": 3000}))
+        .await;
+    let b = a.wait_status(&t, &["blocked"]).await;
+    let task = &b["task"];
+    assert_eq!(task["failure_class"], "limit_tokens", "{task}");
+    let err = task["error"].as_str().unwrap();
+    assert!(
+        err.contains("Limit überschritten: Tokens 3000")
+            && err.contains("verbraucht 4500 Tokens")
+            && err.contains("erst nach dem Lauf"),
+        "{err}"
+    );
+    // The final report replaces the live deltas (1350) – counted once.
+    assert_eq!(task["usage"]["input_tokens"], 4000);
+    assert_eq!(usage_rows(&h, &t).await, vec![(4000, 500)]);
+    let ev = a.events_of(&t).await;
+    assert!(
+        !ev.iter().any(|(k, _)| k == "review"),
+        "no review run: {ev:?}"
+    );
+    assert!(
+        !ev.iter().any(|(k, _)| k == "contract"),
+        "result not evaluated: {ev:?}"
+    );
+    assert_eq!(fixes(&a.tasks().await), 0);
+    let commits = a.get(&format!("/api/projects/{p}/commits")).await.1;
+    assert!(
+        commits[0]["subject"]
+            .as_str()
+            .unwrap()
+            .contains("(unterbrochen: limit_tokens)"),
+        "{commits}"
+    );
+    assert_eq!(task["snapshot_after"], commits[0]["sha"], "{commits}");
+    // Without a limit the same run is done (the overrun alone decides).
+    let free = a.task(&p, "MOCK_USAGE_TOTAL free").await;
+    a.wait_status(&free, &["done"]).await;
+}
+
 /// AK25: live cost guard.
 #[sqlx::test(migrator = "queued::MIGRATOR")]
 async fn cost_limit_stops_run_live(pool: PgPool) {

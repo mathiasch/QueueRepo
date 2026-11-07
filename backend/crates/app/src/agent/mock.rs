@@ -6,7 +6,9 @@
 //! MOCK_TOKENS (usage lines with pauses), MOCK_TURNS (fails if a turn limit is
 //! passed), MOCK_TRAP (waits for SIGINT and flushes usage), MOCK_STDERR429,
 //! MOCK_REVIEW_LIMIT (the review run hits a rate limit), MOCK_QUIET (6 s
-//! without any output after the first usage line, then success).
+//! without any output after the first usage line, then success),
+//! MOCK_USAGE_TOTAL (final usage report far above the live deltas, like
+//! codex/gemini that report usage only at the end).
 use serde_json::Value;
 
 use super::{
@@ -31,6 +33,7 @@ esac
 case "$P" in
   *MOCK_SLOW*) echo '{"type":"text","text":"working slowly"}'; sleep 30;;
   *MOCK_QUIET*) sleep 6;;
+  *MOCK_USAGE_TOTAL*) echo '{"type":"usage_total","input_tokens":4000,"output_tokens":500}';;
   *MOCK_TRAP*)
     trap 'echo "{\"type\":\"usage\",\"input_tokens\":1200,\"output_tokens\":150}"; echo "{\"type\":\"text\",\"text\":\"interrupted cleanly\"}"; echo "{\"type\":\"final\",\"text\":\"interrupted cleanly\"}"; exit 130' INT
     echo '{"type":"text","text":"waiting for SIGINT"}'; sleep 30 & wait $!;;
@@ -111,13 +114,20 @@ pub(super) fn parse(v: &Value) -> Vec<AgentEvent> {
             "cost" => vec![AgentEvent::LimitHit(LimitKind::Cost)],
             _ => vec![],
         },
-        "usage" => vec![AgentEvent::UsageDelta(Usage {
-            input_tokens: n(v, "input_tokens"),
-            output_tokens: n(v, "output_tokens"),
-            cache_read_tokens: n(v, "cache_read_tokens"),
-            cost_usd: super::usd(&v["cost_usd"]),
-            ..Default::default()
-        })],
+        "usage" | "usage_total" => {
+            let u = Usage {
+                input_tokens: n(v, "input_tokens"),
+                output_tokens: n(v, "output_tokens"),
+                cache_read_tokens: n(v, "cache_read_tokens"),
+                cost_usd: super::usd(&v["cost_usd"]),
+                ..Default::default()
+            };
+            vec![if s(v, "type") == "usage" {
+                AgentEvent::UsageDelta(u)
+            } else {
+                AgentEvent::UsageTotal(u)
+            }]
+        }
         _ => vec![],
     }
 }

@@ -571,7 +571,9 @@ mod tests {
         assert_eq!(r.queue_file("result.json").await.unwrap(), None);
         std::os::unix::fs::symlink(&outside, q.join("review.json")).unwrap();
         write_queue_file(&r.dir, "review.json", "").await.unwrap();
-        assert!(std::fs::read_to_string(&outside).unwrap().contains("stolen"));
+        assert!(std::fs::read_to_string(&outside)
+            .unwrap()
+            .contains("stolen"));
         assert!(!std::fs::symlink_metadata(q.join("review.json"))
             .unwrap()
             .file_type()

@@ -76,8 +76,8 @@ Limits (Projekt-Standard unter Projekt → Einstellungen, pro Auftrag per API ü
 | Provider (gepinnte CLI) | Ergebnis-Schema | Turn-Limit | Kostenlimit | Token-Verbrauch |
 |---|---|---|---|---|
 | Claude Code 2.1.319 | `--json-schema` | `--max-turns` | `--max-budget-usd` (Schätzung der CLI) | live (`assistant.message.usage`), am Ende `modelUsage` |
-| Codex CLI 0.167.0 | `--output-schema` | – | – | erst am Ende (`turn.completed`) → Überschreitung nur gemeldet |
-| Gemini CLI 0.67.0 | – (nur Datei) | `model.maxSessionTurns` | – | erst am Ende → Überschreitung nur gemeldet |
+| Codex CLI 0.167.0 | `--output-schema` | – | – | erst am Ende (`turn.completed`) → Überschreitung blockiert nach dem Lauf |
+| Gemini CLI 0.67.0 | – (nur Datei) | `model.maxSessionTurns` | – | erst am Ende → Überschreitung blockiert nach dem Lauf |
 
 Die CLI-Versionen sind im Agent-Image gepinnt (`docker/agent.Dockerfile`, Build prüft die Versionen); die Parser haben Contract-Tests gegen Fixtures genau dieser Versionen (`backend/crates/app/tests/fixtures/cli/`, Herkunft in `PROVENANCE.md`).
 
@@ -92,7 +92,7 @@ Die CLI-Versionen sind im Agent-Image gepinnt (`docker/agent.Dockerfile`, Build 
 | E2E | Browser gegen echten Stack: Registrierung, Einreihen, Live-Status, Drawer/Diff/Git-Log, Rückfrage, Freigabe, Fix-Kette, Budget-UI, Reorder | `npx playwright test --project=desktop` |
 | E2E Mobile | iPhone 15 Pro hoch/quer mit simulierter **Dynamic Island**/Notch/Home-Indikator: nichts verdeckt, Tab-Bar ≥ 44pt, Inputs ≥ 16px (kein iOS-Zoom), kein horizontales Scrollen | `npx playwright test --project=iphone --project=iphone-landscape` |
 
-Der Mock-Provider (`ENABLE_MOCK_PROVIDER=true`) macht alle Flows deterministisch und kostet keine Tokens. Er wird über Schlüsselwörter im Prompt gesteuert: `MOCK_FAIL`, `MOCK_ASK`, `MOCK_FOLLOWUPS`, `MOCK_LIMIT`, `MOCK_SLOW`, `MOCK_TRANSIENT` (scheitert transient, bis die Re-Queue-Notiz im Prompt steht), `MOCK_TRANSIENT_ALWAYS`, `MOCK_AUTH`, `MOCK_STRUCTURED`, `MOCK_STRUCTURED_BAD`, `MOCK_TOKENS`, `MOCK_TURNS`, `MOCK_TRAP` (wartet auf SIGINT und meldet dann Verbrauch), `MOCK_STDERR429`, `MOCK_REVIEW_LIMIT`, `MOCK_QUIET` (6 s ohne Ausgabe, dann Erfolg). CI (`.github/workflows/ci.yml`) führt fmt, clippy `-D warnings`, alle Rust-Tests, Frontend-Build und -Tests sowie Playwright aus.
+Der Mock-Provider (`ENABLE_MOCK_PROVIDER=true`) macht alle Flows deterministisch und kostet keine Tokens. Er wird über Schlüsselwörter im Prompt gesteuert: `MOCK_FAIL`, `MOCK_ASK`, `MOCK_FOLLOWUPS`, `MOCK_LIMIT`, `MOCK_SLOW`, `MOCK_TRANSIENT` (scheitert transient, bis die Re-Queue-Notiz im Prompt steht), `MOCK_TRANSIENT_ALWAYS`, `MOCK_AUTH`, `MOCK_STRUCTURED`, `MOCK_STRUCTURED_BAD`, `MOCK_TOKENS`, `MOCK_TURNS`, `MOCK_TRAP` (wartet auf SIGINT und meldet dann Verbrauch), `MOCK_STDERR429`, `MOCK_REVIEW_LIMIT`, `MOCK_QUIET` (6 s ohne Ausgabe, dann Erfolg), `MOCK_USAGE_TOTAL` (Gesamtverbrauch erst am Ende, weit über den Live-Werten). CI (`.github/workflows/ci.yml`) führt fmt, clippy `-D warnings`, alle Rust-Tests, Frontend-Build und -Tests sowie Playwright aus.
 
 ## Betrieb (Hetzner/Mac mini/Linux-Box, ohne Root zur Laufzeit)
 
@@ -129,7 +129,8 @@ cd frontend && npm install && npm run dev      # http://localhost:5173
 - Innerhalb eines Projekts läuft immer nur ein Agent (gemeinsamer Workspace). Die Parallelität gilt projektübergreifend.
 - Das verbleibende Abo-Kontingent liefern die CLIs nicht exakt. Darum gibt es die Kombination aus eigenen Budgets, Erkennung echter Limits und beobachteten Werten.
 - Der Review-Agent ist per Prompt read-only, nicht technisch erzwungen. Seine Änderungen würden als WIP-Commit sichtbar.
-- Codex und Gemini kennen kein Kostenlimit, Codex kein Turn-Limit; ihr Token-Verbrauch kommt erst am Ende eines Laufs. Eine Überschreitung wird dann nur gemeldet, das Ergebnis bleibt.
+- Codex und Gemini kennen kein Kostenlimit, Codex kein Turn-Limit; ihr Token-Verbrauch kommt erst am Ende eines Laufs. Ein Lauf kann ein Kosten-/Token-Limit daher überschreiten, bevor es greift. Der Auftrag wird dann trotzdem `blocked` (wie beim Live-Abbruch): kein „erledigt“, kein Review, kein Fix, keine Folgeaufträge. Die Änderungen bleiben als Teil-Commit im Diff des Auftrags; „Wiederholen“ startet mit frischem Budget. Gleiches gilt, wenn Claudes Live-Zähler zu wenig meldet.
+- Verbrauchswerte aus dem CLI-Stream werden begrenzt (negativ → 0, je Meldung höchstens 10^10 Tokens bzw. 10 000 USD); gemeldete Limit-Resets höchstens 8 Tage in der Zukunft.
 - Ein Provider-Fehler im Review-Lauf pausiert den Review-Provider, der Review wird aber übersprungen statt wiederholt (kein Phasen-Retry).
 - `GEMINI_CLI_TRUST_WORKSPACE=true` (sonst führt Gemini headless keine Tools aus) lässt auch Gemini-Einstellungen aus dem Repo wirken; Härtung gegen nicht vertrauenswürdige Repo-Konfiguration folgt in WP03.
 - Kleine Turn-Limits vertragen sich schlecht mit dem Ergebnis-Schema: Claude braucht für den structured output selbst zusätzliche Turns (beobachtet: „say hi" = 3 Turns).

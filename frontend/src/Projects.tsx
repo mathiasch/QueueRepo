@@ -249,7 +249,7 @@ function ProjectSettings({ p, canEdit, onSaved, onDelete }: { p: Project; canEdi
         <p className="muted small">
           {notEnforced("max_cost") && <>Kostenlimit wird von {notEnforced("max_cost")} nicht erzwungen (keine Kostenangabe der CLI). </>}
           {notEnforced("max_turns") && <>Turn-Limit wird von {notEnforced("max_turns")} nicht unterstützt. </>}
-          Tokens dieser Provider werden erst nach dem Lauf geprüft. Kosten sind Schätzungen der CLI.
+          Tokens dieser Provider werden erst nach dem Lauf geprüft – eine Überschreitung blockiert den Auftrag dann nachträglich. Kosten sind Schätzungen der CLI.
         </p>
       )}
       <h4>Git</h4>
