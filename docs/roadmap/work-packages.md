@@ -21,7 +21,7 @@ Artefakte pro Paket in `docs/roadmap/`: `WPxx-plan.md`, `WPxx-impl.md` (Umsetzun
 - Frontend: bis WP00 abgeschlossen ist React (`frontend/`), danach Rust/Leptos – UI-Arbeit immer im aktuellen Frontend.
 - UI ist deutsch; mobile Safe-Area-Regeln (CSS-Variablen `--sat/--sab/...`, Tab-Bar unten) einhalten.
 
-## WP00 – GUI auf Rust umstellen (Reihenfolge: direkt nach WP01, vor allen anderen Paketen)
+## WP00 – GUI auf Rust umstellen (Reihenfolge: direkt nach WP01, vor allen anderen Paketen; danach WP13, dann WP02 ff.)
 Nutzerwunsch: das komplette Frontend in Rust statt React/TypeScript.
 - Framework: **Leptos (CSR, WASM, Build mit Trunk)** – bleibt Web-App/PWA (iPhone, Web Push, Safe Areas), E2E-Tests bleiben gültig. Abweichung (z. B. Dioxus) nur mit harter Begründung im Plan.
 - Volle Funktionsparität mit dem bisherigen React-UI (Login/Registrierung/OIDC-Buttons, Queue mit allen Sektionen, Composer inkl. Optionen, Task-Drawer mit Live-Log/Diff/Revert/Edit, Inbox, Projekte inkl. Git/Dateien/Mitglieder/Einstellungen, Einstellungen inkl. Budgets/Credentials/Push/Limits, Toasts, SSE-Live-Updates, Limit-Chips, alles was WP01 ergänzt hat). Safe-Area-Variablen, Tab-Bar unten mobil und 16px-Inputs auf Touch bleiben Pflicht.
@@ -36,6 +36,20 @@ Nutzerwunsch: das komplette Frontend in Rust statt React/TypeScript.
 - Vitest-Tests durch Rust-Tests ersetzen (reine Logik als normale `cargo test`, DOM-nahe Logik ggf. `wasm-bindgen-test`); **alle Playwright-System- und E2E-Tests (inkl. iPhone hoch/quer) müssen ohne inhaltliche Abschwächung grün sein** – Selektoren nur anpassen, wo das Markup sich zwingend ändert.
 - React/TS-Frontend vollständig entfernen; Build in `e2e/scripts/stack.sh`, `deploy/install.sh`, `Dockerfile`, CI (`.github/workflows/ci.yml`) und README auf Trunk umstellen. `trunk` (0.22.1) und Target `wasm32-unknown-unknown` sind hier installiert; `wasm-bindgen-cli` ggf. per `cargo install` in exakt der zur Crate passenden Version (Trunk-Download von GitHub kann blockiert sein).
 - Nach WP00 gilt für alle Pakete: UI-Arbeit erfolgt im Rust-Frontend.
+
+## WP13 – Provider-Anbindungen & Kostenoptimierung (Reihenfolge: direkt nach WP00, vor WP02)
+Quelle: `reports/Kostenoptimale Modellanbieter für Queue.md`. Nutzer: keine zeitkritischen Aufgaben, Kosten minimieren, User soll Anbieter/Modell wählen können. Lizenz-/ToS-Thema bleibt ausgeklammert.
+- **Eigene Kostenrechnung:** versionierte Preistabelle (Input, Output, Cache-Write 5 min/1 h, Cache-Read, Batch/Flex-Rabatt, Long-Context-Aufschläge wie Haiku >100K und OpenAI >272K, Regionsaufschläge, gültig-ab-Datum für angekündigte Preisänderungen) im Backend; Budgets/Analytics rechnen aus Token-Zählern, nicht aus CLI-Dollarwerten. Preistabelle per Admin/Config überschreibbar.
+- **Connectoren (wählbar pro User/Projekt/Task):**
+  - Claude Code mit API-Key, mit Bedrock-EU und Vertex-EU (Region wählbar) und mit eigener Base-URL (Gateway).
+  - Codex CLI mit API-Key inkl. **OpenAI Flex** (Service-Tier) für den Agent-Loop; Custom Provider (Responses API).
+  - **opencode** als Multi-Provider-Harness (Mistral inkl. EU-Endpoint, OpenAI-kompatible Endpoints, Infomaniak/Self-Hosted vLLM) mit Headless-/JSON-Events.
+  - Gemini: Status der Gemini CLI prüfen (Ablösung durch Antigravity laut Sekundärquellen); Connector nur weiterführen, wenn lauffähig, sonst sauber als nicht verfügbar markieren.
+- **Gateway:** optional selbst gehostetes LiteLLM als OpenAI-/Anthropic-kompatibler Endpunkt mit Budget-Key pro Task; Container erreichen dann nur das Gateway (Anknüpfung an WP02-Egress).
+- **Modell-Routing pro Pipeline-Schritt** (vorgezogen aus WP12): Schritte Plan, Agent-Loop, Review, OnEmptyQueue-Analyse je mit eigenem Provider/Modell; Presets ("Günstig": Haiku-first mit Eskalation Haiku→Sonnet→Opus; "Ausgewogen": Opus plant/Sonnet führt aus; "EU": Bedrock/Vertex-EU bzw. Mistral EU; "Maximal günstig": OpenAI Terra Flex); Eskalation bei Fehlschlag. Review nie mit dem billigsten Modell.
+- **Batch-Connector** für Einzelschritte (Plan, OnEmptyQueue-Analyse, optional Review) über Anthropic Message Batches bzw. OpenAI Batch – asynchron mit Polling, Scheduler kann darauf warten (keine Zeitkritik); Cache-Hygiene (stabile Prompt-Präfixe, 1-h-Cache für Batch).
+- **UI:** Anbieter-/Modellwahl mit geschätzten Kosten pro Task (aus Preistabelle + historischen Token-Profilen), Preset-Auswahl, Hinweis auf Datenstandort (EU/CH/US).
+- Externe APIs sind hier nicht live erreichbar: gegen lokale Fake-Server testen; Fixtures für Batch-/Flex-/opencode-Events mit Herkunftsangabe.
 
 ## WP01 – Strukturierte CLI-Integration & Fehlerklassifikation
 Wettbewerb nutzt strukturierte Signale statt Text-Parsing.
