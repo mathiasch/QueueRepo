@@ -137,7 +137,7 @@ Nutzerwunsch: ein "richtig schlauer" Chooser, der jede Aufgabe dem passenden Mod
 - **Transparenz & Kontrolle:** Begründung pro Task in der UI ("Gewählt: X, weil …, erwartete Kosten …, Alternativen …"), manuelles Override, Feedback des Users fliesst ins Lernen ein; Admin-Sicht auf Chooser-Statistiken.
 - **Absicherung:** Offline-Evaluation gegen historische Läufe (Replay), Vergleich mit statischen Presets (muss Kosten pro akzeptiertem Task nachweislich senken oder Qualität halten), Fallback auf Preset bei fehlenden Daten, deterministische Tests der Entscheidungslogik.
 
-## WP14 – Kommerzielles Angebot: Zugang gegen Bezahlung (Reihenfolge: ganz am Schluss, nach WP15)
+## WP14 – Kommerzielles Angebot: Zugang gegen Bezahlung (Reihenfolge: nach WP15, vor dem Abschluss-Audit WP16)
 Nutzerwunsch: das Produkt für Kunden zugänglich machen, die dafür bezahlen.
 - Hinweis: Das ausgeklammerte Lizenz-/ToS-Thema wird hier zwingend relevant (Weiterverkauf/Vermittlung von Modellnutzung). Das Abrechnungsmodell so bauen, dass es konfigurierbar ist (z. B. Plattformgebühr mit eigenem API-Key des Kunden vs. nutzungsbasierte Abrechnung über eigene Provider-Verträge); die Entscheidung trifft der Betreiber vor dem Go-live.
 - Pläne/Tarife (z. B. Free/Trial, Pro, Team) mit Limits (Tasks, Projekte, parallele Agenten, Token-Kontingent), Feature-Gates, Upgrade/Downgrade, Testphase.
@@ -149,3 +149,12 @@ Nutzerwunsch: das Produkt für Kunden zugänglich machen, die dafür bezahlen.
 - Rechtstexte als Vorlagen mit klarer Markierung "vom Betreiber zu prüfen": AGB, Datenschutzerklärung, AVV/DPA, Impressum.
 - Tests gegen Stripe-Testmodus-Fixtures/Fake-Server (Webhooks signiert), E2E des Kaufflows.
 
+
+## WP16 – Abschluss-Audit: Best Practice, gängige Fehler, CVEs (Reihenfolge: allerletztes Paket, nach WP14)
+Nutzerwunsch: Am Schluss mit frischem Kontext prüfen, ob alles nach Best Practice gebaut wurde, auf gängige Fehler prüfen und nach möglichen CVEs suchen.
+- Durchführung durch einen Agenten mit frischem Kontext, der an keinem vorherigen Paket beteiligt war; prüft den Code, nicht die Berichte (die Berichte nur zum Abgleich von Behauptung vs. Realität).
+- Best Practice: Rust-Idiome und Fehlerbehandlung (keine `unwrap`/`expect` auf Eingaben, keine Panics im Request-Pfad, Timeouts überall), Async-Fallen (Blocking im Runtime-Thread, Locks über `.await`), SQL (nur parametrisiert, Transaktionen/Isolation, Indizes für heiße Queries, Migrationen idempotent), API-Design (AuthZ auf jedem Endpunkt, Mandantentrennung, Pagination, Rate-Limits), Konfiguration/Secrets, Logging ohne Secrets, Leptos/Frontend (XSS, CSP, Service Worker), Deployment (systemd-Härtung, Container-Rechte, Dockerfiles), CI.
+- Gängige Fehler: OWASP Top 10 / ASVS L2 als Checkliste, OWASP LLM Top 10 (Prompt Injection über Repo-Inhalte/Issues, Excessive Agency, unsichere Ausgabeverarbeitung), CSRF/Session-Fixation/Cookie-Flags, SSRF, Path Traversal/Symlinks, Command Injection, TOCTOU, Race Conditions im Scheduler, Zeitzonen/Überläufe, Ressourcenlecks (Prozesse, Container, Sockets, temporäre Dateien), DoS (Body-Limits, unbeschränkte Streams).
+- CVEs/Supply Chain: `cargo audit` (RustSec) und `cargo deny` (advisories, licenses, bans, sources) für Backend und Frontend, `npm audit` für `e2e/`, Prüfung der gepinnten Versionen in Dockerfiles und Agent-Image (Basis-Images, CLIs, opencode, Node) gegen bekannte CVEs/GHSA (OSV-Datenbank), veraltete/ungepflegte Crates, Lizenz-Kompatibilität dokumentieren (Entscheidung bleibt beim Nutzer).
+- Ergebnis: Befundliste mit Schweregrad (kritisch/hoch/mittel/niedrig), Beleg (Datei:Zeile, PoC oder Testfall) und Empfehlung; kritische und hohe Befunde werden direkt behoben (mit Regressionstest), Rest dokumentiert. Werkzeuge (`cargo-audit`, `cargo-deny`) als CI-Schritt verankern.
+- Artefakte: `docs/roadmap/WP16-audit.md` (Befunde), `WP16-impl.md` (Fixes), `WP16-test.md`; volle Testsuite zweimal grün.
