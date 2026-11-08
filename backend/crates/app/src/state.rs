@@ -23,10 +23,16 @@ pub struct AppState {
     pub bus: broadcast::Sender<BusEvent>,
     /// Wakes the scheduler immediately (new task, finished task, settings change).
     pub wake: Arc<Notify>,
+    /// Wakes the poller of single-shot/batch jobs.
+    pub batch_wake: Arc<Notify>,
     /// Cancellation handles of running tasks.
     pub running: Arc<Mutex<HashMap<Uuid, CancellationToken>>>,
     pub vapid: Arc<Vapid>,
+    /// Effective price catalog, cached per override version (see `pricing::current`).
+    pub prices: Arc<std::sync::RwLock<Option<PriceCache>>>,
 }
+
+pub type PriceCache = (Option<i32>, Arc<queued_api::PriceCatalog>);
 
 impl AppState {
     pub fn new(cfg: Config, db: PgPool) -> anyhow::Result<Self> {
@@ -42,8 +48,10 @@ impl AppState {
                 .build()?,
             bus,
             wake: Arc::new(Notify::new()),
+            batch_wake: Arc::new(Notify::new()),
             running: Arc::new(Mutex::new(HashMap::new())),
             vapid: Arc::new(vapid),
+            prices: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 

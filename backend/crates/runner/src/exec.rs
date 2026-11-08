@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use queued_common::{ExecFrame, ExecRequest};
+use queued_common::{CliProbe, ExecFrame, ExecRequest};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
@@ -127,6 +127,66 @@ pub fn build_command(
     .stderr(Stdio::piped())
     .kill_on_drop(true);
     cmd
+}
+
+/// CLIs probed by `GET /v1/cli-status`: a fixed list (no caller input).
+/// `agy` = Antigravity, the reported successor of the Gemini CLI.
+pub const PROBED_CLIS: [&str; 5] = ["claude", "codex", "gemini", "opencode", "agy"];
+
+static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Runs `<cli> --version` in the sandbox (same engine, image and limits as
+/// agent runs, empty workspace/home, no env, no stdin, 20 s timeout).
+pub async fn probe(cfg: &RunnerConfig) -> Result<Vec<CliProbe>> {
+    let seq = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = cfg.data_dir.join("probe").join(seq.to_string());
+    let (ws, home) = (dir.join("workspace"), dir.join("home"));
+    tokio::fs::create_dir_all(&ws).await?;
+    tokio::fs::create_dir_all(&home).await?;
+    let mut out = vec![];
+    for cli in PROBED_CLIS {
+        let req = ExecRequest {
+            name: format!("queue-probe-{cli}-{}-{seq}", std::process::id()),
+            workspace: String::new(),
+            program: cli.into(),
+            args: vec!["--version".into()],
+            env: vec![],
+            home_files: vec![],
+            read_back: vec![],
+            stdin: None,
+            timeout_secs: 20,
+            idle_timeout_secs: None,
+            queue_files: vec![],
+        };
+        let mut cmd = build_command(cfg, &req, &ws, &home);
+        let version = match tokio::time::timeout(Duration::from_secs(20), cmd.output()).await {
+            Ok(Ok(o)) if o.status.success() => {
+                let text = String::from_utf8_lossy(if o.stdout.is_empty() {
+                    &o.stderr
+                } else {
+                    &o.stdout
+                })
+                .to_string();
+                text.lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .map(|l| l.chars().take(200).collect())
+            }
+            Ok(_) => None,
+            Err(_) => {
+                if cfg.engine != Engine::None {
+                    send(cfg.engine, &req.name, None, Signal::Kill).await;
+                }
+                None
+            }
+        };
+        out.push(CliProbe {
+            cli: cli.into(),
+            version,
+        });
+    }
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(out)
 }
 
 fn safe_rel(rel: &str) -> bool {
@@ -708,5 +768,27 @@ mod tests {
                 engine == Engine::Docker
             );
         }
+    }
+
+    #[tokio::test]
+    async fn probe_reports_missing_and_present_clis() {
+        let t = tempfile::tempdir().unwrap();
+        let c = cfg(t.path(), Engine::None);
+        let found = probe(&c).await.unwrap();
+        assert_eq!(
+            found.iter().map(|p| p.cli.as_str()).collect::<Vec<_>>(),
+            PROBED_CLIS
+        );
+        // `agy` (Antigravity) is not installed in this environment.
+        assert!(found
+            .iter()
+            .find(|p| p.cli == "agy")
+            .unwrap()
+            .version
+            .is_none());
+        assert!(
+            !t.path().join("probe").join("0").exists(),
+            "probe dir cleaned up"
+        );
     }
 }

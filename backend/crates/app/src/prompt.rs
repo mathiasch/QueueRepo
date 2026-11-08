@@ -72,6 +72,12 @@ pub fn task(task: &Task, project: &Project, parent: Option<&Parent>) -> String {
     if !task.context.trim().is_empty() {
         p.push_str(&format!("\n## Context\n{}\n", task.context.trim()));
     }
+    if let Some(plan) = task.plan.as_deref().filter(|p| !p.trim().is_empty()) {
+        p.push_str(&format!(
+            "\n## Plan (from a planning step – follow it, but adapt where the code says otherwise)\n{}\n",
+            cut(plan.trim(), 12_000)
+        ));
+    }
     p.push('\n');
     p.push_str(&rules(project));
     p.push('\n');
@@ -131,6 +137,119 @@ pub fn onempty(
     p
 }
 
+/// Max. files listed in the stable prefix of single-shot prompts.
+pub const MAX_FILES: usize = 400;
+
+/// Stable, cacheable prefix of single-shot calls (plan, review, analysis):
+/// only project data that changes rarely – no task ids, no timestamps.
+pub fn single_shot_system(project: &Project, files: &[String]) -> String {
+    let mut p = format!(
+        "You assist an autonomous coding queue for the project \"{}\". You cannot run tools or read files; answer from the information given.\n",
+        project.name
+    );
+    if !project.description.trim().is_empty() {
+        p.push_str(&format!(
+            "\n## Project\n{}\n",
+            cut(project.description.trim(), 1500)
+        ));
+    }
+    if !project.goal.trim().is_empty() {
+        p.push_str(&format!(
+            "\n## Project goal\n{}\n",
+            cut(project.goal.trim(), 1500)
+        ));
+    }
+    if let Some(cmd) = project
+        .verify_command
+        .as_deref()
+        .filter(|c| !c.trim().is_empty())
+    {
+        p.push_str(&format!(
+            "\n## Verification\nThe queue runs `{cmd}` after every task.\n"
+        ));
+    }
+    if !files.is_empty() {
+        let mut sorted: Vec<&String> = files.iter().collect();
+        sorted.sort();
+        p.push_str("\n## Files in the repository\n");
+        for f in sorted.iter().take(MAX_FILES) {
+            p.push_str(f);
+            p.push('\n');
+        }
+        if files.len() > MAX_FILES {
+            p.push_str(&format!("… and {} more\n", files.len() - MAX_FILES));
+        }
+    }
+    p
+}
+
+/// Plan step: a concise plan for the agent that will execute the task.
+pub fn plan_request(task: &Task, parent: Option<&Parent>) -> String {
+    let mut p = format!(
+        "Write an implementation plan for the task below. Another agent with full repository access will execute it.\n\n# Task: {}\n\n{}\n",
+        task.title,
+        cut(task.prompt.trim(), 8000)
+    );
+    if let Some(par) = parent {
+        if let Some(h) = par
+            .handoff
+            .as_deref()
+            .or(par.summary.as_deref())
+            .filter(|h| !h.trim().is_empty())
+        {
+            p.push_str(&format!(
+                "\n## Handoff from previous task \"{}\"\n{}\n",
+                par.title,
+                cut(h.trim(), MAX_HANDOFF)
+            ));
+        }
+    }
+    if !task.context.trim().is_empty() {
+        p.push_str(&format!(
+            "\n## Context\n{}\n",
+            cut(task.context.trim(), 6000)
+        ));
+    }
+    p.push_str("\n## Output\nPlain text, at most 40 lines: files to look at, steps in order, how to verify, risks. No code longer than a few lines.");
+    p
+}
+
+/// Review step as one request: the answer must be the review JSON.
+pub fn review_request(task: &Task, summary: &str, diff: &str) -> String {
+    format!(
+        "You are a strict code reviewer. Another agent worked on the task below.\n\n### Task\n{}\n\n### Agent summary\n{}\n\n### Diff\n```diff\n{}\n```\n\nCheck: is the task fulfilled, are there bugs, security issues or broken builds? Approve unless there are real defects or the task is not fulfilled; style nits are not defects.\nAnswer ONLY with JSON: {{\"approved\":true|false,\"issues\":[\"concrete, actionable issue\", …]}}",
+        cut(task.prompt.trim(), 6000),
+        cut(summary.trim(), 2000),
+        cut(diff, MAX_DIFF)
+    )
+}
+
+/// OnEmpty analysis as one request: the answer must be the result JSON.
+pub fn analyze_request(actions: &[String], history: &[(String, Option<String>)]) -> String {
+    let mut p = String::from(
+        "The task queue of this project is empty. Propose the most valuable next work.\n",
+    );
+    for a in actions {
+        match a.as_str() {
+            "review" => p.push_str("- Review: likely bugs, security issues, missing tests, maintainability problems (judging from the file list and recent work).\n"),
+            "research" => p.push_str("- Research: libraries, tools or practices worth checking (from your knowledge; you cannot browse).\n"),
+            "improve" => p.push_str("- Improve: concrete next steps towards the project goal.\n"),
+            _ => {}
+        }
+    }
+    if !history.is_empty() {
+        p.push_str("\n## Recent tasks\n");
+        for (t, s) in history {
+            p.push_str(&format!(
+                "- {t}: {}\n",
+                cut(s.as_deref().unwrap_or("").lines().next().unwrap_or(""), 200)
+            ));
+        }
+    }
+    p.push_str("\nPropose at most 5 tasks, most valuable first, each with a self-contained prompt for a fresh agent. If nothing is worth doing, return no tasks.\nAnswer ONLY with JSON: {\"status\":\"done\",\"summary\":\"…\",\"handoff\":\"\",\"questions\":[],\"follow_up_tasks\":[{\"title\":\"…\",\"prompt\":\"…\"}]}");
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +277,9 @@ mod tests {
             max_cost_usd: None,
             max_tokens: None,
             max_turns: None,
+            routing: None,
+            data_residency: "any".into(),
+            is_eval: false,
         }
     }
 
@@ -197,6 +319,10 @@ mod tests {
             failure_class: None,
             transient_retries: 0,
             not_before: None,
+            connector_id: None,
+            escalation_level: 0,
+            plan: None,
+            cost: None,
         }
     }
 

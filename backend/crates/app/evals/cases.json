@@ -1,0 +1,85 @@
+{
+ "version": "2026-11-08",
+ "cases": [
+  {
+   "id": "fizzbuzz-off-by-one",
+   "title": "FizzBuzz: letzte Zeile fehlt",
+   "category": "bugfix",
+   "size": "S",
+   "prompt": "`sh fizzbuzz.sh 15` should print 15 lines, the last one being `FizzBuzz`, but the last line is missing. Find and fix the bug.",
+   "setup": "cat > fizzbuzz.sh <<'EOF'\n#!/bin/sh\n# prints FizzBuzz from 1 to $1\nn=$1; i=1\nwhile [ $i -lt $n ]; do\n  if [ $((i % 15)) -eq 0 ]; then echo FizzBuzz\n  elif [ $((i % 3)) -eq 0 ]; then echo Fizz\n  elif [ $((i % 5)) -eq 0 ]; then echo Buzz\n  else echo $i; fi\n  i=$((i + 1))\ndone\nEOF\n",
+   "verify": "[ \"$(sh fizzbuzz.sh 15 | wc -l | tr -d ' ')\" = 15 ] && [ \"$(sh fizzbuzz.sh 15 | tail -n1)\" = FizzBuzz ] && [ \"$(sh fizzbuzz.sh 3 | tail -n1)\" = Fizz ]",
+   "solution": "sed -i 's/-lt \\$n/-le $n/' fizzbuzz.sh\n"
+  },
+  {
+   "id": "greet-shout-flag",
+   "title": "Neue Option --shout",
+   "category": "feature",
+   "size": "M",
+   "prompt": "Add a `--shout` option to greet.sh: `sh greet.sh --shout Ann` prints `HELLO, ANN`. Without the option the behaviour stays the same (`sh greet.sh Ann` → `Hello, Ann`, `sh greet.sh` → `Hello, world`).",
+   "setup": "cat > greet.sh <<'EOF'\n#!/bin/sh\necho \"Hello, ${1:-world}\"\nEOF\n",
+   "verify": "[ \"$(sh greet.sh Ann)\" = 'Hello, Ann' ] && [ \"$(sh greet.sh --shout Ann)\" = 'HELLO, ANN' ] && [ \"$(sh greet.sh)\" = 'Hello, world' ]",
+   "solution": "cat > greet.sh <<'EOF'\n#!/bin/sh\nshout=0\nif [ \"$1\" = \"--shout\" ]; then shout=1; shift; fi\nmsg=\"Hello, ${1:-world}\"\nif [ $shout -eq 1 ]; then echo \"$msg\" | tr '[:lower:]' '[:upper:]'; else echo \"$msg\"; fi\nEOF\n"
+  },
+  {
+   "id": "docs-usage",
+   "title": "Bedienung dokumentieren",
+   "category": "docs",
+   "size": "S",
+   "prompt": "Document how to use tool.sh in README.md: add a section `## Usage` that explains the `--count N` option with an example.",
+   "setup": "printf '# tool\\n\\nA tiny demo tool.\\n' > README.md\ncat > tool.sh <<'EOF'\n#!/bin/sh\n[ \"$1\" = \"--count\" ] || { echo 'usage: tool.sh --count N' >&2; exit 2; }\ni=0; while [ $i -lt \"$2\" ]; do echo line; i=$((i+1)); done\nEOF\n",
+   "verify": "grep -q '^## Usage' README.md && grep -q -- '--count' README.md && grep -q '# tool' README.md",
+   "solution": "printf '\\n## Usage\\n\\n    sh tool.sh --count 3\\n\\n`--count N` prints N lines.\\n' >> README.md\n"
+  },
+  {
+   "id": "tests-for-max",
+   "title": "Tests für max.sh schreiben",
+   "category": "tests",
+   "size": "S",
+   "prompt": "Write test_max.sh with at least three test cases for max.sh (it prints the largest of its numeric arguments). The test script must exit non-zero if a case fails.",
+   "setup": "cat > max.sh <<'EOF'\n#!/bin/sh\nm=$1; for x in \"$@\"; do [ \"$x\" -gt \"$m\" ] && m=$x; done; echo $m\nEOF\n",
+   "verify": "[ -f test_max.sh ] && [ \"$(grep -c 'max.sh' test_max.sh)\" -ge 3 ] && sh test_max.sh",
+   "solution": "cat > test_max.sh <<'EOF'\n#!/bin/sh\nset -e\n[ \"$(sh max.sh 1 2 3)\" = 3 ]\n[ \"$(sh max.sh 7)\" = 7 ]\n[ \"$(sh max.sh -1 -5)\" = -1 ]\nEOF\n"
+  },
+  {
+   "id": "refactor-shared-log",
+   "title": "Doppelte Funktion auslagern",
+   "category": "refactor",
+   "size": "M",
+   "prompt": "a.sh and b.sh both define the same `log()` function. Move it into a new file lib.sh and source it from both scripts (`. ./lib.sh`). The output must stay exactly the same.",
+   "setup": "cat > a.sh <<'EOF'\n#!/bin/sh\nlog() { echo \"[$1] $2\"; }\nlog a start\nEOF\ncat > b.sh <<'EOF'\n#!/bin/sh\nlog() { echo \"[$1] $2\"; }\nlog b start\nEOF\n",
+   "verify": "[ -f lib.sh ] && grep -q 'log()' lib.sh && ! grep -q 'log()' a.sh && ! grep -q 'log()' b.sh && [ \"$(sh a.sh)\" = '[a] start' ] && [ \"$(sh b.sh)\" = '[b] start' ]",
+   "solution": "printf 'log() { echo \"[$1] $2\"; }\\n' > lib.sh\nprintf '#!/bin/sh\\n. ./lib.sh\\nlog a start\\n' > a.sh\nprintf '#!/bin/sh\\n. ./lib.sh\\nlog b start\\n' > b.sh\n"
+  },
+  {
+   "id": "path-traversal",
+   "title": "Pfad-Ausbruch verhindern",
+   "category": "security",
+   "size": "M",
+   "prompt": "readfile.sh prints a file from the data/ folder. It must reject paths that contain `..` or start with `/`: print `invalid path` to stderr and exit with code 2. Valid names keep working.",
+   "setup": "mkdir -p data && echo ok > data/x\ncat > readfile.sh <<'EOF'\n#!/bin/sh\ncat \"data/$1\"\nEOF\n",
+   "verify": "set -e\nmkdir -p data; echo ok > data/x\n[ \"$(sh readfile.sh x)\" = ok ]\nset +e\nsh readfile.sh ../readfile.sh >/dev/null 2>&1; a=$?\nsh readfile.sh /etc/passwd >/dev/null 2>&1; b=$?\nmsg=$(sh readfile.sh ../x 2>&1 >/dev/null)\n[ $a -eq 2 ] && [ $b -eq 2 ] && [ \"$msg\" = 'invalid path' ]",
+   "solution": "cat > readfile.sh <<'EOF'\n#!/bin/sh\ncase \"$1\" in\n  /*|*..*) echo 'invalid path' >&2; exit 2;;\nesac\ncat \"data/$1\"\nEOF\n"
+  },
+  {
+   "id": "csv-sum",
+   "title": "Spaltensumme einer CSV",
+   "category": "feature",
+   "size": "M",
+   "prompt": "Write sum.sh: `sh sum.sh FILE` prints the sum of the second column of a CSV file with a header line.",
+   "setup": "printf 'name,amount\\na,10\\nb,20\\nc,30\\n' > data.csv\n",
+   "verify": "[ \"$(sh sum.sh data.csv)\" = 60 ] && printf 'n,a\\nx,5\\n' > /tmp/queue-eval-$$.csv && [ \"$(sh sum.sh /tmp/queue-eval-$$.csv)\" = 5 ]; r=$?; rm -f /tmp/queue-eval-$$.csv; exit $r",
+   "solution": "printf '#!/bin/sh\\nawk -F, '\"'\"'NR>1 {s+=$2} END {print s+0}'\"'\"' \"$1\"\\n' > sum.sh\n"
+  },
+  {
+   "id": "rename-everywhere",
+   "title": "Funktion projektweit umbenennen",
+   "category": "refactor",
+   "size": "L",
+   "prompt": "Rename the shell function `old_name` to `format_date` everywhere in the project (definition and all callers in every script). All scripts must keep working.",
+   "setup": "cat > util.sh <<'EOF'\nold_name() { echo \"date: $1\"; }\nEOF\nfor f in main report export; do printf '#!/bin/sh\\n. ./util.sh\\nold_name 2026-%s\\n' \"$f\" > $f.sh; done\n",
+   "verify": "! grep -rq old_name --include='*.sh' . && grep -q 'format_date()' util.sh && [ \"$(sh main.sh)\" = 'date: 2026-main' ] && [ \"$(sh export.sh)\" = 'date: 2026-export' ]",
+   "solution": "sed -i 's/old_name/format_date/g' util.sh main.sh report.sh export.sh\n"
+  }
+ ]
+}

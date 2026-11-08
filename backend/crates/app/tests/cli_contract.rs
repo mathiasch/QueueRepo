@@ -343,3 +343,56 @@ fn gemini_network_error_is_transient() {
     let (_, class) = run_fixture("gemini", "network_transient");
     assert_eq!(class, Some(FailureClass::ProviderTransient));
 }
+
+// --- opencode 1.19.5 (constructed from the bundled source, see PROVENANCE.md) ---
+
+#[test]
+fn opencode_success_with_tools_and_usage() {
+    let (evs, class) = run_fixture("opencode", "success_tools");
+    assert_eq!(class, None);
+    assert_eq!(count(&evs, |e| matches!(e, AgentEvent::Tool(_))), 2);
+    assert!(evs.contains(&AgentEvent::Final("Tests laufen, Fix ist drin.".into())));
+    let u = deltas(&evs);
+    assert_eq!(
+        (
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_read_tokens,
+            u.cache_write_tokens
+        ),
+        (6000, 210, 5300, 200),
+        "reasoning counts as output"
+    );
+    assert!((u.cost_usd - 0.0034).abs() < 1e-9);
+    assert!(total(&evs).is_none(), "opencode reports per step only");
+}
+
+#[test]
+fn opencode_provider_failures_classify() {
+    assert_eq!(
+        run_fixture("opencode", "rate_limit_429").1,
+        Some(FailureClass::RateLimit)
+    );
+    assert_eq!(
+        run_fixture("opencode", "auth_error").1,
+        Some(FailureClass::ProviderAuth)
+    );
+    assert_eq!(
+        run_fixture("opencode", "server_error_503").1,
+        Some(FailureClass::ProviderTransient)
+    );
+    assert_eq!(
+        run_fixture("opencode", "retryable_without_status").1,
+        Some(FailureClass::ProviderTransient)
+    );
+    let (evs, class) = run_fixture("opencode", "context_overflow");
+    assert_eq!(class, Some(FailureClass::Task));
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Error(t) if t.contains("too long"))));
+    let (evs, class) = run_fixture("opencode", "tool_error_then_text");
+    assert_eq!(class, None, "a failed tool call is not a run failure");
+    assert!(!evs
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Failure { .. } | AgentEvent::Error(_))));
+}

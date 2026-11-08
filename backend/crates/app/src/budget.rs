@@ -52,28 +52,44 @@ pub fn evaluate(w: &Window, b: &Budget, now: DateTime<Utc>) -> Option<(DateTime<
     hits.into_iter().max_by_key(|(t, _)| *t)
 }
 
-pub async fn record_usage(
-    db: &PgPool,
-    user: Uuid,
-    provider: &str,
-    task: Option<Uuid>,
-    u: &Usage,
-) -> sqlx::Result<()> {
-    if counted(u) == 0 && u.cache_read_tokens == 0 && u.cost_usd == 0.0 {
+/// One row of `usage_log`: tokens plus the money cost of the run.
+pub struct UsageRow<'a> {
+    pub user: Uuid,
+    /// Harness (budgets are per provider).
+    pub provider: &'a str,
+    pub task: Option<Uuid>,
+    pub project: Option<Uuid>,
+    pub connector: Option<Uuid>,
+    pub cost: &'a queued_api::StepCost,
+}
+
+pub async fn record_usage(db: &PgPool, r: UsageRow<'_>) -> sqlx::Result<()> {
+    let u = &r.cost.usage;
+    if counted(u) == 0 && u.cache_read_tokens == 0 && u.cost_usd == 0.0 && r.cost.amount == 0.0 {
         return Ok(());
     }
     sqlx::query(
-        "INSERT INTO usage_log (user_id, provider, task_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        "INSERT INTO usage_log (user_id, provider, task_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd,
+                                project_id, connector_id, model, step, cost_source, currency, cost_amount, price_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
     )
-    .bind(user)
-    .bind(provider)
-    .bind(task)
+    .bind(r.user)
+    .bind(r.provider)
+    .bind(r.task)
     .bind(u.input_tokens)
     .bind(u.output_tokens)
     .bind(u.cache_read_tokens)
     .bind(u.cache_write_tokens)
-    .bind(u.cost_usd)
+    // USD only: budgets are in USD (CHF prices are reported separately).
+    .bind(if r.cost.currency == "USD" { r.cost.amount } else { 0.0 })
+    .bind(r.project)
+    .bind(r.connector)
+    .bind(r.cost.model.as_deref())
+    .bind(&r.cost.step)
+    .bind(r.cost.source.as_str())
+    .bind(&r.cost.currency)
+    .bind(r.cost.amount)
+    .bind(r.cost.price_id.as_deref())
     .execute(db)
     .await?;
     Ok(())
@@ -171,20 +187,6 @@ pub async fn status(db: &PgPool, user: Uuid, provider: &str) -> sqlx::Result<Pro
         observed_limit_tokens,
         observed_at,
     })
-}
-
-pub async fn blocked_providers(
-    db: &PgPool,
-    user: Uuid,
-    providers: &[&str],
-) -> sqlx::Result<Vec<String>> {
-    let mut out = vec![];
-    for p in providers {
-        if status(db, user, p).await?.blocked {
-            out.push(p.to_string());
-        }
-    }
-    Ok(out)
 }
 
 pub async fn is_blocked(db: &PgPool, user: Uuid, provider: &str) -> sqlx::Result<bool> {

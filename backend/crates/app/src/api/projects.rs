@@ -86,7 +86,7 @@ async fn ensure_idle(st: &AppState, id: Uuid) -> ApiResult<()> {
     Ok(())
 }
 
-async fn load(st: &AppState, id: Uuid) -> ApiResult<Project> {
+pub(crate) async fn load(st: &AppState, id: Uuid) -> ApiResult<Project> {
     Ok(sqlx::query_as("SELECT * FROM projects WHERE id=$1")
         .bind(id)
         .fetch_one(&st.db)
@@ -109,6 +109,7 @@ pub async fn list(
         "SELECT p.id, p.name, p.description, m.role, ou.name, p.git_remote_url FROM projects p
          JOIN project_members m ON m.project_id=p.id AND m.user_id=$1
          JOIN users ou ON ou.id = p.owner_id
+         WHERE NOT p.is_eval
          ORDER BY p.name",
     )
     .bind(u.id)
@@ -261,6 +262,17 @@ pub async fn update(
             return Err(AppError::bad_request(
                 "git remote must be an https:// or ssh URL",
             ));
+        }
+    }
+    if let Some(rp) = p
+        .review_provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        // Legacy review providers need their own credential (opencode: connectors only).
+        if !st.cfg.providers().contains(&rp) || crate::agent::credential_kinds(rp).is_empty() {
+            return Err(AppError::bad_request("unknown provider"));
         }
     }
     let (token_set, token_enc) = match p.git_token.as_deref().map(str::trim) {

@@ -1,0 +1,2 @@
+{"type":"step_start","timestamp":1762560000000,"sessionID":"ses_04","part":{"type":"step-start"}}
+{"type":"error","timestamp":1762560001000,"sessionID":"ses_04","error":{"name":"APIError","data":{"message":"Service Unavailable","statusCode":503,"isRetryable":true}}}

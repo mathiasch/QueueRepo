@@ -5,17 +5,25 @@
 pub mod agent;
 pub mod api;
 pub mod auth;
+pub mod batch;
 pub mod budget;
 pub mod config;
+pub mod connectors;
 pub mod crypto;
 pub mod error;
+pub mod estimate;
+pub mod eval;
+pub mod gateway;
 pub mod limits;
+pub mod llm;
 pub mod models;
 pub mod notify;
 pub mod oidc;
+pub mod pricing;
 pub mod prompt;
 pub mod push;
 pub mod queue;
+pub mod routing;
 pub mod runner;
 pub mod runner_client;
 pub mod state;
@@ -40,6 +48,8 @@ pub async fn init(cfg: config::Config) -> anyhow::Result<state::AppState> {
 /// Starts the scheduler loop in the background.
 pub async fn start_worker(st: &state::AppState) -> anyhow::Result<()> {
     worker::recover(st).await?;
+    batch::recover(st).await?;
     tokio::spawn(worker::run(st.clone()));
+    tokio::spawn(batch::run(st.clone()));
     Ok(())
 }

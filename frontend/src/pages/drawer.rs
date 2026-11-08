@@ -1,12 +1,13 @@
 //! Task details: progress, result, review, changes (diff), revert, edit, log.
 use leptos::task::spawn_local;
 use leptos::{html, prelude::*};
-use queued_api::{Answer, DiffView, Task, TaskDetail, TaskEvent, TaskStatus, UpdateTask};
+use queued_api::{Answer, DiffView, Task, TaskCost, TaskDetail, TaskEvent, TaskStatus, UpdateTask};
 use uuid::Uuid;
 
 use crate::api;
+use crate::logic::costs::{fmt_money, fmt_money_list, source_label, step_label};
 use crate::logic::diff::{classify, file_stats};
-use crate::logic::format::{duration, fmt_relative, fmt_time, fmt_tokens, fmt_usd};
+use crate::logic::format::{duration, fmt_relative, fmt_time, fmt_tokens};
 use crate::logic::labels::{
     event_kind_label, failure_help, failure_label, help, provider_label, status_help, status_label,
     task_kind_label,
@@ -181,10 +182,8 @@ fn DrawerHead(t: Task, title_id: String, on_close: Callback<()>) -> impl IntoVie
     let store = use_store();
     let status = t.status_kind();
     let pid = t.project_id;
-    let provider = match &t.model {
-        Some(m) => format!("{} · {m}", provider_label(&t.provider)),
-        None => provider_label(&t.provider),
-    };
+    let provider =
+        crate::logic::costs::access_text(&t, &store.connectors.get_untracked(), provider_label);
     let (started, finished, created) = (t.started_at, t.finished_at, t.created_at);
     view! {
         <div class="drawer-head">
@@ -377,6 +376,8 @@ fn Details(t: Task) -> impl IntoView {
     let limits = task_limits(&t);
     let review = t.review_result();
     let usage = t.usage_parsed();
+    let cost = t.cost_parsed().filter(|c| !c.steps.is_empty());
+    let plan = t.plan.clone().filter(|p| !p.trim().is_empty());
     let questions = t.questions_list();
     let started = t.started_at.is_some();
     let phase = Memo::new(move |_| {
@@ -491,16 +492,54 @@ fn Details(t: Task) -> impl IntoView {
             }
         })
         }}
+        {plan.map(|p| view! { <Collapsible title="Plan" text=p help=help::PLAN/> })}
         {usage.map(|u| view! {
             <Block title="Verbrauch" help=help::TOKENS>
                 <div class="usage">
                     <span><strong>{fmt_tokens(u.input_tokens)}</strong>" Eingabe"</span>
                     <span><strong>{fmt_tokens(u.output_tokens)}</strong>" Ausgabe"</span>
                     <span><strong>{fmt_tokens(u.cache_read_tokens)}</strong>" aus dem Cache"</span>
-                    {(u.cost_usd > 0.0).then(|| view! { <span><strong>{fmt_usd(u.cost_usd, 3)}</strong>" (Schätzung der CLI)"</span> })}
                 </div>
             </Block>
         })}
+        {cost.map(|c| view! { <CostBlock c=c/> })}
+    }
+}
+
+/// Money cost per step (catalog prices; CLI dollars only as marked fallback).
+#[component]
+fn CostBlock(c: TaskCost) -> impl IntoView {
+    view! {
+        <Block title="Kosten" help=help::COSTS>
+            <p class="cost-total" data-testid="task-cost"><strong>{fmt_money_list(&c.totals)}</strong>
+                {c.incomplete.then(|| view! { <span class="small muted">" – unvollständig, nicht für jeden Schritt ist ein Preis bekannt"</span> })}
+            </p>
+            <table class="table compact" tabindex="0">
+                <caption class="visually-hidden">"Kosten je Schritt"</caption>
+                <thead><tr><th scope="col">"Schritt"</th><th scope="col">"Modell"</th><th scope="col">"Tokens"</th><th scope="col">"Kosten"</th></tr></thead>
+                <tbody>
+                    {c.steps.iter().map(|s| {
+                        let tokens = s.usage.input_tokens + s.usage.output_tokens + s.usage.cache_read_tokens + s.usage.cache_write_tokens;
+                        let model = match (&s.model, &s.connector) {
+                            (Some(m), Some(a)) => format!("{m} ({a})"),
+                            (Some(m), None) => m.clone(),
+                            (None, Some(a)) => a.clone(),
+                            (None, None) => "Standard".into(),
+                        };
+                        view! {
+                            <tr>
+                                <td>{step_label(&s.step)}{(s.runs > 1).then(|| format!(" ×{}", s.runs))}</td>
+                                <td>{model}</td>
+                                <td>{fmt_tokens(tokens)}</td>
+                                <td title=source_label(s.source)>{fmt_money(s.amount, &s.currency)}<span class="small muted">{format!(" · {}", source_label(s.source))}</span></td>
+                            </tr>
+                        }
+                    }).collect_view()}
+                </tbody>
+            </table>
+            {c.steps.iter().flat_map(|s| s.notes.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().map(|n| view! { <p class="small muted">{n}</p> }).collect_view()}
+            <p class="small muted">{format!("Preistabelle vom {}", c.price_version)}</p>
+        </Block>
     }
 }
 

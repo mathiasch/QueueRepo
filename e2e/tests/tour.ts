@@ -36,6 +36,9 @@ export async function tour(page: Page, info: TestInfo, device: string, full: boo
     await page.emulateMedia({ colorScheme: scheme });
     await page.goto("/");
     await expect(page.locator('article[data-status="waiting_input"]')).toBeVisible();
+    // Cost estimate of the composer, with its step table (WP13).
+    await page.getByTestId("estimate").getByRole("button", { name: "Details" }).click();
+    await expect(page.getByTestId("estimate").getByRole("table")).toBeVisible();
     await expectAccessible(page, `queue (${scheme})`);
     await shot(page, out, `${device}-${scheme}-queue`, device === "desktop");
 
@@ -68,6 +71,7 @@ export async function tour(page: Page, info: TestInfo, device: string, full: boo
     await expectAccessible(page, `project git (${scheme})`);
     await page.getByRole("tab", { name: "Einstellungen" }).click();
     await expect(page.getByTestId("project-limits")).toBeVisible();
+    await expect(page.getByTestId("project-routing").getByTestId("preset-balanced")).toBeVisible();
     await expectAccessible(page, `project settings (${scheme})`);
     await shot(page, out, `${device}-${scheme}-project-settings`, device === "desktop");
     await page.getByRole("tab", { name: "Mitglieder" }).click();
@@ -77,6 +81,10 @@ export async function tour(page: Page, info: TestInfo, device: string, full: boo
     await navLink(page, "Einstellungen").click();
     await expect(page.getByTestId("budget-mock")).toBeVisible();
     await page.getByTestId("credential-claude").getByRole("button", { name: "Verbinden" }).click();
+    // WP13: form for an additional access, price table, costs.
+    await page.locator("#connectors").getByRole("button", { name: "Zugang hinzufügen" }).click();
+    await expect(page.getByTestId("connector-form")).toBeVisible();
+    await expect(page.getByTestId("price-table")).toBeVisible();
     await expectAccessible(page, `settings (${scheme})`);
     await shot(page, out, `${device}-${scheme}-settings`, device === "desktop");
 

@@ -185,6 +185,14 @@ pub fn valid_queue_file_name(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
+/// One CLI found (or not) in the agent sandbox (`GET /v1/cli-status`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CliProbe {
+    pub cli: String,
+    /// First line of `<cli> --version`, `None` = not installed or failed.
+    pub version: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

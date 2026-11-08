@@ -8,8 +8,8 @@ use chrono::{DateTime, Local, Utc};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use queued_api::{
-    CredentialInfo, Meta, Notification, ProjectSummary, ProviderStatus, ServerEvent, Settings,
-    Task, TaskDetail, TaskEvent, TaskStatus, User,
+    ConnectorView, CredentialInfo, Meta, Notification, ProjectSummary, ProviderStatus, ServerEvent,
+    Settings, Task, TaskDetail, TaskEvent, TaskStatus, User,
 };
 use uuid::Uuid;
 use wasm_bindgen::{closure::Closure, JsCast};
@@ -52,6 +52,8 @@ pub struct Store {
     pub limits: RwSignal<Vec<ProviderStatus>>,
     pub notifications: RwSignal<Vec<Notification>>,
     pub credentials: RwSignal<Vec<CredentialInfo>>,
+    /// Additional accesses (WP13 connectors), secrets never included.
+    pub connectors: RwSignal<Vec<ConnectorView>>,
     /// Latest log line per task (shown in rows).
     pub last_event: RwSignal<HashMap<Uuid, TaskEvent>>,
     /// Progress step per running task.
@@ -92,6 +94,7 @@ impl Store {
             limits: RwSignal::new(vec![]),
             notifications: RwSignal::new(vec![]),
             credentials: RwSignal::new(vec![]),
+            connectors: RwSignal::new(vec![]),
             last_event: RwSignal::new(HashMap::new()),
             phases: RwSignal::new(HashMap::new()),
             toasts: RwSignal::new(vec![]),
@@ -120,6 +123,7 @@ impl Store {
             self.reload_settings().await;
             self.reload_limits().await;
             self.reload_credentials().await;
+            self.reload_connectors().await;
             self.loaded.set(true);
         });
     }
@@ -177,6 +181,12 @@ impl Store {
     pub async fn reload_credentials(self) {
         if let Ok(c) = api::get::<Vec<CredentialInfo>>("/credentials").await {
             self.credentials.set(c);
+        }
+    }
+
+    pub async fn reload_connectors(self) {
+        if let Ok(c) = api::get::<Vec<ConnectorView>>("/connectors").await {
+            self.connectors.set(c);
         }
     }
 

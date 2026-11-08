@@ -12,19 +12,22 @@ use uuid::Uuid;
 
 use crate::{
     agent::{
-        self, AgentEvent, Capabilities, Credential, ErrorCategory, LimitKind, ParseState,
+        self, AgentEvent, Capabilities, ConnCfg, Credential, ErrorCategory, LimitKind, ParseState,
         RetryInfo, RunKind, RunLimits,
     },
-    budget, crypto,
+    batch, budget, connectors, crypto, gateway,
     limits::{self, EffectiveLimits, Guard},
+    llm,
     models::{
         status, AgentResult, FailureClass, FollowUp, Project, ReviewResult, Settings, Task, Usage,
     },
     notify::{notify, Note},
+    pricing::{self, Meter, PriceCtx, Tier},
     prompt::{self, Parent},
     queue::{self, event, finish, Finish, NewTask, Requeue, TaskLimits},
     state::AppState,
 };
+use queued_api::{add_money, StepCost, StepMode, Target, TaskCost};
 
 /// Agent-generated tasks deeper than this always need approval (loop guard).
 const MAX_AUTO_DEPTH: i32 = 3;
@@ -243,6 +246,8 @@ pub(crate) struct RunOutcome {
     /// Runner unreachable / stream interrupted / process could not start.
     pub infra_error: Option<String>,
     pub stderr_tail: String,
+    /// Money cost of the run (catalog prices; CLI dollars only as fallback).
+    pub step_cost: Option<StepCost>,
 }
 
 impl RunOutcome {
@@ -250,6 +255,14 @@ impl RunOutcome {
         self.usage_total
             .clone()
             .unwrap_or_else(|| self.usage_delta.clone())
+    }
+
+    /// Usage with the catalog cost (what budgets and limits count).
+    pub fn priced_usage(&self) -> Usage {
+        self.step_cost
+            .as_ref()
+            .map(|c| c.usage.clone())
+            .unwrap_or_else(|| self.usage())
     }
 
     fn set_failure(&mut self, category: ErrorCategory, message: String) {
@@ -598,15 +611,30 @@ async fn run_inner(
     )
     .await;
 
-    let Some(cred) = queue::load_credential(st, task.user_id, &task.provider).await? else {
-        let msg = format!(
-            "Keine Zugangsdaten für '{}' hinterlegt (Einstellungen → Provider).",
-            task.provider
-        );
-        if block_running(st, task.id, FailureClass::Config, &msg, usage).await {
-            notify_blocked(st, task, &msg).await;
+    let routing = project.routing();
+    // Flex applies to the agent loop of the routing's own access.
+    let exec_flex = routing.as_ref().is_some_and(|r| {
+        r.execute.flex
+            && task.connector_id.is_some()
+            && r.execute.target.as_ref().and_then(|t| t.connector_id) == task.connector_id
+    });
+    let acc = match access_for(
+        st,
+        task.user_id,
+        &project,
+        task.connector_id,
+        &task.provider,
+        exec_flex,
+    )
+    .await?
+    {
+        AccessResult::Ok(a) => a,
+        AccessResult::Missing(msg) | AccessResult::Denied(msg) => {
+            if block_running(st, task.id, FailureClass::Config, &msg, usage).await {
+                notify_blocked(st, task, &msg).await;
+            }
+            return Ok(());
         }
-        return Ok(());
     };
     if let Some(k) = lim.exhausted(usage) {
         let msg = limit_reason(k, &lim, false);
@@ -617,26 +645,56 @@ async fn run_inner(
         return Ok(());
     }
 
+    // Single-shot steps before the agent loop (plan) or instead of it (analysis).
+    if let Some(r) = &routing {
+        let step = if task.kind == "task" && task.plan.is_none() {
+            Some(("plan", &r.plan))
+        } else if task.kind == "onempty" {
+            Some(("analyze", &r.analyze))
+        } else {
+            None
+        };
+        if let Some((name, route)) =
+            step.filter(|(_, s)| matches!(s.mode, StepMode::Sync | StepMode::Batch))
+        {
+            if defer_single(st, task, &project, &settings, r, name, route, usage).await? {
+                return Ok(());
+            }
+        }
+    }
+
     let remote = project_remote(st, &project);
     let before = prepare_workspace(st, task, &project, remote.clone()).await?;
     let prompt = build_prompt(st, task, &project, &settings).await?;
+    let meter = meter_for(
+        st,
+        &acc,
+        task.model.as_deref(),
+        if task.kind == "onempty" {
+            "analyze"
+        } else {
+            "execute"
+        },
+    )
+    .await;
     let out = agent_run(
         st,
         task,
         RunSpec {
-            provider: &task.provider,
+            provider: &acc.provider,
             model: task.model.as_deref(),
-            cred: &cred,
+            cred: &acc.cred,
             prompt,
             kind: RunKind::Agent,
             label: "agent",
             limits: &lim,
             used_before: usage,
+            meter,
         },
         cancel,
     )
     .await?;
-    record_run_usage(st, task, &task.provider, &out, usage).await?;
+    record_run_usage(st, task, &acc, &out, usage).await?;
 
     let commits = Committer {
         st,
@@ -646,7 +704,7 @@ async fn run_inner(
         author_email: &author_email,
     };
     let user_cancel = cancel.is_cancelled();
-    let contract = if early(&out, user_cancel, &task.provider, &lim, usage).is_none() {
+    let contract = if early(&out, user_cancel, &acc.provider, &lim, usage).is_none() {
         let file = st.runner.queue_file(project.id, "result.json").await?;
         let (c, note) = load_contract(out.structured.as_ref(), file.as_deref());
         event(st, task, "contract", &note).await;
@@ -654,11 +712,11 @@ async fn run_inner(
     } else {
         None
     };
-    let caps = agent::capabilities(&task.provider);
+    let caps = agent::capabilities_for(&acc.provider, acc.cred.conn.as_ref());
     let (disposition, pause) = classify_run(
         &out,
         user_cancel,
-        &task.provider,
+        &acc.provider,
         caps,
         contract,
         &lim,
@@ -666,12 +724,12 @@ async fn run_inner(
     );
     match pause {
         Some(Pause::RateLimit(reset)) => {
-            pause_rate_limited(st, task, &task.provider, reset).await;
+            pause_rate_limited(st, task, &acc.key, reset).await;
         }
-        Some(Pause::Auth(msg)) => pause_auth(st, task, &task.provider, &msg).await,
+        Some(Pause::Auth(msg)) => pause_auth(st, task, &acc.key, &acc.label, &msg).await,
         None => {}
     }
-    let Some(next) = interrupted(&commits, disposition, &lim, usage).await? else {
+    let Some(next) = interrupted(&commits, &acc, disposition, &lim, usage).await? else {
         return Ok(());
     };
     let (result, mut failure) = next.into_result(&out);
@@ -737,9 +795,49 @@ async fn run_inner(
                 failure = Some(format!("Verifikation `{cmd}` fehlgeschlagen:\n{msg}"));
             }
         }
+        let review_route = routing.as_ref().map(|r| r.review.clone());
         if failure.is_none() && project.review_enabled && before != after {
+            if let Some(route) = review_route
+                .as_ref()
+                .filter(|r| matches!(r.mode, StepMode::Sync | StepMode::Batch))
+            {
+                let pending = PendingReview {
+                    summary: summary.clone(),
+                    handoff: handoff.clone(),
+                    follow_ups: result.follow_up_tasks.clone(),
+                    before: before.clone(),
+                    after: after.clone(),
+                };
+                if defer_review(
+                    st,
+                    task,
+                    &project,
+                    routing.as_ref().expect("route"),
+                    route,
+                    &pending,
+                    usage,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+            }
             match run_review(
-                st, task, &project, &before, &after, &summary, cancel, usage, &lim,
+                st,
+                task,
+                &project,
+                ReviewCtx {
+                    before: &before,
+                    after: &after,
+                    summary: &summary,
+                    route: review_route
+                        .as_ref()
+                        .filter(|r| r.mode == StepMode::Harness),
+                    exec: &acc,
+                },
+                cancel,
+                usage,
+                &lim,
             )
             .await?
             {
@@ -860,19 +958,219 @@ async fn build_prompt(
     Ok(prompt::task(task, project, parent.as_ref()))
 }
 
-/// Adds a run's usage to the task total, the usage log and the budget check.
+/// Adds a run's usage to the task total, the usage log, the task cost and the budget check.
 async fn record_run_usage(
     st: &AppState,
     task: &Task,
-    provider: &str,
+    acc: &RunAccess,
     out: &RunOutcome,
     usage: &mut Usage,
 ) -> sqlx::Result<()> {
-    let run_usage = out.usage();
+    let run_usage = out.priced_usage();
     usage.add(&run_usage);
-    budget::record_usage(&st.db, task.user_id, provider, Some(task.id), &run_usage).await?;
-    check_budget(st, task.user_id, provider).await;
+    if let Some(sc) = &out.step_cost {
+        record_cost(st, task, &acc.provider, acc.connector_id, sc).await?;
+    }
+    check_budget(st, task.user_id, &acc.provider).await;
     Ok(())
+}
+
+/// Logs one priced step and merges it into `tasks.cost`.
+pub(crate) async fn record_cost(
+    st: &AppState,
+    task: &Task,
+    provider: &str,
+    connector: Option<Uuid>,
+    sc: &StepCost,
+) -> sqlx::Result<()> {
+    budget::record_usage(
+        &st.db,
+        budget::UsageRow {
+            user: task.user_id,
+            provider,
+            task: Some(task.id),
+            project: Some(task.project_id),
+            connector,
+            cost: sc,
+        },
+    )
+    .await?;
+    let mut tx = st.db.begin().await?;
+    let cur: Option<Value> = sqlx::query_scalar("SELECT cost FROM tasks WHERE id=$1 FOR UPDATE")
+        .bind(task.id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+    let mut tc: TaskCost = cur
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    merge_cost(&mut tc, sc, &pricing::builtin().version);
+    sqlx::query("UPDATE tasks SET cost=$2 WHERE id=$1")
+        .bind(task.id)
+        .bind(serde_json::to_value(&tc).unwrap_or_default())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+/// Adds a step to the task cost (same step + model + access = one line).
+pub(crate) fn merge_cost(tc: &mut TaskCost, sc: &StepCost, version: &str) {
+    match tc.steps.iter_mut().find(|x| {
+        x.step == sc.step
+            && x.model == sc.model
+            && x.connector == sc.connector
+            && x.currency == sc.currency
+    }) {
+        Some(x) => {
+            x.usage.add(&sc.usage);
+            x.amount += sc.amount;
+            x.runs += sc.runs;
+            if x.source != sc.source {
+                // Mixed sources: the weaker one is shown.
+                x.source = if x.source == queued_api::CostSource::Unknown
+                    || sc.source == queued_api::CostSource::Unknown
+                {
+                    queued_api::CostSource::Unknown
+                } else {
+                    queued_api::CostSource::Cli
+                };
+            }
+            for n in &sc.notes {
+                if !x.notes.contains(n) {
+                    x.notes.push(n.clone());
+                }
+            }
+        }
+        None => tc.steps.push(sc.clone()),
+    }
+    tc.totals.clear();
+    for x in &tc.steps {
+        add_money(&mut tc.totals, &x.currency, x.amount);
+    }
+    tc.incomplete = tc.steps.iter().any(|x| {
+        x.source == queued_api::CostSource::Unknown
+            && x.usage.input_tokens + x.usage.output_tokens > 0
+    });
+    tc.price_version = version.to_string();
+}
+
+/// The access (credential) of one run.
+pub(crate) struct RunAccess {
+    /// CLI of the run; usage and budgets are logged under it.
+    pub provider: String,
+    pub cred: Credential,
+    /// `provider_limits` key for pauses (provider, or `connector:<id>`).
+    pub key: String,
+    /// Readable name for messages.
+    pub label: String,
+    pub connector_id: Option<Uuid>,
+    /// Regional surcharge rule of the price catalog.
+    pub region: Option<&'static str>,
+}
+
+pub(crate) enum AccessResult {
+    Ok(Box<RunAccess>),
+    /// Legacy provider without stored credentials.
+    Missing(String),
+    /// Connector gone/not accessible, or the data-residency rule forbids it.
+    Denied(String),
+}
+
+/// Resolves and checks (access rights, data residency) the access of a run.
+pub(crate) async fn access_for(
+    st: &AppState,
+    user: Uuid,
+    project: &Project,
+    connector_id: Option<Uuid>,
+    provider: &str,
+    flex: bool,
+) -> anyhow::Result<AccessResult> {
+    let residency = project.residency();
+    let Some(id) = connector_id else {
+        let loc = connectors::legacy_location(provider);
+        if !residency.allows(loc) {
+            return Ok(AccessResult::Denied(connectors::residency_error(
+                residency,
+                loc,
+                &format!("Der Standard-Zugang „{provider}“"),
+            )));
+        }
+        return Ok(match queue::load_credential(st, user, provider).await? {
+            None => AccessResult::Missing(format!(
+                "Keine Zugangsdaten für '{provider}' hinterlegt (Einstellungen → Provider)."
+            )),
+            Some(cred) => AccessResult::Ok(Box::new(RunAccess {
+                provider: provider.into(),
+                cred,
+                key: provider.into(),
+                label: provider.into(),
+                connector_id: None,
+                region: None,
+            })),
+        });
+    };
+    let Some(c) = connectors::load_for(st, id, user, Some(project.id)).await? else {
+        return Ok(AccessResult::Denied(
+            "Der gewählte Zugang ist nicht mehr verfügbar (gelöscht oder kein Zugriff mehr)."
+                .into(),
+        ));
+    };
+    if !residency.allows(c.location) {
+        return Ok(AccessResult::Denied(connectors::residency_error(
+            residency,
+            c.location,
+            &format!("Der Zugang „{}“", c.label),
+        )));
+    }
+    let flex = flex && connectors::type_info(&c.kind, true).is_some_and(|t| t.flex);
+    Ok(AccessResult::Ok(Box::new(RunAccess {
+        provider: c.harness.clone(),
+        key: c.limit_key(),
+        label: c.label.clone(),
+        connector_id: Some(c.id),
+        region: c.region_rule(),
+        cred: Credential {
+            kind: format!("connector:{}", c.kind),
+            secret: c.secret.clone().unwrap_or_default(),
+            conn: Some(ConnCfg {
+                id: Some(c.id),
+                kind: c.kind.clone(),
+                label: c.label.clone(),
+                config: c.config.clone(),
+                flex,
+            }),
+        },
+    })))
+}
+
+/// Paused (rate limit/auth) or out of budget.
+async fn access_blocked(st: &AppState, user: Uuid, a: &RunAccess) -> sqlx::Result<bool> {
+    let s = budget::status(&st.db, user, &a.provider).await?;
+    if a.connector_id.is_none() {
+        return Ok(s.blocked);
+    }
+    Ok(s.budget_until.is_some() || budget::status(&st.db, user, &a.key).await?.blocked)
+}
+
+/// Meter for a run of `a` with `model`.
+async fn meter_for(st: &AppState, a: &RunAccess, model: Option<&str>, step: &'static str) -> Meter {
+    let cat = pricing::current(st).await;
+    let flex = a.cred.conn.as_ref().is_some_and(|c| c.flex);
+    let region_mult = a
+        .region
+        .and_then(|r| pricing::region(&cat, r))
+        .map_or(1.0, |r| r.multiplier);
+    Meter::new(
+        &cat,
+        model,
+        PriceCtx {
+            tier: if flex { Tier::Flex } else { Tier::Standard },
+            region_mult,
+            long_ttl: false,
+        },
+        step,
+        a.connector_id.map(|_| a.label.clone()),
+    )
 }
 
 async fn push(st: &AppState, task: &Task, project: &Project, r: GitRemote) -> anyhow::Result<()> {
@@ -983,7 +1281,13 @@ async fn finish_failed(
     f: &str,
 ) -> Result<(), RunError> {
     event(st, task, "error", f).await;
-    let can_fix = task.kind != "onempty" && task.attempt < settings.max_fix_attempts;
+    // Eval runs measure first-pass success: no fix tasks.
+    let is_eval: bool = sqlx::query_scalar("SELECT is_eval FROM projects WHERE id=$1")
+        .bind(task.project_id)
+        .fetch_optional(&st.db)
+        .await?
+        .unwrap_or(false);
+    let can_fix = task.kind != "onempty" && !is_eval && task.attempt < settings.max_fix_attempts;
     finish(
         st,
         task.id,
@@ -1084,6 +1388,7 @@ impl Committer<'_> {
 /// normal result flow has to continue with, if anything.
 async fn interrupted(
     c: &Committer<'_>,
+    acc: &RunAccess,
     disposition: Disposition,
     lim: &EffectiveLimits,
     usage: &Usage,
@@ -1128,7 +1433,7 @@ async fn interrupted(
             Ok(None)
         }
         Disposition::RateLimited(reset) => {
-            let until = pause_rate_limited(st, task, &task.provider, reset).await;
+            let until = pause_rate_limited(st, task, &acc.key, reset).await;
             c.interrupted_commit(" (unterbrochen: Limit)".into()).await;
             queue::requeue(
                 st,
@@ -1149,7 +1454,7 @@ async fn interrupted(
                 "limit",
                 &format!(
                     "Limit erreicht – {} pausiert bis {}",
-                    task.provider,
+                    acc.label,
                     until.to_rfc3339()
                 ),
             )
@@ -1159,10 +1464,10 @@ async fn interrupted(
                 task.user_id,
                 Note {
                     kind: "limit",
-                    title: format!("{}-Limit erreicht", task.provider),
+                    title: format!("{}-Limit erreicht", acc.label),
                     body: format!(
                         "Queue für {} pausiert bis {} UTC, danach geht es automatisch weiter.",
-                        task.provider,
+                        acc.label,
                         until.format("%d.%m. %H:%M")
                     ),
                     task_id: Some(task.id),
@@ -1173,7 +1478,7 @@ async fn interrupted(
             Ok(None)
         }
         Disposition::AuthPaused(msg) => {
-            pause_auth(st, task, &task.provider, &msg).await;
+            pause_auth(st, task, &acc.key, &acc.label, &msg).await;
             c.interrupted_commit(" (unterbrochen: Anmeldung)".into())
                 .await;
             queue::requeue(
@@ -1270,10 +1575,11 @@ async fn pause_rate_limited(
     until
 }
 
-/// Pauses `provider` until credentials are updated or the user resumes it.
-async fn pause_auth(st: &AppState, task: &Task, provider: &str, msg: &str) {
+/// Pauses the access `key` (provider or connector) until credentials are
+/// updated or the user resumes it. `provider` is the readable name.
+async fn pause_auth(st: &AppState, task: &Task, key: &str, provider: &str, msg: &str) {
     let reason = cut(msg, 300);
-    if let Err(e) = budget::set_paused(&st.db, task.user_id, provider, &reason).await {
+    if let Err(e) = budget::set_paused(&st.db, task.user_id, key, &reason).await {
         tracing::error!("set_paused failed: {e:#}");
         return;
     }
@@ -1376,6 +1682,8 @@ struct RunSpec<'a> {
     limits: &'a EffectiveLimits,
     /// Task usage before this run (limits are cumulative per task).
     used_before: &'a Usage,
+    /// Prices the usage while it streams in.
+    meter: Meter,
 }
 
 async fn agent_run(
@@ -1384,13 +1692,33 @@ async fn agent_run(
     spec: RunSpec<'_>,
     cancel: &CancellationToken,
 ) -> Result<RunOutcome, RunError> {
-    let caps = agent::capabilities(spec.provider);
+    let caps = agent::capabilities_for(spec.provider, spec.cred.conn.as_ref());
     let (tokens_left, cost_left) = spec.limits.remaining(spec.used_before);
     let run_limits = RunLimits {
         turns: spec.limits.turns.filter(|_| caps.max_turns),
         cost_usd: cost_left.filter(|_| caps.max_cost),
     };
-    let inv = agent::invocation(spec.provider, spec.model, spec.cred, &run_limits, spec.kind)
+    // LiteLLM: a virtual key per run, capped at the task's remaining cost limit.
+    let gw = gateway::per_task(spec.cred);
+    let run_cred;
+    let cred: &Credential = match &gw {
+        Some((base, master)) => {
+            let key = gateway::issue(base, master, task.id, cost_left, &st.cfg.llm_guard())
+                .await
+                .map_err(RunError::Infra)?;
+            event(
+                st,
+                task,
+                "status",
+                "Gateway: eigener Budget-Schlüssel für diesen Lauf",
+            )
+            .await;
+            run_cred = gateway::with_key(spec.cred, key);
+            &run_cred
+        }
+        None => spec.cred,
+    };
+    let inv = agent::invocation(spec.provider, spec.model, cred, &run_limits, spec.kind)
         .map_err(|e| RunError::Config(format!("{e:#}")))?;
     let mut unsupported = vec![];
     if spec.limits.turns.is_some() && !caps.max_turns {
@@ -1438,6 +1766,7 @@ async fn agent_run(
 
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(512);
     let provider = spec.provider;
+    let mut meter = spec.meter;
     let consumer = async {
         let mut ps = ParseState::default();
         let mut o = RunOutcome::default();
@@ -1452,7 +1781,13 @@ async fn agent_run(
                             }
                             AgentEvent::Text(_) => {}
                             AgentEvent::Tool(t) => event(st, task, "tool", &t).await,
-                            AgentEvent::UsageDelta(u) => {
+                            AgentEvent::UsageDelta(mut u) => {
+                                // Catalog price instead of the CLI's dollars (USD prices
+                                // only; the cost limit is in USD).
+                                let c = meter.on_delta(&u);
+                                if meter.usd() {
+                                    u.cost_usd = c;
+                                }
                                 o.usage_delta.add(&u);
                                 if let Some(k) = guard.as_mut().and_then(|g| g.on_delta(&u)) {
                                     o.guard_limit = Some(k);
@@ -1514,9 +1849,12 @@ async fn agent_run(
                 _ => {}
             }
         }
-        o
+        (o, meter)
     };
-    let (last, mut o) = tokio::join!(exec(st, req, &run_cancel, tx), consumer);
+    let (last, (mut o, meter)) = tokio::join!(exec(st, req, &run_cancel, tx), consumer);
+    if let Some((base, master)) = &gw {
+        gateway::revoke(base, master, &cred.secret, &st.cfg.llm_guard()).await;
+    }
     match last {
         Ok(ExecFrame::Exit {
             success,
@@ -1547,8 +1885,29 @@ async fn agent_run(
                 if new.trim() != spec.cred.secret.trim()
                     && serde_json::from_str::<Value>(&new).is_ok()
                 {
-                    queue::store_credential(st, task.user_id, provider, &spec.cred.kind, &new)
-                        .await?;
+                    match spec.cred.conn.as_ref().and_then(|c| c.id) {
+                        // Connector (e.g. ChatGPT subscription): back into its secret.
+                        Some(id) => {
+                            let enc = crypto::encrypt(&st.cfg.master_key, new.trim().as_bytes())?;
+                            sqlx::query(
+                                "UPDATE connectors SET secret_enc=$2, updated_at=now() WHERE id=$1",
+                            )
+                            .bind(id)
+                            .bind(enc)
+                            .execute(&st.db)
+                            .await?;
+                        }
+                        None => {
+                            queue::store_credential(
+                                st,
+                                task.user_id,
+                                provider,
+                                &spec.cred.kind,
+                                &new,
+                            )
+                            .await?
+                        }
+                    }
                 }
             }
         }
@@ -1557,6 +1916,7 @@ async fn agent_run(
         Err(e) => o.infra_error = Some(format!("{e:#}")),
     }
     o.stderr_tail = tail(&o.stderr_tail, 3000);
+    o.step_cost = Some(meter.finish(&o.usage()));
     Ok(o)
 }
 
@@ -1630,52 +1990,99 @@ enum ReviewOutcome {
     Blocked(FailureClass, String),
 }
 
-#[allow(clippy::too_many_arguments)]
+struct ReviewCtx<'a> {
+    before: &'a str,
+    after: &'a str,
+    summary: &'a str,
+    /// Harness review route of the project routing (`None` = legacy fields).
+    route: Option<&'a queued_api::StepRoute>,
+    /// Access of the agent loop (default reviewer).
+    exec: &'a RunAccess,
+}
+
+/// Reviewer target: routing route, legacy review provider, or the access
+/// and model of the agent loop.
+fn review_target(
+    task: &Task,
+    project: &Project,
+    route: Option<&queued_api::StepRoute>,
+) -> (Option<Uuid>, String, Option<String>) {
+    match route {
+        Some(r) => match &r.target {
+            Some(t) => (
+                t.connector_id,
+                t.provider.clone().unwrap_or_else(|| task.provider.clone()),
+                t.model
+                    .clone()
+                    .filter(|m| !m.is_empty())
+                    .or(task.model.clone()),
+            ),
+            None => (task.connector_id, task.provider.clone(), task.model.clone()),
+        },
+        None => match project.review_provider.clone().filter(|p| !p.is_empty()) {
+            Some(p) => (None, p, project.review_model.clone()),
+            None => (
+                task.connector_id,
+                task.provider.clone(),
+                project.review_model.clone().or(task.model.clone()),
+            ),
+        },
+    }
+}
+
 async fn run_review(
     st: &AppState,
     task: &Task,
     project: &Project,
-    before: &str,
-    after: &str,
-    summary: &str,
+    rc: ReviewCtx<'_>,
     cancel: &CancellationToken,
     usage: &mut Usage,
     lim: &EffectiveLimits,
 ) -> Result<ReviewOutcome, RunError> {
-    let provider = project
-        .review_provider
-        .clone()
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| task.provider.clone());
-    let model = if project.review_provider.is_some() {
-        project.review_model.clone()
+    let (connector, provider, model) = review_target(task, project, rc.route);
+    let same = connector == rc.exec.connector_id && provider == rc.exec.provider;
+    let acc_owned;
+    let acc: &RunAccess = if same && connector.is_some() {
+        rc.exec
     } else {
-        project.review_model.clone().or(task.model.clone())
+        match access_for(st, task.user_id, project, connector, &provider, false).await? {
+            AccessResult::Ok(a) => {
+                acc_owned = a;
+                &acc_owned
+            }
+            AccessResult::Missing(_) => return Ok(ReviewOutcome::Skipped(String::new())),
+            // Residency or a vanished access must never be skipped silently.
+            AccessResult::Denied(msg) => {
+                return Ok(ReviewOutcome::Blocked(
+                    FailureClass::Config,
+                    format!("{msg} (Review)"),
+                ))
+            }
+        }
     };
-    let Some(cred) = queue::load_credential(st, task.user_id, &provider).await? else {
-        return Ok(ReviewOutcome::Skipped(String::new()));
-    };
-    if budget::is_blocked(&st.db, task.user_id, &provider).await? {
+    if access_blocked(st, task.user_id, acc).await? {
         return Ok(ReviewOutcome::Skipped(String::new()));
     }
-    event(st, task, "review", &format!("Review via {provider}")).await;
+    event(st, task, "review", &format!("Review via {}", acc.label)).await;
     let diff = st
         .runner
-        .diff(project.id, before, after, prompt::MAX_DIFF)
+        .diff(project.id, rc.before, rc.after, prompt::MAX_DIFF)
         .await?
         .diff;
+    let meter = meter_for(st, acc, model.as_deref(), "review").await;
     let out = match agent_run(
         st,
         task,
         RunSpec {
-            provider: &provider,
+            provider: &acc.provider,
             model: model.as_deref(),
-            cred: &cred,
-            prompt: prompt::review(task, summary, &diff),
+            cred: &acc.cred,
+            prompt: prompt::review(task, rc.summary, &diff),
             kind: RunKind::Review,
             label: "review",
             limits: lim,
             used_before: usage,
+            meter,
         },
         cancel,
     )
@@ -1689,12 +2096,12 @@ async fn run_review(
         }
         Err(e) => return Err(e),
     };
-    record_run_usage(st, task, &provider, &out, usage).await?;
+    record_run_usage(st, task, acc, &out, usage).await?;
     if cancel.is_cancelled() {
         return Ok(ReviewOutcome::Cancelled);
     }
-    let caps = agent::capabilities(&provider);
-    if let Some(d) = early(&out, false, &provider, lim, usage) {
+    let caps = agent::capabilities_for(&acc.provider, acc.cred.conn.as_ref());
+    if let Some(d) = early(&out, false, &acc.provider, lim, usage) {
         return Ok(match d {
             Disposition::Blocked { class, reason } => {
                 ReviewOutcome::Blocked(class, format!("{reason} (Review)"))
@@ -1705,7 +2112,7 @@ async fn run_review(
     }
     let file = st.runner.queue_file(project.id, "review.json").await?;
     let review = load_review(out.structured.as_ref(), file.as_deref());
-    // Limits/auth problems of the review provider pause it for the next tasks,
+    // Limits/auth problems of the review access pause it for the next tasks,
     // whether or not a review result exists (same rule as for agent runs).
     if let Some((c, msg)) = &out.failure {
         match c.class() {
@@ -1714,19 +2121,20 @@ async fn run_review(
                     ErrorCategory::RateLimit(t) => *t,
                     _ => None,
                 };
-                let until = pause_rate_limited(st, task, &provider, reset).await;
+                let until = pause_rate_limited(st, task, &acc.key, reset).await;
                 event(
                     st,
                     task,
                     "limit",
                     &format!(
-                        "Limit erreicht – {provider} pausiert bis {}",
+                        "Limit erreicht – {} pausiert bis {}",
+                        acc.label,
                         until.to_rfc3339()
                     ),
                 )
                 .await;
             }
-            FailureClass::ProviderAuth => pause_auth(st, task, &provider, msg).await,
+            FailureClass::ProviderAuth => pause_auth(st, task, &acc.key, &acc.label, msg).await,
             _ => {}
         }
     }
@@ -1754,6 +2162,366 @@ async fn run_review(
     Ok(ReviewOutcome::Reviewed(r))
 }
 
+// ---------------------------------------------------------------------------
+// Single-shot steps (plan, review, analysis) as jobs – WP13
+// ---------------------------------------------------------------------------
+
+/// What the review job needs to finish the task later.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+pub(crate) struct PendingReview {
+    pub summary: String,
+    pub handoff: Option<String>,
+    pub follow_ups: Vec<FollowUp>,
+    pub before: String,
+    pub after: String,
+}
+
+/// Connector of a single-shot step (target or the agent loop's connector).
+async fn step_connector(
+    st: &AppState,
+    task: &Task,
+    project: &Project,
+    route: &queued_api::StepRoute,
+    exec: Option<&Target>,
+) -> anyhow::Result<Result<(connectors::Resolved, String), String>> {
+    let target = route.target.as_ref().or(exec);
+    let model = route
+        .target
+        .as_ref()
+        .and_then(|t| t.model.clone())
+        .or_else(|| exec.and_then(|t| t.model.clone()))
+        .or(task.model.clone())
+        .filter(|m| !m.trim().is_empty());
+    let Some(cid) = target.and_then(|t| t.connector_id).or(task.connector_id) else {
+        return Ok(Err("kein Zugang mit API-Schlüssel gewählt".into()));
+    };
+    let Some(c) = connectors::load_for(st, cid, task.user_id, Some(project.id)).await? else {
+        return Ok(Err("Zugang nicht mehr verfügbar".into()));
+    };
+    let r = project.residency();
+    if !r.allows(c.location) {
+        return Ok(Err(connectors::residency_error(
+            r,
+            c.location,
+            &format!("Der Zugang „{}“", c.label),
+        )));
+    }
+    let Some(model) = model else {
+        return Ok(Err("kein Modell angegeben".into()));
+    };
+    let blocked = budget::status(&st.db, task.user_id, &c.limit_key())
+        .await?
+        .blocked
+        || budget::status(&st.db, task.user_id, &c.harness)
+            .await?
+            .budget_until
+            .is_some();
+    if blocked {
+        return Ok(Err(format!(
+            "{} ist pausiert oder das Budget ist erschöpft",
+            c.label
+        )));
+    }
+    Ok(Ok((c, model)))
+}
+
+/// Stable prefix of single-shot prompts (cacheable).
+async fn stable_prefix(st: &AppState, project: &Project) -> String {
+    let files = st.runner.files(project.id).await.unwrap_or_default();
+    prompt::single_shot_system(project, &files)
+}
+
+/// Plan before / analysis instead of the agent loop. Returns whether the
+/// task now waits for the job. On a configuration problem the plan is
+/// skipped (and the analysis falls back to the agentic run).
+#[allow(clippy::too_many_arguments)]
+async fn defer_single(
+    st: &AppState,
+    task: &Task,
+    project: &Project,
+    settings: &Settings,
+    routing: &queued_api::Routing,
+    step: &'static str,
+    route: &queued_api::StepRoute,
+    usage: &Usage,
+) -> Result<bool, RunError> {
+    let (c, model) =
+        match step_connector(st, task, project, route, routing.execute.target.as_ref()).await? {
+            Ok(x) => x,
+            Err(why) => {
+                if why.contains("erlaubt nur") {
+                    // Data residency is a hard rule, never a silent fallback.
+                    return Err(RunError::Config(format!(
+                        "{}: {why}",
+                        batch::step_label(step)
+                    )));
+                }
+                event(
+                    st,
+                    task,
+                    "batch",
+                    &format!("{} übersprungen: {why}", batch::step_label(step)),
+                )
+                .await;
+                if step == "plan" {
+                    sqlx::query("UPDATE tasks SET plan='' WHERE id=$1")
+                        .bind(task.id)
+                        .execute(&st.db)
+                        .await?;
+                }
+                return Ok(false);
+            }
+        };
+    let system = stable_prefix(st, project).await;
+    let user = if step == "plan" {
+        let parent = parent_of(st, task).await?;
+        prompt::plan_request(task, parent.as_ref())
+    } else {
+        let history = onempty_history(st, project).await?;
+        prompt::analyze_request(&settings.onempty_actions, &history)
+    };
+    let mode = route.mode;
+    let _ = usage;
+    batch::create(
+        st,
+        batch::JobSpec {
+            task,
+            step,
+            mode,
+            connector: &c,
+            request: llm::Request {
+                model,
+                system,
+                user,
+                max_tokens: if step == "plan" { 8_000 } else { 12_000 },
+                cache_long: mode == StepMode::Batch,
+            },
+            payload: json!({}),
+        },
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Review as a single-shot job after a successful run and verify.
+async fn defer_review(
+    st: &AppState,
+    task: &Task,
+    project: &Project,
+    routing: &queued_api::Routing,
+    route: &queued_api::StepRoute,
+    pending: &PendingReview,
+    usage: &Usage,
+) -> Result<bool, RunError> {
+    let (c, model) =
+        match step_connector(st, task, project, route, routing.execute.target.as_ref()).await? {
+            Ok(x) => x,
+            Err(why) => {
+                if why.contains("erlaubt nur") {
+                    return Err(RunError::Config(format!("Review: {why}")));
+                }
+                event(
+                    st,
+                    task,
+                    "review",
+                    &format!("Review per API nicht möglich ({why}) – agentisches Review"),
+                )
+                .await;
+                return Ok(false);
+            }
+        };
+    let diff = st
+        .runner
+        .diff(
+            project.id,
+            &pending.before,
+            &pending.after,
+            prompt::MAX_DIFF,
+        )
+        .await?
+        .diff;
+    let system = stable_prefix(st, project).await;
+    // Keep what the run produced; the job finishes the task.
+    sqlx::query("UPDATE tasks SET summary=$2, handoff=COALESCE($3, handoff), usage=$4 WHERE id=$1")
+        .bind(task.id)
+        .bind(&pending.summary)
+        .bind(&pending.handoff)
+        .bind(serde_json::to_value(usage).unwrap_or_default())
+        .execute(&st.db)
+        .await?;
+    batch::create(
+        st,
+        batch::JobSpec {
+            task,
+            step: "review",
+            mode: route.mode,
+            connector: &c,
+            request: llm::Request {
+                model,
+                system,
+                user: prompt::review_request(task, &pending.summary, &diff),
+                max_tokens: 4_000,
+                cache_long: route.mode == StepMode::Batch,
+            },
+            payload: serde_json::to_value(pending).unwrap_or_default(),
+        },
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn parent_of(st: &AppState, task: &Task) -> sqlx::Result<Option<Parent>> {
+    Ok(match task.parent_id {
+        Some(pid) => sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT title, handoff, summary FROM tasks WHERE id=$1",
+        )
+        .bind(pid)
+        .fetch_optional(&st.db)
+        .await?
+        .map(|(title, handoff, summary)| Parent {
+            title,
+            handoff,
+            summary,
+        }),
+        None => None,
+    })
+}
+
+async fn onempty_history(
+    st: &AppState,
+    project: &Project,
+) -> sqlx::Result<Vec<(String, Option<String>)>> {
+    sqlx::query_as(
+        "SELECT title, summary FROM tasks WHERE project_id=$1 AND status='done' AND kind<>'onempty' ORDER BY finished_at DESC LIMIT 8",
+    )
+    .bind(project.id)
+    .fetch_all(&st.db)
+    .await
+}
+
+/// Continues a task after its review job (poller).
+pub(crate) async fn complete_review(
+    st: &AppState,
+    task: &Task,
+    payload: &Value,
+    outcome: Result<ReviewResult, String>,
+    usage: &Usage,
+) -> anyhow::Result<()> {
+    let p: PendingReview = serde_json::from_value(payload.clone()).unwrap_or_default();
+    let project: Project = sqlx::query_as("SELECT * FROM projects WHERE id=$1")
+        .bind(task.project_id)
+        .fetch_one(&st.db)
+        .await?;
+    let settings = queue::load_settings(st, task.user_id).await?;
+    let (review, failure) = match outcome {
+        Ok(r) => {
+            event(
+                st,
+                task,
+                "review",
+                &if r.approved {
+                    "Review: OK".to_string()
+                } else {
+                    format!("Review: abgelehnt\n- {}", r.issues.join("\n- "))
+                },
+            )
+            .await;
+            let failure =
+                (!r.approved).then(|| format!("Review abgelehnt:\n- {}", r.issues.join("\n- ")));
+            (Some(json!(r)), failure)
+        }
+        Err(why) => {
+            event(st, task, "review", &format!("Review übersprungen: {why}")).await;
+            (None, None)
+        }
+    };
+    let end = End {
+        summary: p.summary,
+        handoff: p.handoff,
+        review,
+        usage,
+    };
+    let res = match failure {
+        None => {
+            if project.auto_push && p.before != p.after {
+                if let Some(r) = project_remote(st, &project) {
+                    push(st, task, &project, r).await?;
+                }
+            }
+            finish_done(st, task, &settings, end, p.follow_ups).await
+        }
+        Some(f) => finish_failed(st, task, &settings, end, &f).await,
+    };
+    res.map_err(|e| match e {
+        RunError::Config(m) => anyhow::anyhow!(m),
+        RunError::Infra(e) => e,
+    })?;
+    st.wake.notify_one();
+    Ok(())
+}
+
+/// Continues an OnEmpty task after its analysis job (poller).
+pub(crate) async fn complete_analyze(
+    st: &AppState,
+    task: &Task,
+    outcome: Result<AgentResult, String>,
+    usage: &Usage,
+) -> anyhow::Result<()> {
+    let settings = queue::load_settings(st, task.user_id).await?;
+    let res = match outcome {
+        Ok(r) if r.status.as_deref() == Some("needs_input") && !r.questions.is_empty() => finish(
+            st,
+            task.id,
+            Finish {
+                status: status::WAITING_INPUT,
+                summary: r.summary.clone(),
+                handoff: r.handoff.clone(),
+                error: None,
+                review: None,
+                questions: Some(json!(r.questions)),
+                usage,
+                failure_class: None,
+            },
+        )
+        .await
+        .map_err(RunError::from),
+        Ok(r) => {
+            let end = End {
+                summary: r
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| "Analyse abgeschlossen".into()),
+                handoff: r.handoff.clone(),
+                review: None,
+                usage,
+            };
+            finish_done(st, task, &settings, end, r.follow_up_tasks).await
+        }
+        Err(why) => {
+            let end = End {
+                summary: String::new(),
+                handoff: None,
+                review: None,
+                usage,
+            };
+            finish_failed(
+                st,
+                task,
+                &settings,
+                end,
+                &format!("Analyse fehlgeschlagen: {why}"),
+            )
+            .await
+        }
+    };
+    res.map_err(|e| match e {
+        RunError::Config(m) => anyhow::anyhow!(m),
+        RunError::Infra(e) => e,
+    })?;
+    st.wake.notify_one();
+    Ok(())
+}
+
 async fn create_followups(
     st: &AppState,
     parent: &Task,
@@ -1770,10 +2538,40 @@ async fn create_followups(
     }
     let depth = parent.depth + 1;
     let needs_approval = items.len() as i32 > settings.max_auto_tasks || depth > MAX_AUTO_DEPTH;
-    let provider = if parent.kind == "onempty" {
-        settings.default_provider.clone()
+    // OnEmpty proposals run on the project's agent-loop access; other
+    // follow-ups inherit the parent's access.
+    let (provider, connector_id, model) = if parent.kind == "onempty" {
+        let route =
+            sqlx::query_scalar::<_, Option<Value>>("SELECT routing FROM projects WHERE id=$1")
+                .bind(parent.project_id)
+                .fetch_one(&st.db)
+                .await?
+                .and_then(|r| serde_json::from_value::<queued_api::Routing>(r).ok())
+                .and_then(|r| r.execute.target);
+        match route {
+            Some(t) => (
+                t.provider
+                    .clone()
+                    .unwrap_or_else(|| parent.provider.clone()),
+                t.connector_id,
+                t.model.clone(),
+            ),
+            None => (settings.default_provider.clone(), None, None),
+        }
     } else {
-        parent.provider.clone()
+        (
+            parent.provider.clone(),
+            parent.connector_id,
+            parent.model.clone(),
+        )
+    };
+    // A connector's harness wins over the stored provider.
+    let provider = match connector_id {
+        Some(c) => match connectors::load_row(st, c).await? {
+            Some(row) => connectors::harness(&row.3, &row.5),
+            None => provider,
+        },
+        None => provider,
     };
     for f in &items {
         let title = if f.title.trim().is_empty() {
@@ -1796,11 +2594,7 @@ async fn create_followups(
                 prompt: f.prompt.clone(),
                 context: String::new(),
                 provider: provider.clone(),
-                model: if parent.kind == "onempty" {
-                    None
-                } else {
-                    parent.model.clone()
-                },
+                model: model.clone(),
                 status: if needs_approval {
                     status::PENDING_APPROVAL
                 } else {
@@ -1812,6 +2606,8 @@ async fn create_followups(
                 front: false,
                 // Follow-ups get the project defaults, not the parent's overrides.
                 limits: TaskLimits::default(),
+                connector_id,
+                escalation_level: 0,
             },
         )
         .await?;
@@ -1862,6 +2658,26 @@ async fn create_followups(
 }
 
 async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Result<()> {
+    // Escalation along the routing chain (e.g. Haiku → Sonnet → Opus).
+    let routing: Option<queued_api::Routing> =
+        sqlx::query_scalar::<_, Option<Value>>("SELECT routing FROM projects WHERE id=$1")
+            .bind(failed.project_id)
+            .fetch_one(&st.db)
+            .await?
+            .and_then(|r| serde_json::from_value(r).ok());
+    let (model, level) = match crate::routing::escalate(routing.as_ref(), failed) {
+        Some((m, l)) => {
+            event(
+                st,
+                failed,
+                "status",
+                &format!("Eskalation: der nächste Versuch nutzt {m}"),
+            )
+            .await;
+            (Some(m), l)
+        }
+        None => (failed.model.clone(), failed.escalation_level),
+    };
     let mut root = failed.clone();
     while root.kind == "fix" {
         match root.parent_id {
@@ -1883,7 +2699,7 @@ async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Resu
             prompt: prompt::fix_prompt(&root.title, &root.prompt, failure),
             context: root.context.clone(),
             provider: failed.provider.clone(),
-            model: failed.model.clone(),
+            model,
             status: status::QUEUED,
             attempt: failed.attempt + 1,
             depth: failed.depth,
@@ -1891,6 +2707,8 @@ async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Resu
             front: true,
             // A fix inherits the task-level limits of the failed task.
             limits: TaskLimits::of(failed),
+            connector_id: failed.connector_id,
+            escalation_level: level,
         },
     )
     .await?;

@@ -23,6 +23,7 @@ pub fn status_icon(s: TaskStatus) -> Ic {
         TaskStatus::PendingApproval => Ic::Shield,
         TaskStatus::Queued => Ic::CircleDashed,
         TaskStatus::Running => Ic::Loader,
+        TaskStatus::WaitingBatch => Ic::Clock,
         TaskStatus::WaitingInput => Ic::Message,
         TaskStatus::Done => Ic::CheckCircle,
         TaskStatus::Failed => Ic::XCircle,

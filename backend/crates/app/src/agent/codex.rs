@@ -11,7 +11,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use super::{
-    classify::ErrorCategory, error_event, n, s, trunc, AgentEvent, Credential, Invocation,
+    classify::ErrorCategory, error_event, n, s, trunc, AgentEvent, ConnCfg, Credential, Invocation,
     ParseState, RetryInfo, RunKind,
 };
 use crate::models::{Usage, RESULT_SCHEMA, REVIEW_SCHEMA};
@@ -42,7 +42,15 @@ pub(super) fn invocation(
         inv.args.extend(["--model".into(), m.into()]);
     }
     inv.args.push("-".into()); // prompt from stdin
-    match cred.kind.as_str() {
+    let kind = match &cred.conn {
+        Some(c) => match c.kind.as_str() {
+            "codex_subscription" => "auth_json",
+            "openai_api" => "api_key",
+            _ => return connector_provider(inv, c, &cred.secret),
+        },
+        None => cred.kind.as_str(),
+    };
+    match kind {
         "auth_json" => {
             inv.home_files
                 .push((".codex/auth.json".into(), cred.secret.clone()));
@@ -51,9 +59,59 @@ pub(super) fn invocation(
         "api_key" => {
             inv.env.push(("OPENAI_API_KEY".into(), cred.secret.clone()));
             inv.env.push(("CODEX_API_KEY".into(), cred.secret.clone()));
+            if let Some(c) = &cred.conn {
+                if let Some(b) = c.get("base_url") {
+                    inv.env.push(("OPENAI_BASE_URL".into(), b.into()));
+                }
+                if c.flex {
+                    inv.home_files.push((
+                        ".codex/config.toml".into(),
+                        "service_tier = \"flex\"\n".into(),
+                    ));
+                }
+            }
         }
         k => bail!("unsupported codex credential kind {k}"),
     }
+    Ok(())
+}
+
+fn toml_str(s: &str) -> String {
+    serde_json::to_string(s).expect("string serialises")
+}
+
+/// Custom Responses-API provider in the **user** `config.toml` (a project
+/// config may not define providers). Keys `model_provider`,
+/// `model_providers.*.{base_url,env_key,env_http_headers,wire_api}` exist in
+/// the 0.167.0 binary; behaviour against Azure/LiteLLM is not verified.
+fn connector_provider(inv: &mut Invocation, c: &ConnCfg, secret: &str) -> Result<()> {
+    const KEY: &str = "QUEUE_LLM_API_KEY";
+    let (name, base, auth) = match c.kind.as_str() {
+        "azure_openai" => (
+            "Azure OpenAI",
+            c.get("base_url").map(String::from),
+            format!("env_http_headers = {{ \"api-key\" = \"{KEY}\" }}"),
+        ),
+        "litellm" => (
+            "LiteLLM",
+            c.get("base_url")
+                .map(|b| format!("{}/v1", b.trim_end_matches('/'))),
+            format!("env_key = \"{KEY}\""),
+        ),
+        k => bail!("Zugang {k} kann nicht mit Codex betrieben werden"),
+    };
+    let Some(base) = base else {
+        bail!("Basis-URL fehlt");
+    };
+    let mut cfg = format!(
+        "model_provider = \"queue\"\n{}\n[model_providers.queue]\nname = {}\nbase_url = {}\nwire_api = \"responses\"\n{auth}\n",
+        if c.flex { "service_tier = \"flex\"\n" } else { "" },
+        toml_str(name),
+        toml_str(&base),
+    );
+    cfg = cfg.replace("\n\n[", "\n[");
+    inv.home_files.push((".codex/config.toml".into(), cfg));
+    inv.env.push((KEY.into(), secret.to_string()));
     Ok(())
 }
 
@@ -156,6 +214,7 @@ mod tests {
         let c = Credential {
             kind: "api_key".into(),
             secret: "k".into(),
+            conn: None,
         };
         let i = inv("codex", None, &c, &RunLimits::default(), RunKind::Agent).unwrap();
         assert_eq!(

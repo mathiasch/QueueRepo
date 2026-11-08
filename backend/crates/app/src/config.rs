@@ -34,6 +34,11 @@ pub struct Config {
     pub oidc: Vec<OidcProvider>,
     /// Scheduler idle poll interval.
     pub tick_secs: u64,
+    /// Poll interval of single-shot/batch jobs (env `BATCH_POLL_SECS`).
+    pub batch_poll_secs: u64,
+    /// App-side model calls may go to loopback/private networks
+    /// (`ALLOW_PRIVATE_LLM_ENDPOINTS`, default off – SSRF guard).
+    pub allow_private_llm_endpoints: bool,
     /// Allow `file://` / local path git remotes (tests, single-host setups).
     pub allow_local_remotes: bool,
 }
@@ -83,6 +88,8 @@ impl Config {
             vapid_subject: var("VAPID_SUBJECT").unwrap_or_else(|| "mailto:admin@localhost".into()),
             oidc: oidc::load_providers(&http).await,
             tick_secs: num("TICK_SECS", 15),
+            batch_poll_secs: num::<u64>("BATCH_POLL_SECS", 60).max(1),
+            allow_private_llm_endpoints: flag("ALLOW_PRIVATE_LLM_ENDPOINTS", false),
             allow_local_remotes: flag("ALLOW_LOCAL_GIT_REMOTES", false),
             data_dir,
         })
@@ -117,6 +124,9 @@ impl Config {
             vapid_subject: "mailto:test@localhost".into(),
             oidc: vec![],
             tick_secs: 1,
+            batch_poll_secs: 1,
+            // Fake provider servers listen on 127.0.0.1.
+            allow_private_llm_endpoints: true,
             allow_local_remotes: true,
         }
     }
@@ -125,8 +135,19 @@ impl Config {
         self.public_url.starts_with("https://")
     }
 
+    /// SSRF guard for app-side calls to user-configured endpoints.
+    pub fn llm_guard(&self) -> crate::llm::Guard {
+        let runner = url::Url::parse(&self.runner_url)
+            .ok()
+            .and_then(|u| Some(format!("{}:{}", u.host_str()?, u.port_or_known_default()?)));
+        crate::llm::Guard {
+            allow_private: self.allow_private_llm_endpoints,
+            deny: runner.into_iter().collect(),
+        }
+    }
+
     pub fn providers(&self) -> Vec<&'static str> {
-        let mut p = vec!["claude", "codex", "gemini"];
+        let mut p = vec!["claude", "codex", "gemini", "opencode"];
         if self.enable_mock_provider {
             p.push("mock");
         }

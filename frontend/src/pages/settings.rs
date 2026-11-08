@@ -23,7 +23,7 @@ use crate::ui::dialog::Confirm;
 use crate::ui::{Field, FieldIds, Ic, Icon, Meter};
 
 #[component]
-fn Card(
+pub(crate) fn Card(
     id: &'static str,
     icon: Ic,
     title: &'static str,
@@ -81,6 +81,11 @@ pub fn SettingsPage() -> impl IntoView {
             }}
             <Budgets/>
             <Credentials/>
+            <super::providers::ConnectorsCard/>
+            <super::providers::CostsCard/>
+            <super::providers::PricesCard/>
+            <super::providers::EvalCard/>
+            <super::providers::CliStatusCard/>
             <Appearance/>
             <Account/>
         </div>
@@ -173,7 +178,7 @@ fn GeneralSettings(s: Settings) -> impl IntoView {
                 {number(parallelism, "Parallele Agenten", "1 = einer nach dem anderen", help::PARALLEL, "1", "16")}
                 <Field ids=prov_ids.clone() label="Standard-Anbieter" help=help::PROVIDER>
                     <select id=prov_ids.id.clone() class="select" prop:value=move || provider.get() on:change=move |ev| provider.set(event_target_value(&ev))>
-                        {store.meta.with_untracked(|m| m.providers.iter().map(|p| view! { <option value=p.clone()>{provider_label(p)}</option> }).collect_view())}
+                        {store.meta.with_untracked(|m| m.providers.iter().filter(|p| m.credential_kinds.get(*p).is_some_and(|k| !k.is_empty())).map(|p| view! { <option value=p.clone()>{provider_label(p)}</option> }).collect_view())}
                     </select>
                 </Field>
                 {number(fixes, "Max. Reparaturversuche", "Danach: gestoppt und Benachrichtigung", help::FIX, "0", "10")}
@@ -501,7 +506,11 @@ fn Credentials() -> impl IntoView {
         store.meta.with(|m| {
             m.providers
                 .iter()
-                .filter(|p| p.as_str() != "mock")
+                // opencode works only through connectors (no own credential).
+                .filter(|p| {
+                    p.as_str() != "mock"
+                        && m.credential_kinds.get(*p).is_some_and(|k| !k.is_empty())
+                })
                 .cloned()
                 .collect::<Vec<_>>()
         })

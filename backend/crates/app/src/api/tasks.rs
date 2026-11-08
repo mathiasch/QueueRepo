@@ -34,7 +34,7 @@ async fn own_task(st: &AppState, id: Uuid, user_id: Uuid) -> ApiResult<Task> {
 pub async fn list(State(st): State<AppState>, AuthUser(u): AuthUser) -> ApiResult<Json<Vec<Task>>> {
     Ok(Json(
         sqlx::query_as::<_, Task>(
-            "(SELECT * FROM tasks WHERE user_id=$1 AND status IN ('queued','running','waiting_input','pending_approval'))
+            "(SELECT * FROM tasks WHERE user_id=$1 AND status IN ('queued','running','waiting_batch','waiting_input','pending_approval'))
              UNION ALL
              (SELECT * FROM tasks WHERE user_id=$1 AND status IN ('done','failed','blocked','cancelled') ORDER BY updated_at DESC LIMIT 150)
              ORDER BY position",
@@ -56,13 +56,21 @@ pub async fn create(
     }
     let lim = c.limits.check()?;
     let settings = queue::load_settings(&st, u.id).await?;
-    let provider = c
-        .provider
-        .filter(|p| !p.is_empty())
-        .unwrap_or(settings.default_provider);
-    if !st.cfg.providers().contains(&provider.as_str()) {
-        return Err(AppError::bad_request("unknown provider"));
-    }
+    let project: crate::models::Project = sqlx::query_as("SELECT * FROM projects WHERE id=$1")
+        .bind(c.project_id)
+        .fetch_one(&st.db)
+        .await?;
+    let exec = crate::routing::resolve_execute(
+        &st,
+        u.id,
+        &project,
+        c.connector_id,
+        c.provider.as_deref(),
+        c.model.clone(),
+        &settings.default_provider,
+    )
+    .await?
+    .map_err(AppError::bad_request)?;
     if let Some(pid) = c.parent_id {
         let ok: bool =
             sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tasks WHERE id=$1 AND project_id=$2)")
@@ -94,8 +102,8 @@ pub async fn create(
             title: title.trim().to_string(),
             prompt: c.prompt.trim().to_string(),
             context: c.context.trim().to_string(),
-            provider,
-            model: c.model.filter(|m| !m.trim().is_empty()),
+            provider: exec.provider,
+            model: exec.model,
             status: status::QUEUED,
             attempt: 0,
             depth: 0,
@@ -107,6 +115,8 @@ pub async fn create(
                 max_tokens: lim.max_tokens.flatten(),
                 max_turns: lim.max_turns.flatten(),
             },
+            connector_id: exec.connector_id,
+            escalation_level: 0,
         },
     )
     .await?;
@@ -149,12 +159,41 @@ pub async fn update(
     {
         return Err(AppError::conflict("only waiting tasks can be edited"));
     }
-    if let Some(p) = &c.provider {
-        if !st.cfg.providers().contains(&p.as_str()) {
-            return Err(AppError::bad_request("unknown provider"));
-        }
-    }
     let lim = c.limits.check()?;
+    // Provider/connector/model change: resolved and checked like a new task.
+    let access_change = c.provider.is_some() || c.connector_id.is_some();
+    let exec = if access_change {
+        let project: crate::models::Project = sqlx::query_as("SELECT * FROM projects WHERE id=$1")
+            .bind(t.project_id)
+            .fetch_one(&st.db)
+            .await?;
+        // `connector_id: null` or only a provider: back to a legacy credential.
+        let connector = c.connector_id.flatten();
+        let model = match &c.model {
+            Some(m) => Some(m.clone()),
+            None => t.model.clone(),
+        };
+        let provider = if connector.is_some() {
+            None
+        } else {
+            c.provider.clone().or(Some(t.provider.clone()))
+        };
+        Some(
+            crate::routing::resolve_execute(
+                &st,
+                u.id,
+                &project,
+                connector,
+                provider.as_deref(),
+                model,
+                &t.provider,
+            )
+            .await?
+            .map_err(AppError::bad_request)?,
+        )
+    } else {
+        None
+    };
     sqlx::query(
         "UPDATE tasks SET title=COALESCE($2,title), prompt=COALESCE($3,prompt), context=COALESCE($4,context),
                 provider=COALESCE($5,provider), model=CASE WHEN $6::text IS NULL THEN model ELSE NULLIF($6,'') END,
@@ -162,6 +201,7 @@ pub async fn update(
                 max_cost_usd = CASE WHEN $9 THEN $10 ELSE max_cost_usd END,
                 max_tokens = CASE WHEN $11 THEN $12 ELSE max_tokens END,
                 max_turns = CASE WHEN $13 THEN $14 ELSE max_turns END,
+                connector_id = CASE WHEN $15 THEN $16 ELSE connector_id END,
                 updated_at=now()
          WHERE id=$1",
     )
@@ -169,8 +209,11 @@ pub async fn update(
     .bind(c.title.filter(|s| !s.trim().is_empty()))
     .bind(c.prompt.filter(|s| !s.trim().is_empty()))
     .bind(c.context)
-    .bind(c.provider)
-    .bind(c.model)
+    .bind(exec.as_ref().map(|e| e.provider.clone()))
+    .bind(match &exec {
+        Some(e) => Some(e.model.clone().unwrap_or_default()),
+        None => c.model,
+    })
     .bind(lim.max_runtime_secs.is_some())
     .bind(lim.max_runtime_secs.flatten())
     .bind(lim.max_cost_usd.is_some())
@@ -179,6 +222,8 @@ pub async fn update(
     .bind(lim.max_tokens.flatten())
     .bind(lim.max_turns.is_some())
     .bind(lim.max_turns.flatten())
+    .bind(exec.is_some())
+    .bind(exec.as_ref().and_then(|e| e.connector_id))
     .execute(&st.db)
     .await?;
     queue::emit_task(&st, id).await;
@@ -214,6 +259,18 @@ pub async fn cancel(
         if let Some(tok) = st.running.lock().await.get(&id) {
             tok.cancel();
         }
+        return Ok(Json(json!({"ok": true})));
+    }
+    if t.status == status::WAITING_BATCH {
+        crate::batch::cancel_for_task(&st, id).await?;
+        sqlx::query(
+            "UPDATE tasks SET status='cancelled', failure_class='cancelled', error='abgebrochen', finished_at=now(), updated_at=now()
+             WHERE id=$1 AND status='waiting_batch'",
+        )
+        .bind(id)
+        .execute(&st.db)
+        .await?;
+        queue::emit_task(&st, id).await;
         return Ok(Json(json!({"ok": true})));
     }
     set_status(

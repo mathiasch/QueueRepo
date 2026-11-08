@@ -151,6 +151,7 @@ pub fn router(st: RunnerState) -> Router {
         .route("/workspaces/{id}/queue/{name}", get(queue_file))
         .route("/exec", post(exec_start))
         .route("/exec/{name}/cancel", post(exec_cancel))
+        .route("/cli-status", get(cli_status))
         .layer(middleware::from_fn_with_state(st.clone(), auth));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -389,6 +390,11 @@ async fn exec_start(State(st): State<RunnerState>, Json(req): Json<ExecRequest>)
         Body::from_stream(stream),
     )
         .into_response())
+}
+
+/// Which agent CLIs exist in the sandbox, and in which version.
+async fn cli_status(State(st): State<RunnerState>) -> R<Json<Vec<CliProbe>>> {
+    Ok(Json(exec::probe(&st.cfg).await?))
 }
 
 async fn exec_cancel(

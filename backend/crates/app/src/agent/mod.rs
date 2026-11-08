@@ -4,6 +4,11 @@
 //!   claude  – Claude Code  (`claude setup-token` → CLAUDE_CODE_OAUTH_TOKEN, or ANTHROPIC_API_KEY)
 //!   codex   – Codex CLI    (~/.codex/auth.json from `codex login`, or OPENAI_API_KEY)
 //!   gemini  – Gemini CLI   (~/.gemini/oauth_creds.json from Google login, or GEMINI_API_KEY)
+//!   opencode – opencode    (only through connectors: Mistral, Gemini API, Infomaniak,
+//!              OpenAI-compatible endpoints, OpenRouter, LiteLLM)
+//!
+//! Connectors (WP13) add Bedrock/Vertex/gateway modes to Claude Code and
+//! Azure/Flex/gateway modes to Codex, see [`ConnCfg`].
 //!
 //! The parsers rely on the structured signals of the CLI versions pinned in
 //! `docker/agent.Dockerfile` ([`CLI_VERSIONS`]); contract tests in
@@ -13,6 +18,7 @@ mod claude;
 mod codex;
 mod gemini;
 mod mock;
+pub mod opencode;
 
 use anyhow::{bail, Result};
 use serde_json::Value;
@@ -22,15 +28,111 @@ pub use classify::{classify_text, parse_reset, ErrorCategory};
 use crate::models::Usage;
 
 /// CLI versions installed in the agent image (must match `docker/agent.Dockerfile`).
-pub const CLI_VERSIONS: [(&str, &str); 3] = [
+pub const CLI_VERSIONS: [(&str, &str); 4] = [
     ("claude", "2.1.319"),
     ("codex", "0.167.0"),
     ("gemini", "0.67.0"),
+    ("opencode", "1.19.5"),
 ];
+
+/// Maintenance state of the pinned CLIs (research of 2026-11-08, see
+/// docs/roadmap/WP13-plan.md §0). The live check is `GET /api/cli-status`.
+pub fn cli_notes() -> std::collections::BTreeMap<String, queued_api::CliNote> {
+    let note = |state: &str, note: &str| queued_api::CliNote {
+        state: state.into(),
+        note: note.into(),
+        checked: "2026-11-08".into(),
+    };
+    [
+        ("claude", note("active", "Gepinnt auf 2.1.319.")),
+        ("codex", note("active", "Gepinnt auf 0.167.0 (= aktuelle npm-Version am 8.11.2026).")),
+        ("gemini", note(
+            "frozen",
+            "Eingefroren auf 0.67.0: keine Weiterentwicklung im Queue. Das npm-Paket wird weiter veröffentlicht (0.67.0 am 4.11.2026, 0.68.0-preview, nicht als veraltet markiert). Sekundärquellen melden eine Ablösung durch das Closed-Source-CLI Antigravity und ein Ende des Abo-/OAuth-Pfads am 18.6.2026 – nicht bestätigt. Für Gemini per API-Schlüssel den Zugang „Gemini API (über opencode)“ nutzen.",
+        )),
+        ("opencode", note("active", "Gepinnt auf 1.19.5 (MIT), Mehranbieter-Agent für Mistral, Gemini-API, Infomaniak, eigene Server, OpenRouter und LiteLLM.")),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
+/// Interprets the runner's CLI probe against the pins (Gemini: frozen;
+/// Antigravity `agy` present = the reported successor is installed, unsupported).
+pub fn interpret_cli_status(found: &[queued_common::CliProbe]) -> Vec<queued_api::CliStatus> {
+    found
+        .iter()
+        .map(|p| {
+            let pinned = CLI_VERSIONS
+                .iter()
+                .find(|(c, _)| *c == p.cli)
+                .map(|(_, v)| v.to_string());
+            let (state, note) = match (&p.version, &pinned) {
+                (None, Some(_)) => ("missing", format!("{} ist im Agenten-Image nicht installiert oder startet nicht.", p.cli)),
+                (Some(v), Some(pin)) if !v.contains(pin.as_str()) => (
+                    "version_mismatch",
+                    format!("Gefunden: {v}, erwartet {pin} – die Auswertung ist auf {pin} abgestimmt."),
+                ),
+                (Some(_), Some(_)) if p.cli == "gemini" => (
+                    "frozen",
+                    "Läuft, ist aber eingefroren: keine Weiterentwicklung im Queue (siehe Hinweis).".to_string(),
+                ),
+                (Some(_), Some(_)) => ("ok", "Installiert in der gepinnten Version.".to_string()),
+                (Some(v), None) if p.cli == "agy" => (
+                    "replaced",
+                    format!("Antigravity ({v}) ist installiert – der Queue unterstützt es nicht (Closed Source, Format unbekannt)."),
+                ),
+                (None, None) => ("missing", "Nicht installiert.".to_string()),
+                (Some(v), None) => ("unexpected", format!("Gefunden: {v}")),
+            };
+            queued_api::CliStatus {
+                cli: p.cli.clone(),
+                pinned,
+                installed: p.version.clone(),
+                state: state.into(),
+                note,
+            }
+        })
+        .collect()
+}
 
 pub struct Credential {
     pub kind: String,
     pub secret: String,
+    /// Set when the credential comes from a connector (WP13).
+    pub conn: Option<ConnCfg>,
+}
+
+impl Credential {
+    pub fn legacy(kind: impl Into<String>, secret: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            secret: secret.into(),
+            conn: None,
+        }
+    }
+}
+
+/// Non-secret connector settings handed to the adapters.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConnCfg {
+    /// Connector id (refreshed OAuth files are written back to it).
+    pub id: Option<uuid::Uuid>,
+    pub kind: String,
+    pub label: String,
+    pub config: Value,
+    /// OpenAI Flex service tier for this run.
+    pub flex: bool,
+}
+
+impl ConnCfg {
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.config
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 pub struct Invocation {
@@ -88,6 +190,13 @@ pub fn capabilities(provider: &str) -> Capabilities {
             max_cost: true,
             live_usage: true,
         },
+        // Usage per step (`step_finish`) → live token/cost guard of the queue.
+        "opencode" => Capabilities {
+            structured_output: false,
+            max_turns: false,
+            max_cost: false,
+            live_usage: true,
+        },
         _ => Capabilities {
             structured_output: false,
             max_turns: false,
@@ -95,6 +204,19 @@ pub fn capabilities(provider: &str) -> Capabilities {
             live_usage: false,
         },
     }
+}
+
+/// Capabilities of a run: Claude Code's own cost limit (`--max-budget-usd`)
+/// estimates with Anthropic prices, which is wrong behind a gateway with other
+/// models – there the queue's live cost guard (catalog prices) applies alone.
+pub fn capabilities_for(provider: &str, conn: Option<&ConnCfg>) -> Capabilities {
+    let mut c = capabilities(provider);
+    if provider == "claude"
+        && conn.is_some_and(|c| matches!(c.kind.as_str(), "anthropic_gateway" | "litellm"))
+    {
+        c.max_cost = false;
+    }
+    c
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +287,8 @@ pub fn credential_kinds(provider: &str) -> &'static [&'static str] {
         "codex" => &["auth_json", "api_key"],
         "gemini" => &["oauth_creds", "api_key"],
         "mock" => &["none"],
+        // Only through connectors.
+        "opencode" => &[],
         _ => &[],
     }
 }
@@ -188,6 +312,7 @@ pub fn invocation(
         "claude" => claude::invocation(&mut inv, model, cred, limits, kind)?,
         "codex" => codex::invocation(&mut inv, model, cred, kind)?,
         "gemini" => gemini::invocation(&mut inv, model, cred, limits)?,
+        "opencode" => opencode::invocation(&mut inv, model, cred)?,
         "mock" => mock::invocation(&mut inv, limits),
         p => bail!("unknown provider {p}"),
     }
@@ -282,6 +407,7 @@ pub fn parse_line(provider: &str, line: &str, st: &mut ParseState) -> Vec<AgentE
         "claude" => claude::parse(&v, st),
         "codex" => codex::parse(&v, st),
         "gemini" => gemini::parse(&v, st),
+        "opencode" => opencode::parse(&v, st),
         "mock" => mock::parse(&v),
         _ => vec![],
     }
@@ -305,6 +431,7 @@ mod tests {
         let c = Credential {
             kind: "oauth_token".into(),
             secret: "tok".into(),
+            conn: None,
         };
         let i = invocation("claude", Some("opus"), &c, &none, RunKind::Agent).unwrap();
         assert!(i
@@ -315,10 +442,7 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "--model" && w[1] == "opus"));
         assert!(!i.args.iter().any(|a| a.contains("tok")));
-        let c = Credential {
-            kind: "auth_json".into(),
-            secret: "{}".into(),
-        };
+        let c = Credential::legacy("auth_json", "{}");
         let i = invocation("codex", None, &c, &none, RunKind::Agent).unwrap();
         assert_eq!(i.home_files[0].0, ".codex/auth.json");
         assert_eq!(i.writeback.as_deref(), Some(".codex/auth.json"));
@@ -327,7 +451,8 @@ mod tests {
             None,
             &Credential {
                 kind: "bogus".into(),
-                secret: "".into()
+                secret: "".into(),
+                conn: None,
             },
             &none,
             RunKind::Agent
@@ -352,6 +477,7 @@ mod tests {
                     let c = Credential {
                         kind: k.to_string(),
                         secret: "SECRET-VALUE-123".into(),
+                        conn: None,
                     };
                     let i = invocation(p, Some("m"), &c, &lim, kind).unwrap();
                     assert!(
@@ -444,10 +570,14 @@ mod tests {
             !df.contains("latest"),
             "agent image must not install latest"
         );
-        for (arg, (provider, version)) in
-            ["CLAUDE_CODE_VERSION", "CODEX_VERSION", "GEMINI_CLI_VERSION"]
-                .iter()
-                .zip(CLI_VERSIONS)
+        for (arg, (provider, version)) in [
+            "CLAUDE_CODE_VERSION",
+            "CODEX_VERSION",
+            "GEMINI_CLI_VERSION",
+            "OPENCODE_VERSION",
+        ]
+        .iter()
+        .zip(CLI_VERSIONS)
         {
             assert!(
                 df.contains(&format!("ARG {arg}={version}\n")),
@@ -458,5 +588,303 @@ mod tests {
             df.contains("--version"),
             "the image build must verify the installed versions"
         );
+    }
+
+    fn conn(kind: &str, config: serde_json::Value, secret: &str, flex: bool) -> Credential {
+        Credential {
+            kind: format!("connector:{kind}"),
+            secret: secret.into(),
+            conn: Some(ConnCfg {
+                id: None,
+                kind: kind.into(),
+                label: "Zugang".into(),
+                config,
+                flex,
+            }),
+        }
+    }
+
+    fn env<'a>(i: &'a Invocation, k: &str) -> Option<&'a str> {
+        i.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
+    }
+
+    /// Every connector type: the secret never appears in argv or the program,
+    /// and only travels through env/home files.
+    #[test]
+    fn no_secret_in_argv_for_any_connector() {
+        use serde_json::json;
+        let secret = "SECRET-CONN-987";
+        let lim = RunLimits {
+            turns: Some(5),
+            cost_usd: Some(2.0),
+        };
+        for t in crate::connectors::types(true) {
+            let mut cfg = serde_json::Map::new();
+            for f in &t.fields {
+                let v = match (f.key.as_str(), f.input.as_str()) {
+                    (_, "select") => f.default.clone().unwrap(),
+                    ("base_url", _) => "https://gw.example.ch".into(),
+                    ("project_id", _) => "proj".into(),
+                    ("region", _) => "eu-central-1".into(),
+                    _ => continue,
+                };
+                cfg.insert(f.key.clone(), json!(v));
+            }
+            let cfg = serde_json::Value::Object(cfg);
+            let harness = crate::connectors::harness(&t.kind, &cfg);
+            let s = if t.secret_json {
+                format!("{{\"k\":\"{secret}\"}}")
+            } else {
+                secret.to_string()
+            };
+            for kind in [RunKind::Agent, RunKind::Review] {
+                let c = conn(&t.kind, cfg.clone(), &s, t.flex);
+                let i = invocation(&harness, Some("claude-sonnet-5-5"), &c, &lim, kind)
+                    .unwrap_or_else(|e| panic!("{}: {e}", t.kind));
+                assert!(
+                    !i.args.iter().any(|a| a.contains(secret)),
+                    "{}: {:?}",
+                    t.kind,
+                    i.args
+                );
+                assert!(!i.program.contains(secret));
+                if t.kind != "mock" && t.secret_label.is_some() {
+                    let carried = i.env.iter().any(|(_, v)| v.contains(secret))
+                        || i.home_files.iter().any(|(_, v)| v.contains(secret));
+                    assert!(carried, "{}: secret not handed over", t.kind);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn claude_connector_modes() {
+        use serde_json::json;
+        let none = RunLimits::default();
+        // Bedrock EU: geo profile, region, bearer token, background model in the same geo.
+        let b = conn(
+            "bedrock",
+            json!({"geo":"eu","region":"eu-central-1"}),
+            "tok",
+            false,
+        );
+        let i = invocation(
+            "claude",
+            Some("claude-sonnet-5-5"),
+            &b,
+            &none,
+            RunKind::Agent,
+        )
+        .unwrap();
+        assert_eq!(env(&i, "CLAUDE_CODE_USE_BEDROCK"), Some("1"));
+        assert_eq!(env(&i, "AWS_REGION"), Some("eu-central-1"));
+        assert_eq!(env(&i, "AWS_BEARER_TOKEN_BEDROCK"), Some("tok"));
+        assert_eq!(
+            env(&i, "ANTHROPIC_SMALL_FAST_MODEL"),
+            Some("eu.anthropic.claude-sonnet-5-5")
+        );
+        assert!(i
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--model" && w[1] == "eu.anthropic.claude-sonnet-5-5"));
+        assert!(env(&i, "ANTHROPIC_API_KEY").is_none());
+        // Access keys as JSON.
+        let k = conn(
+            "bedrock",
+            json!({"geo":"eu","region":"eu-west-1"}),
+            r#"{"access_key_id":"AK","secret_access_key":"SK","session_token":"ST"}"#,
+            false,
+        );
+        let i = invocation(
+            "claude",
+            Some("eu.anthropic.claude-opus-5-5"),
+            &k,
+            &none,
+            RunKind::Agent,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                env(&i, "AWS_ACCESS_KEY_ID"),
+                env(&i, "AWS_SECRET_ACCESS_KEY"),
+                env(&i, "AWS_SESSION_TOKEN")
+            ),
+            (Some("AK"), Some("SK"), Some("ST"))
+        );
+        // A US profile on an EU connector, or no model, is refused.
+        assert!(invocation(
+            "claude",
+            Some("us.anthropic.claude-opus-5-5"),
+            &b,
+            &none,
+            RunKind::Agent
+        )
+        .is_err());
+        assert!(invocation("claude", None, &b, &none, RunKind::Agent).is_err());
+        let bad = conn(
+            "bedrock",
+            json!({"geo":"eu"}),
+            r#"{"access_key_id":"AK"}"#,
+            false,
+        );
+        assert!(invocation(
+            "claude",
+            Some("claude-sonnet-5-5"),
+            &bad,
+            &none,
+            RunKind::Agent
+        )
+        .is_err());
+        // Vertex: ADC file in HOME, region and project.
+        let v = conn(
+            "vertex",
+            json!({"project_id":"p1","region":"eu"}),
+            r#"{"type":"service_account"}"#,
+            false,
+        );
+        let i = invocation(
+            "claude",
+            Some("claude-sonnet-5-5"),
+            &v,
+            &none,
+            RunKind::Agent,
+        )
+        .unwrap();
+        assert_eq!(env(&i, "CLAUDE_CODE_USE_VERTEX"), Some("1"));
+        assert_eq!(env(&i, "CLOUD_ML_REGION"), Some("eu"));
+        assert_eq!(env(&i, "ANTHROPIC_VERTEX_PROJECT_ID"), Some("p1"));
+        assert_eq!(
+            i.home_files[0].0,
+            ".config/gcloud/application_default_credentials.json"
+        );
+        // Gateway: base URL + auth token, no cost flag (Claude would price other models wrongly).
+        let g = conn(
+            "anthropic_gateway",
+            json!({"base_url":"https://gw.example.ch","location":"ch"}),
+            "gw",
+            false,
+        );
+        let lim = RunLimits {
+            turns: None,
+            cost_usd: Some(1.0),
+        };
+        let caps = capabilities_for("claude", g.conn.as_ref());
+        assert!(!caps.max_cost && caps.live_usage);
+        let i = invocation(
+            "claude",
+            Some("mistral-large-4"),
+            &g,
+            &RunLimits {
+                cost_usd: lim.cost_usd.filter(|_| caps.max_cost),
+                ..lim
+            },
+            RunKind::Agent,
+        )
+        .unwrap();
+        assert_eq!(env(&i, "ANTHROPIC_BASE_URL"), Some("https://gw.example.ch"));
+        assert_eq!(env(&i, "ANTHROPIC_AUTH_TOKEN"), Some("gw"));
+        assert!(!i.args.contains(&"--max-budget-usd".to_string()));
+        // Anthropic API with a proxy base URL.
+        let a = conn(
+            "anthropic_api",
+            json!({"base_url":"https://proxy.example.ch"}),
+            "sk",
+            false,
+        );
+        let i = invocation("claude", None, &a, &none, RunKind::Agent).unwrap();
+        assert_eq!(
+            (env(&i, "ANTHROPIC_API_KEY"), env(&i, "ANTHROPIC_BASE_URL")),
+            (Some("sk"), Some("https://proxy.example.ch"))
+        );
+        // Wrong harness for a connector.
+        let m = conn("mistral", json!({"endpoint":"eu"}), "k", false);
+        assert!(invocation("claude", Some("x"), &m, &none, RunKind::Agent).is_err());
+        assert!(invocation("codex", Some("x"), &m, &none, RunKind::Agent).is_err());
+        assert!(invocation("gemini", Some("x"), &m, &none, RunKind::Agent).is_err());
+    }
+
+    #[test]
+    fn codex_connector_modes() {
+        use serde_json::json;
+        let none = RunLimits::default();
+        let o = conn("openai_api", json!({}), "sk", true);
+        let i = invocation("codex", Some("gpt-6.1-terra"), &o, &none, RunKind::Agent).unwrap();
+        assert_eq!(env(&i, "OPENAI_API_KEY"), Some("sk"));
+        assert_eq!(
+            i.home_files,
+            vec![(
+                ".codex/config.toml".to_string(),
+                "service_tier = \"flex\"\n".to_string()
+            )]
+        );
+        let o = conn("openai_api", json!({}), "sk", false);
+        assert!(invocation("codex", None, &o, &none, RunKind::Agent)
+            .unwrap()
+            .home_files
+            .is_empty());
+        let a = conn(
+            "azure_openai",
+            json!({"base_url":"https://r.openai.azure.com/openai/v1","deployment":"switzerland_north"}),
+            "az",
+            false,
+        );
+        let i = invocation("codex", Some("gpt-6.1-sol"), &a, &none, RunKind::Agent).unwrap();
+        let toml = &i
+            .home_files
+            .iter()
+            .find(|(p, _)| p == ".codex/config.toml")
+            .unwrap()
+            .1;
+        assert!(
+            toml.starts_with("model_provider = \"queue\"\n[model_providers.queue]\n"),
+            "{toml}"
+        );
+        assert!(toml.contains("base_url = \"https://r.openai.azure.com/openai/v1\""));
+        assert!(toml.contains("wire_api = \"responses\""));
+        assert!(toml.contains("env_http_headers = { \"api-key\" = \"QUEUE_LLM_API_KEY\" }"));
+        assert!(!toml.contains("az\""), "no secret in the config file");
+        assert_eq!(env(&i, "QUEUE_LLM_API_KEY"), Some("az"));
+        let l = conn(
+            "litellm",
+            json!({"base_url":"https://llm.example.ch/","harness":"codex"}),
+            "vk",
+            true,
+        );
+        let i = invocation("codex", Some("gpt-6.1-terra"), &l, &none, RunKind::Agent).unwrap();
+        let toml = &i.home_files[0].1;
+        assert!(
+            toml.contains("base_url = \"https://llm.example.ch/v1\"")
+                && toml.contains("env_key = \"QUEUE_LLM_API_KEY\"")
+        );
+        assert!(toml.contains("service_tier = \"flex\""));
+        let sub = conn("codex_subscription", json!({}), "{}", false);
+        let i = invocation("codex", None, &sub, &none, RunKind::Agent).unwrap();
+        assert_eq!(i.writeback.as_deref(), Some(".codex/auth.json"));
+        let gs = conn("gemini_subscription", json!({}), "{}", false);
+        let i = invocation("gemini", None, &gs, &none, RunKind::Agent).unwrap();
+        assert_eq!(i.writeback.as_deref(), Some(".gemini/oauth_creds.json"));
+    }
+
+    #[test]
+    fn cli_status_interpretation() {
+        use queued_common::CliProbe;
+        let p = |cli: &str, v: Option<&str>| CliProbe {
+            cli: cli.into(),
+            version: v.map(String::from),
+        };
+        let st = interpret_cli_status(&[
+            p("claude", Some("2.1.319 (Claude Code)")),
+            p("codex", Some("codex-cli 0.150.0")),
+            p("gemini", Some("0.67.0")),
+            p("opencode", None),
+            p("agy", Some("1.0.0")),
+        ]);
+        let state: Vec<&str> = st.iter().map(|s| s.state.as_str()).collect();
+        assert_eq!(
+            state,
+            ["ok", "version_mismatch", "frozen", "missing", "replaced"]
+        );
+        assert_eq!(st[0].pinned.as_deref(), Some("2.1.319"));
+        assert!(st[4].pinned.is_none());
     }
 }

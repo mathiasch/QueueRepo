@@ -3,11 +3,15 @@ use std::cell::Cell;
 
 use leptos::task::spawn_local;
 use leptos::{html, prelude::*};
-use queued_api::{CreateTask, Task, TaskStatus};
+use queued_api::{CreateTask, Estimate, EstimateRequest, Task, TaskStatus};
 use uuid::Uuid;
 use wasm_bindgen::JsCast;
 
 use crate::api;
+use crate::logic::costs::{
+    connector_label, estimate_summary, fmt_money, mode_label, model_suggestions, parse_access,
+    step_label,
+};
 use crate::logic::labels::{help, provider_label};
 use crate::logic::limits::{LimitField, LimitForm};
 use crate::logic::task::first_line;
@@ -93,8 +97,14 @@ pub fn Composer() -> impl IntoView {
     let store = use_store();
     let prompt = RwSignal::new(get_pref("draft").unwrap_or_default());
     let context = RwSignal::new(String::new());
-    let provider = RwSignal::new(String::new());
+    // "" = standard (project routing / default), "p:<provider>", "c:<connector>".
+    let access = RwSignal::new(String::new());
     let model = RwSignal::new(String::new());
+    // The estimate follows the model only when the input is committed (change), not per keystroke.
+    let model_committed = RwSignal::new(String::new());
+    let estimate = RwSignal::new(None::<Result<Estimate, String>>);
+    let est_seq = StoredValue::new(0u64);
+    let show_steps = RwSignal::new(false);
     let parent = RwSignal::new(String::new());
     let front = RwSignal::new(false);
     let advanced = RwSignal::new(false);
@@ -153,6 +163,33 @@ pub fn Composer() -> impl IntoView {
         }
     });
 
+    // Cost estimate before submitting (project routing + chosen access/model).
+    Effect::new(move |_| {
+        let Some(pid) = project_id.get() else {
+            estimate.set(None);
+            return;
+        };
+        let (connector_id, provider) = parse_access(&access.get());
+        let model = Some(model_committed.get().trim().to_string()).filter(|m| !m.is_empty());
+        let seq = est_seq.get_value() + 1;
+        est_seq.set_value(seq);
+        let body = EstimateRequest {
+            project_id: pid,
+            connector_id,
+            provider,
+            model,
+        };
+        spawn_local(async move {
+            let r = api::post::<_, Estimate>("/estimate", &body)
+                .await
+                .map_err(|e| e.message);
+            // Only the newest request counts.
+            if est_seq.get_value() == seq {
+                estimate.set(Some(r));
+            }
+        });
+    });
+
     let submit = move || {
         let text = prompt.get_untracked();
         let Some(pid) = project_id.get_untracked() else {
@@ -176,9 +213,10 @@ pub fn Composer() -> impl IntoView {
             title: None,
             prompt: text,
             context: context.get_untracked(),
-            provider: Some(provider.get_untracked()).filter(|p| !p.is_empty()),
+            provider: parse_access(&access.get_untracked()).1,
             model: Some(model.get_untracked().trim().to_string()).filter(|m| !m.is_empty()),
             parent_id: Uuid::parse_str(&parent.get_untracked()).ok(),
+            connector_id: parse_access(&access.get_untracked()).0,
             front: front.get_untracked(),
             limits: lim.create_fields(),
         };
@@ -211,6 +249,25 @@ pub fn Composer() -> impl IntoView {
     let parent_ids = FieldIds::new("parent");
     let prov_ids = FieldIds::new("provider");
     let model_ids = FieldIds::new("model");
+    let models_list = uid("models");
+    let suggestions = Memo::new(move |_| {
+        let (cid, prov) = parse_access(&access.get());
+        let types = store.meta.with(|m| m.connector_types.clone());
+        store.connectors.with(|cs| {
+            let c = cid.and_then(|id| cs.iter().find(|c| c.id == id));
+            model_suggestions(&types, c, prov.as_deref())
+        })
+    });
+    // Legacy providers with their own credentials (opencode only via connectors).
+    let legacy = Memo::new(move |_| {
+        store.meta.with(|m| {
+            m.providers
+                .iter()
+                .filter(|p| m.credential_kinds.get(*p).is_some_and(|k| !k.is_empty()))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    });
     let default_provider = move || {
         store.settings.with(|s| {
             s.as_ref()
@@ -249,6 +306,7 @@ pub fn Composer() -> impl IntoView {
             {move || advanced.get().then(|| {
                 let (ctx_ids, parent_ids, prov_ids, model_ids) = (ctx_ids.clone(), parent_ids.clone(), prov_ids.clone(), model_ids.clone());
                 let (ctx_id, parent_id, prov_id, model_id) = (ctx_ids.id.clone(), parent_ids.id.clone(), prov_ids.id.clone(), model_ids.id.clone());
+                let (list_ref, list_id) = (models_list.clone(), models_list.clone());
                 view! {
                     <div class="advanced" id=adv_id.clone()>
                         <Field ids=ctx_ids label="Zusätzlicher Kontext" help=help::CONTEXT hint="Optional – wird dem Agenten mitgegeben.">
@@ -261,14 +319,32 @@ pub fn Composer() -> impl IntoView {
                                     {move || parents.get().into_iter().map(|(id, t)| view! { <option value=id.to_string()>{t}</option> }).collect_view()}
                                 </select>
                             </Field>
-                            <Field ids=prov_ids label="Anbieter" help=help::PROVIDER>
-                                <select id=prov_id class="select" prop:value=move || provider.get() on:change=move |ev| provider.set(event_target_value(&ev))>
+                            <Field ids=prov_ids label="Zugang" help=help::PROVIDER>
+                                <select id=prov_id class="select" prop:value=move || access.get() on:change=move |ev| access.set(event_target_value(&ev))>
                                     <option value="">{move || format!("Standard ({})", default_provider())}</option>
-                                    {move || store.meta.with(|m| m.providers.iter().map(|p| view! { <option value=p.clone()>{provider_label(p)}</option> }).collect_view())}
+                                    <optgroup label="Standard-Zugänge">
+                                        {move || legacy.get().into_iter().map(|p| view! { <option value=format!("p:{p}")>{provider_label(&p)}</option> }).collect_view()}
+                                    </optgroup>
+                                    {move || (!store.connectors.with(Vec::is_empty)).then(|| view! {
+                                        <optgroup label="Weitere Zugänge">
+                                            {move || store.connectors.get().into_iter().map(|c| view! { <option value=format!("c:{}", c.id)>{connector_label(&c)}</option> }).collect_view()}
+                                        </optgroup>
+                                    })}
                                 </select>
                             </Field>
                             <Field ids=model_ids label="Modell" help=help::MODEL>
-                                <input id=model_id class="input" placeholder="Standard" bind:value=model/>
+                                <input
+                                    id=model_id
+                                    class="input"
+                                    placeholder="Standard"
+                                    list=list_ref
+                                    autocomplete="off"
+                                    bind:value=model
+                                    on:change=move |ev| model_committed.set(event_target_value(&ev))
+                                />
+                                <datalist id=list_id>
+                                    {move || suggestions.get().into_iter().map(|m| view! { <option value=m></option> }).collect_view()}
+                                </datalist>
                             </Field>
                         </div>
                         <h4 class="row">"Limits dieses Auftrags" <HelpTip topic="Limits" text=help::LIMITS/></h4>
@@ -318,7 +394,63 @@ pub fn Composer() -> impl IntoView {
                     "Einreihen"
                 </button>
             </div>
+            <EstimateLine estimate=estimate show_steps=show_steps/>
         </section>
+    }
+}
+
+/// Cost estimate before submitting, with the steps on request.
+#[component]
+fn EstimateLine(
+    estimate: RwSignal<Option<Result<Estimate, String>>>,
+    show_steps: RwSignal<bool>,
+) -> impl IntoView {
+    let steps_id = uid("estimate-steps");
+    view! {
+        <div class="estimate" data-testid="estimate" aria-live="polite">
+            {move || match estimate.get() {
+                None => view! { <span class="small muted">"Kosten werden geschätzt …"</span> }.into_any(),
+                Some(Err(e)) => view! { <span class="small tone-warning-text" role="note">{format!("Keine Schätzung: {e}")}</span> }.into_any(),
+                Some(Ok(e)) => {
+                    let summary = estimate_summary(&e);
+                    let loc = e.location.clone();
+                    let steps = e.steps.clone();
+                    let notes = e.notes.clone();
+                    let sid2 = steps_id.clone();
+                    view! {
+                        <div class="row wrap small">
+                            <Icon icon=Ic::Gauge class="sm"/>
+                            <span><strong>"Geschätzte Kosten: "</strong>{summary}</span>
+                            {(!loc.is_empty()).then(|| view! { <span class="tag">{format!("Daten: {loc}")}</span> })}
+                            <button type="button" class="btn ghost sm" aria-expanded=move || show_steps.get().to_string() on:click=move |_| show_steps.update(|v| *v = !*v)>
+                                {move || if show_steps.get() { "Details ausblenden" } else { "Details" }}
+                            </button>
+                        </div>
+                        {move || show_steps.get().then(|| view! {
+                            <div id=sid2.clone() class="estimate-steps">
+                                <table class="table compact" tabindex="0">
+                                    <caption class="visually-hidden">"Geschätzte Kosten je Schritt"</caption>
+                                    <thead><tr><th scope="col">"Schritt"</th><th scope="col">"Modell"</th><th scope="col">"Art"</th><th scope="col">"Mittel"</th><th scope="col">"Spanne"</th></tr></thead>
+                                    <tbody>
+                                        {steps.iter().map(|s| view! {
+                                            <tr>
+                                                <td>{step_label(&s.step)}</td>
+                                                <td>{s.model.clone().unwrap_or_else(|| "Standard".into())}</td>
+                                                <td>{mode_label(&s.mode)}</td>
+                                                <td>{if s.known { fmt_money(s.mid, &s.currency) } else { "unbekannt".into() }}</td>
+                                                <td>{if s.known { format!("{} – {}", fmt_money(s.low, &s.currency), fmt_money(s.high, &s.currency)) } else { "–".into() }}</td>
+                                            </tr>
+                                        }).collect_view()}
+                                    </tbody>
+                                </table>
+                                <p class="small muted">{steps.first().map(|s| format!("Grundlage: {}", s.basis)).unwrap_or_default()}</p>
+                                {notes.iter().map(|n| view! { <p class="small muted">{n.clone()}</p> }).collect_view()}
+                            </div>
+                        })}
+                    }.into_any()
+                }
+            }}
+        </div>
     }
 }
 

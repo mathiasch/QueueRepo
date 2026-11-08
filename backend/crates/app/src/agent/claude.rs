@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use super::{
     classify::{epoch_value, ErrorCategory},
-    count, n, s, tool_summary, trunc, usd, AgentEvent, Credential, Invocation, LimitKind,
+    count, n, s, tool_summary, trunc, usd, AgentEvent, ConnCfg, Credential, Invocation, LimitKind,
     ParseState, RetryInfo, RunKind, RunLimits,
 };
 use crate::models::{Usage, RESULT_SCHEMA, REVIEW_SCHEMA};
@@ -50,20 +50,119 @@ pub(super) fn invocation(
         inv.args
             .extend(["--max-budget-usd".into(), format!("{:.4}", c.max(0.0001))]);
     }
+    let model = match &cred.conn {
+        Some(c) => connector_env(inv, c, &cred.secret, model)?,
+        None => {
+            match cred.kind.as_str() {
+                "oauth_token" => inv
+                    .env
+                    .push(("CLAUDE_CODE_OAUTH_TOKEN".into(), cred.secret.clone())),
+                "api_key" => inv
+                    .env
+                    .push(("ANTHROPIC_API_KEY".into(), cred.secret.clone())),
+                k => bail!("unsupported claude credential kind {k}"),
+            }
+            model.map(String::from)
+        }
+    };
     if let Some(m) = model {
-        inv.args.extend(["--model".into(), m.into()]);
-    }
-    match cred.kind.as_str() {
-        "oauth_token" => inv
-            .env
-            .push(("CLAUDE_CODE_OAUTH_TOKEN".into(), cred.secret.clone())),
-        "api_key" => inv
-            .env
-            .push(("ANTHROPIC_API_KEY".into(), cred.secret.clone())),
-        k => bail!("unsupported claude credential kind {k}"),
+        inv.args.extend(["--model".into(), m]);
     }
     inv.env.push(("DISABLE_AUTOUPDATER".into(), "1".into()));
     Ok(())
+}
+
+/// Bedrock model id for a geo profile: `claude-sonnet-5-5` → `eu.anthropic.claude-sonnet-5-5`.
+/// A full profile id must belong to the configured geo (else data would leave it).
+pub(crate) fn bedrock_model(model: Option<&str>, geo: &str) -> Result<String> {
+    let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) else {
+        bail!("Für Bedrock muss ein Modell angegeben werden (z. B. claude-sonnet-5-5), sonst wählt Claude Code ein Profil außerhalb des Datenraums");
+    };
+    if m.contains("anthropic.") {
+        if !m.starts_with(&format!("{geo}.")) {
+            bail!("Bedrock-Modell {m} gehört nicht zum Datenraum „{geo}“ des Zugangs");
+        }
+        return Ok(m.to_string());
+    }
+    if !m
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':'))
+    {
+        bail!("Ungültige Modell-ID {m}");
+    }
+    Ok(format!("{geo}.anthropic.{m}"))
+}
+
+/// Environment for Claude Code connectors. Returns the model to pass.
+/// Variable names are present in the 2.1.319 binary; their behaviour is
+/// prior knowledge (not verified live).
+fn connector_env(
+    inv: &mut Invocation,
+    c: &ConnCfg,
+    secret: &str,
+    model: Option<&str>,
+) -> Result<Option<String>> {
+    let env = |inv: &mut Invocation, k: &str, v: &str| inv.env.push((k.into(), v.into()));
+    match c.kind.as_str() {
+        "claude_subscription" => env(inv, "CLAUDE_CODE_OAUTH_TOKEN", secret),
+        "anthropic_api" | "mock" => {
+            env(inv, "ANTHROPIC_API_KEY", secret);
+            if let Some(b) = c.get("base_url") {
+                env(inv, "ANTHROPIC_BASE_URL", b);
+            }
+        }
+        "anthropic_gateway" | "litellm" => {
+            let Some(b) = c.get("base_url") else {
+                bail!("Basis-URL fehlt");
+            };
+            env(inv, "ANTHROPIC_BASE_URL", b);
+            env(inv, "ANTHROPIC_AUTH_TOKEN", secret);
+        }
+        "bedrock" => {
+            let geo = c.get("geo").unwrap_or("eu");
+            let m = bedrock_model(model, geo)?;
+            env(inv, "CLAUDE_CODE_USE_BEDROCK", "1");
+            env(inv, "AWS_REGION", c.get("region").unwrap_or("eu-central-1"));
+            match serde_json::from_str::<Value>(secret) {
+                Ok(j) if j.is_object() => {
+                    let (Some(id), Some(key)) =
+                        (j["access_key_id"].as_str(), j["secret_access_key"].as_str())
+                    else {
+                        bail!("AWS-Zugangsschlüssel: access_key_id und secret_access_key fehlen");
+                    };
+                    env(inv, "AWS_ACCESS_KEY_ID", id);
+                    env(inv, "AWS_SECRET_ACCESS_KEY", key);
+                    if let Some(t) = j["session_token"].as_str() {
+                        env(inv, "AWS_SESSION_TOKEN", t);
+                    }
+                }
+                _ => env(inv, "AWS_BEARER_TOKEN_BEDROCK", secret),
+            }
+            // Background requests (small/fast model) stay in the same geo profile.
+            env(inv, "ANTHROPIC_SMALL_FAST_MODEL", &m);
+            env(inv, "ANTHROPIC_DEFAULT_HAIKU_MODEL", &m);
+            return Ok(Some(m));
+        }
+        "vertex" => {
+            let Some(project) = c.get("project_id") else {
+                bail!("Google-Cloud-Projekt-ID fehlt");
+            };
+            env(inv, "CLAUDE_CODE_USE_VERTEX", "1");
+            env(inv, "CLOUD_ML_REGION", c.get("region").unwrap_or("eu"));
+            env(inv, "ANTHROPIC_VERTEX_PROJECT_ID", project);
+            // Application Default Credentials file in the run's HOME.
+            inv.home_files.push((
+                ".config/gcloud/application_default_credentials.json".into(),
+                secret.to_string(),
+            ));
+            if let Some(m) = model {
+                env(inv, "ANTHROPIC_SMALL_FAST_MODEL", m);
+                env(inv, "ANTHROPIC_DEFAULT_HAIKU_MODEL", m);
+            }
+        }
+        k => bail!("Zugang {k} kann nicht mit Claude Code betrieben werden"),
+    }
+    Ok(model.map(String::from))
 }
 
 fn usage_of(u: &Value) -> Usage {
@@ -243,6 +342,7 @@ mod tests {
         let c = Credential {
             kind: "api_key".into(),
             secret: "sk-secret".into(),
+            conn: None,
         };
         let i = inv("claude", None, &c, &RunLimits::default(), RunKind::Agent).unwrap();
         let has = |a: &[String], w: &[&str]| a.windows(w.len()).any(|x| x == w);

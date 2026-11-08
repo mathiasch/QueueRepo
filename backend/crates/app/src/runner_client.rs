@@ -152,6 +152,11 @@ impl RunnerClient {
             .sha)
     }
 
+    /// Agent CLIs found in the sandbox (`<cli> --version`).
+    pub async fn cli_status(&self) -> Result<Vec<queued_common::CliProbe>> {
+        self.get(format!("{}/cli-status", self.base)).await
+    }
+
     pub async fn files(&self, ws: Uuid) -> Result<Vec<String>> {
         self.get(self.url(ws, "/files")).await
     }

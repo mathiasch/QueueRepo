@@ -8,7 +8,8 @@
 //! MOCK_REVIEW_LIMIT (the review run hits a rate limit), MOCK_QUIET (6 s
 //! without any output after the first usage line, then success),
 //! MOCK_USAGE_TOTAL (final usage report far above the live deltas, like
-//! codex/gemini that report usage only at the end).
+//! codex/gemini that report usage only at the end), MOCK_SOLUTION_B64:<b64>
+//! (runs the decoded shell script in the workspace – eval set, see `eval.rs`).
 use serde_json::Value;
 
 use super::{
@@ -49,6 +50,10 @@ case "$P" in
        echo '{"type":"error","category":"overloaded","text":"API Error: 529 overloaded"}'; exit 1;; esac;;
   *MOCK_AUTH*) echo '{"type":"error","category":"authentication_failed","text":"Invalid API key"}'; exit 1;;
   *MOCK_TURNS*) if [ -n "$QUEUE_MAX_TURNS" ]; then echo '{"type":"limit","kind":"turns"}'; exit 1; fi;;
+esac
+case "$P" in
+  *MOCK_SOLUTION_B64:*) printf '%s\n' "$P" | sed -n 's/.*MOCK_SOLUTION_B64:\([A-Za-z0-9+/=]*\).*/\1/p' | head -n 1 | base64 -d | sh
+    echo '{"type":"tool","text":"eval: applied reference solution"}';;
 esac
 case "$P" in
   *MOCK_LIMIT*) echo '{"type":"error","text":"Claude AI usage limit reached|'$(( $(date +%s) + 120 ))'"}'; exit 1;;
@@ -142,6 +147,7 @@ mod tests {
         let c = Credential {
             kind: "none".into(),
             secret: String::new(),
+            conn: None,
         };
         let i = inv(
             "mock",

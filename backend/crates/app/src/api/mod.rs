@@ -1,6 +1,8 @@
 mod credentials;
+mod evals;
 pub mod limits;
 mod projects;
+mod providers;
 mod tasks;
 
 use std::convert::Infallible;
@@ -54,6 +56,27 @@ pub fn router(st: AppState) -> Router {
             "/credentials/{provider}",
             put(credentials::put).delete(credentials::remove),
         )
+        .route("/connectors", get(providers::list).post(providers::create))
+        .route(
+            "/connectors/{id}",
+            axum::routing::patch(providers::update).delete(providers::remove),
+        )
+        .route("/connectors/{id}/check", post(providers::check))
+        .route("/connectors/{id}/resume", post(providers::resume))
+        .route("/prices", get(providers::prices))
+        .route(
+            "/admin/prices",
+            get(providers::get_overrides).put(providers::put_overrides),
+        )
+        .route("/admin/prices/history", get(providers::override_history))
+        .route("/estimate", post(providers::estimate))
+        .route("/costs", get(providers::costs))
+        .route("/cli-status", get(providers::cli_status))
+        .route("/projects/{id}/presets", get(providers::presets))
+        .route("/projects/{id}/routing", put(providers::put_routing))
+        .route("/evals/cases", get(evals::cases))
+        .route("/evals", get(evals::list).post(evals::start))
+        .route("/evals/{id}", get(evals::get).delete(evals::remove))
         .route("/notifications", get(list_notifications))
         .route("/notifications/read-all", post(read_all))
         .route("/notifications/{id}/read", post(read_one))
@@ -142,6 +165,9 @@ async fn meta(State(st): State<AppState>) -> Json<Meta> {
             .iter()
             .map(|(p, v)| (p.to_string(), v.to_string()))
             .collect(),
+        connector_types: crate::connectors::types(st.cfg.enable_mock_provider),
+        cli_notes: crate::agent::cli_notes(),
+        price_catalog_version: crate::pricing::builtin().version.clone(),
     })
 }
 
@@ -171,7 +197,9 @@ async fn put_settings(
     AuthUser(u): AuthUser,
     Json(s): Json<SettingsUpdate>,
 ) -> ApiResult<Json<Settings>> {
-    if !st.cfg.providers().contains(&s.default_provider.as_str()) {
+    if !st.cfg.providers().contains(&s.default_provider.as_str())
+        || crate::agent::credential_kinds(&s.default_provider).is_empty()
+    {
         return Err(AppError::bad_request("unknown provider"));
     }
     let actions: Vec<String> = s

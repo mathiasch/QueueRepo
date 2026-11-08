@@ -12,6 +12,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+mod costs;
+mod providers;
+pub use costs::*;
+pub use providers::*;
+
 /// For PATCH semantics: field absent → `None` (unchanged), `null` →
 /// `Some(None)` (back to the default), value → `Some(Some(v))`.
 pub fn double_option<'de, T, D>(d: D) -> Result<Option<Option<T>>, D::Error>
@@ -75,6 +80,15 @@ pub struct Meta {
     pub allow_registration: bool,
     pub provider_capabilities: BTreeMap<String, ProviderCapabilities>,
     pub cli_versions: BTreeMap<String, String>,
+    /// Connector types this server offers (WP13).
+    #[serde(default)]
+    pub connector_types: Vec<ConnectorTypeInfo>,
+    /// Maintenance state of the pinned CLIs (e.g. Gemini CLI).
+    #[serde(default)]
+    pub cli_notes: BTreeMap<String, CliNote>,
+    /// Version of the built-in price catalog.
+    #[serde(default)]
+    pub price_catalog_version: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +102,9 @@ pub enum TaskStatus {
     PendingApproval,
     Queued,
     Running,
+    /// A single-shot step (plan, review, analysis) waits for a provider
+    /// (batch API or synchronous call). Occupies no slot, locks no project.
+    WaitingBatch,
     WaitingInput,
     Done,
     Failed,
@@ -96,10 +113,11 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
-    pub const ALL: [TaskStatus; 8] = [
+    pub const ALL: [TaskStatus; 9] = [
         Self::PendingApproval,
         Self::Queued,
         Self::Running,
+        Self::WaitingBatch,
         Self::WaitingInput,
         Self::Done,
         Self::Failed,
@@ -112,6 +130,7 @@ impl TaskStatus {
             Self::PendingApproval => "pending_approval",
             Self::Queued => "queued",
             Self::Running => "running",
+            Self::WaitingBatch => "waiting_batch",
             Self::WaitingInput => "waiting_input",
             Self::Done => "done",
             Self::Failed => "failed",
@@ -148,7 +167,11 @@ impl TaskStatus {
     pub fn can_cancel(self) -> bool {
         matches!(
             self,
-            Self::Queued | Self::PendingApproval | Self::Running | Self::WaitingInput
+            Self::Queued
+                | Self::PendingApproval
+                | Self::Running
+                | Self::WaitingBatch
+                | Self::WaitingInput
         )
     }
 
@@ -298,9 +321,27 @@ pub struct Task {
     pub failure_class: Option<String>,
     pub transient_retries: i32,
     pub not_before: Option<DateTime<Utc>>,
+    /// Connector of the agent loop (`None` = legacy credential of `provider`).
+    #[serde(default)]
+    pub connector_id: Option<Uuid>,
+    /// Position in the model escalation chain of the project routing.
+    #[serde(default)]
+    pub escalation_level: i32,
+    /// Result of the plan step (single-shot call), handed to the agent.
+    #[serde(default)]
+    pub plan: Option<String>,
+    /// [`TaskCost`] as JSON, see [`Task::cost_parsed`].
+    #[serde(default)]
+    pub cost: Option<Value>,
 }
 
 impl Task {
+    pub fn cost_parsed(&self) -> Option<TaskCost> {
+        self.cost
+            .as_ref()
+            .and_then(|c| serde_json::from_value(c.clone()).ok())
+    }
+
     /// Unknown values (never written by the backend) count as `queued`.
     pub fn status_kind(&self) -> TaskStatus {
         TaskStatus::parse(&self.status).unwrap_or(TaskStatus::Queued)
@@ -405,6 +446,9 @@ pub struct CreateTask {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<Uuid>,
+    /// Connector of the agent loop; its harness replaces `provider`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_id: Option<Uuid>,
     #[serde(default)]
     pub front: bool,
     #[serde(flatten)]
@@ -424,6 +468,13 @@ pub struct UpdateTask {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Absent = unchanged, `null` = back to the legacy credential of `provider`.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub connector_id: Option<Option<Uuid>>,
     #[serde(flatten)]
     pub limits: TaskLimitFields,
 }
@@ -516,6 +567,12 @@ pub struct ProjectView {
     pub max_turns: Option<i32>,
     pub role: ProjectRole,
     pub has_git_token: bool,
+    /// Per-step routing (`None` = legacy behaviour: task provider, project review provider).
+    #[serde(default)]
+    pub routing: Option<Routing>,
+    /// Hard data-location rule, enforced by the server.
+    #[serde(default)]
+    pub data_residency: Residency,
 }
 
 /// Response of `POST /api/projects`: the new project and its first commit.
@@ -823,7 +880,8 @@ mod tests {
             "created_at": "2026-01-01T10:00:00Z", "started_at": null, "finished_at": null,
             "updated_at": "2026-01-01T10:00:00Z", "max_runtime_secs": 60, "max_cost_usd": null,
             "max_tokens": null, "max_turns": 3, "failure_class": "limit_tokens",
-            "transient_retries": 0, "not_before": null
+            "transient_retries": 0, "not_before": null,
+            "connector_id": null, "escalation_level": 0, "plan": null, "cost": null
         })
     }
 
@@ -885,6 +943,7 @@ mod tests {
             provider: None,
             model: None,
             parent_id: None,
+            connector_id: None,
             front: true,
             limits: TaskLimitFields {
                 max_runtime_secs: Some(Some(90)),

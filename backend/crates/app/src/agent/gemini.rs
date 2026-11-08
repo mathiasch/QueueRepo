@@ -43,7 +43,15 @@ pub(super) fn invocation(
     inv.env
         .push(("GEMINI_CLI_TRUST_WORKSPACE".into(), "true".into()));
     let mut settings = json!({});
-    match cred.kind.as_str() {
+    let kind = match &cred.conn {
+        Some(c) if c.kind == "gemini_subscription" => "oauth_creds",
+        Some(c) => bail!(
+            "Zugang {} kann nicht mit der Gemini CLI betrieben werden",
+            c.kind
+        ),
+        None => cred.kind.as_str(),
+    };
+    match kind {
         "oauth_creds" => {
             inv.home_files
                 .push((".gemini/oauth_creds.json".into(), cred.secret.clone()));
@@ -130,10 +138,7 @@ mod tests {
 
     #[test]
     fn settings_json_contains_turn_limit_and_auth() {
-        let oauth = Credential {
-            kind: "oauth_creds".into(),
-            secret: "{}".into(),
-        };
+        let oauth = Credential::legacy("oauth_creds", "{}");
         let lim = RunLimits {
             turns: Some(9),
             cost_usd: Some(1.0),
@@ -152,6 +157,7 @@ mod tests {
         let key = Credential {
             kind: "api_key".into(),
             secret: "k".into(),
+            conn: None,
         };
         let i = inv("gemini", None, &key, &RunLimits::default(), RunKind::Agent).unwrap();
         assert_eq!(settings(&i), json!({}));

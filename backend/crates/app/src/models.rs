@@ -5,13 +5,15 @@ use uuid::Uuid;
 
 // Wire types shared with the web frontend live in `queued-api`.
 pub use queued_api::{
-    FailureClass, ProjectRole, ProjectView, ReviewResult, Settings, Task, TaskEvent, Usage, User,
+    FailureClass, ProjectRole, ProjectView, Residency, ReviewResult, Routing, Settings, Task,
+    TaskEvent, Usage, User,
 };
 
 pub mod status {
     pub const PENDING_APPROVAL: &str = "pending_approval";
     pub const QUEUED: &str = "queued";
     pub const RUNNING: &str = "running";
+    pub const WAITING_BATCH: &str = "waiting_batch";
     pub const WAITING_INPUT: &str = "waiting_input";
     pub const DONE: &str = "done";
     pub const FAILED: &str = "failed";
@@ -41,9 +43,25 @@ pub struct Project {
     pub max_cost_usd: Option<f64>,
     pub max_tokens: Option<i64>,
     pub max_turns: Option<i32>,
+    /// [`Routing`] as JSON (`None` = legacy behaviour).
+    pub routing: Option<serde_json::Value>,
+    /// any | eu | ch (CHECK in the database).
+    pub data_residency: String,
+    /// Project created by an eval run (hidden from the project list).
+    pub is_eval: bool,
 }
 
 impl Project {
+    pub fn routing(&self) -> Option<Routing> {
+        self.routing
+            .as_ref()
+            .and_then(|r| serde_json::from_value(r.clone()).ok())
+    }
+
+    pub fn residency(&self) -> Residency {
+        Residency::parse(&self.data_residency).unwrap_or_default()
+    }
+
     /// Public projection: the encrypted git token never leaves the backend.
     pub fn view(&self, role: ProjectRole) -> ProjectView {
         ProjectView {
@@ -67,6 +85,8 @@ impl Project {
             max_turns: self.max_turns,
             role,
             has_git_token: self.git_token_enc.is_some(),
+            routing: self.routing(),
+            data_residency: self.residency(),
         }
     }
 }

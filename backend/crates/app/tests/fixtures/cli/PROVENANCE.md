@@ -53,3 +53,27 @@ files. They are *not* live output – real streams may contain extra fields
 | `turn_limit.jsonl` | constructed | `result.error.type:"FatalTurnLimitedError"` (exit code 53 in the bundle) from `model.maxSessionTurns`. |
 | `quota_429.jsonl` | constructed | quota text ("exhausted your capacity", `RESOURCE_EXHAUSTED`). Gemini 0.67.0 has no structured retry/limit event in stream-json; classification is a text fallback on the error channel. |
 | `network_transient.jsonl` | constructed | `error` severity `error` + `result.error` "fetch failed: read ECONNRESET". |
+
+## opencode-1.19.5
+
+All **constructed**: opencode could not be executed in this environment
+(the auto-mode policy forbids running downloaded binaries). Event and field
+names come from the JavaScript bundled in `opencode-linux-x64@1.19.5`
+(`npm pack`, binary grepped as data on 2026-11-08): the `run` command writes
+`JSON.stringify({type, timestamp, sessionID, ...})` for `tool_use`
+(completed/error tool parts), `step_start`, `step_finish` (part with
+`tokens:{input,output,reasoning,cache:{read,write}}` and `cost`), `text`
+(finished text parts), `reasoning` and `error` (`{error}` of `session.error`,
+NamedError shape `{name, data}` with `ProviderAuthError{providerID,message}`,
+`APIError{message,statusCode,isRetryable,…}`, `ContextOverflowError{message}`).
+Ids/timestamps are invented.
+
+| File | Origin | Notes |
+|---|---|---|
+| `success_tools.jsonl` | constructed | two steps with `read`/`bash` tools, final text, `step_finish` usage incl. reasoning and cache read/write. |
+| `rate_limit_429.jsonl` | constructed | `APIError` with `statusCode:429` → rate limit. |
+| `auth_error.jsonl` | constructed | `ProviderAuthError` → provider_auth (pause). |
+| `server_error_503.jsonl` | constructed | `APIError` 503 → transient. |
+| `retryable_without_status.jsonl` | constructed | `APIError` without status, `isRetryable:true` → transient. |
+| `context_overflow.jsonl` | constructed | `ContextOverflowError` → task failure (no provider cause). |
+| `tool_error_then_text.jsonl` | constructed | tool part with `status:"error"` is a notice, not a failure. |

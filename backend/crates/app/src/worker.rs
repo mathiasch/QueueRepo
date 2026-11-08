@@ -119,9 +119,9 @@ async fn tick(st: &AppState) -> Result<()> {
         let mut slots = s.parallelism.max(1) as i64 - running;
         let mut started = 0;
         let blocked = if slots > 0 {
-            budget::blocked_providers(&st.db, s.user_id, &st.cfg.providers()).await?
+            Blocked::load(st, s.user_id).await?
         } else {
-            vec![]
+            Blocked::default()
         };
         while slots > 0 {
             match claim_next(st, s.user_id, &blocked).await? {
@@ -140,10 +140,44 @@ async fn tick(st: &AppState) -> Result<()> {
     Ok(())
 }
 
-/// Claims the next runnable task. `blocked` = providers paused by a
-/// subscription limit, an auth failure or an exhausted token budget. Tasks
-/// in backoff (`not_before` in the future) are skipped.
-async fn claim_next(st: &AppState, user_id: Uuid, blocked: &[String]) -> Result<Option<Task>> {
+/// What the scheduler must not start right now.
+#[derive(Default)]
+struct Blocked {
+    /// Legacy credentials paused (limit/auth) or out of budget.
+    legacy: Vec<String>,
+    /// Harnesses whose token/cost budget is exhausted (applies to connectors too).
+    budget: Vec<String>,
+    /// Connectors paused by a limit or an auth failure (`connector:<id>`).
+    connectors: Vec<String>,
+}
+
+impl Blocked {
+    async fn load(st: &AppState, user: Uuid) -> Result<Self> {
+        let mut b = Blocked::default();
+        for p in st.cfg.providers() {
+            let s = budget::status(&st.db, user, p).await?;
+            if s.blocked {
+                b.legacy.push(p.to_string());
+            }
+            if s.budget_until.is_some() {
+                b.budget.push(p.to_string());
+            }
+        }
+        b.connectors = sqlx::query_scalar(
+            "SELECT provider FROM provider_limits WHERE user_id=$1 AND provider LIKE 'connector:%'
+               AND (paused_reason IS NOT NULL OR limited_until > now())",
+        )
+        .bind(user)
+        .fetch_all(&st.db)
+        .await?;
+        Ok(b)
+    }
+}
+
+/// Claims the next runnable task. Legacy tasks: provider paused (limit,
+/// auth) or out of budget; connector tasks: connector paused or the
+/// harness out of budget. Tasks in backoff (`not_before` in the future) are skipped.
+async fn claim_next(st: &AppState, user_id: Uuid, blocked: &Blocked) -> Result<Option<Task>> {
     Ok(sqlx::query_as::<_, Task>(
         "UPDATE tasks SET status='running', started_at=now(), updated_at=now(), error=NULL, not_before=NULL
          WHERE id = (
@@ -151,14 +185,17 @@ async fn claim_next(st: &AppState, user_id: Uuid, blocked: &[String]) -> Result<
             WHERE t.user_id = $1 AND t.status = 'queued'
               AND (t.not_before IS NULL OR t.not_before <= now())
               AND NOT EXISTS (SELECT 1 FROM tasks r WHERE r.project_id = t.project_id AND r.status = 'running')
-              AND NOT (t.provider = ANY($2))
+              AND CASE WHEN t.connector_id IS NULL THEN NOT (t.provider = ANY($2))
+                       ELSE NOT (t.provider = ANY($3)) AND NOT (('connector:' || t.connector_id::text) = ANY($4)) END
             ORDER BY t.position
             LIMIT 1
             FOR UPDATE SKIP LOCKED)
          RETURNING *",
     )
     .bind(user_id)
-    .bind(blocked)
+    .bind(&blocked.legacy)
+    .bind(&blocked.budget)
+    .bind(&blocked.connectors)
     .fetch_optional(&st.db)
     .await?)
 }
@@ -184,7 +221,7 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
     }
     let busy: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM tasks WHERE user_id=$1
-                        AND status IN ('queued','running','waiting_input','pending_approval'))",
+                        AND status IN ('queued','running','waiting_batch','waiting_input','pending_approval'))",
     )
     .bind(s.user_id)
     .fetch_one(&st.db)
@@ -192,18 +229,10 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
     if busy {
         return Ok(());
     }
-    let provider = s.default_provider.clone();
-    if budget::is_blocked(&st.db, s.user_id, &provider).await?
-        || queue::load_credential(st, s.user_id, &provider)
-            .await?
-            .is_none()
-    {
-        return Ok(());
-    }
     // Round-robin over projects the user can edit that already have some history.
-    let project: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT p.id, p.name FROM projects p JOIN project_members m ON m.project_id = p.id
-         WHERE m.user_id = $1 AND m.role IN ('owner','editor')
+    let project: Option<(Uuid, String, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.routing FROM projects p JOIN project_members m ON m.project_id = p.id
+         WHERE m.user_id = $1 AND m.role IN ('owner','editor') AND NOT p.is_eval
            AND EXISTS (SELECT 1 FROM tasks t WHERE t.project_id = p.id AND t.status = 'done')
          ORDER BY (SELECT max(created_at) FROM tasks o WHERE o.project_id = p.id AND o.kind = 'onempty' AND o.user_id = $1) ASC NULLS FIRST
          LIMIT 1",
@@ -211,8 +240,47 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
     .bind(s.user_id)
     .fetch_optional(&st.db)
     .await?;
-    let Some((project_id, name)) = project else {
+    let Some((project_id, name, routing)) = project else {
         return Ok(());
+    };
+    // Access: the routing's analysis (or agent-loop) target, else the default provider.
+    let target = routing
+        .and_then(|r| serde_json::from_value::<queued_api::Routing>(r).ok())
+        .and_then(|r| r.analyze.target.or(r.execute.target));
+    let (provider, connector_id, model) = match target {
+        Some(t) => match t.connector_id {
+            Some(c) => match crate::connectors::load_row(st, c).await? {
+                Some(row) => {
+                    let harness = crate::connectors::harness(&row.3, &row.5);
+                    let paused =
+                        budget::status(&st.db, s.user_id, &crate::connectors::limit_key(c))
+                            .await?
+                            .blocked
+                            || budget::status(&st.db, s.user_id, &harness)
+                                .await?
+                                .budget_until
+                                .is_some();
+                    if paused {
+                        return Ok(());
+                    }
+                    (harness, Some(c), t.model)
+                }
+                None => return Ok(()),
+            },
+            None => {
+                let p = t.provider.unwrap_or_else(|| s.default_provider.clone());
+                if !legacy_ready(st, s.user_id, &p).await? {
+                    return Ok(());
+                }
+                (p, None, t.model)
+            }
+        },
+        None => {
+            if !legacy_ready(st, s.user_id, &s.default_provider).await? {
+                return Ok(());
+            }
+            (s.default_provider.clone(), None, None)
+        }
     };
 
     sqlx::query("UPDATE user_settings SET last_onempty_at=now() WHERE user_id=$1")
@@ -231,15 +299,23 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
             prompt: String::new(),
             context: String::new(),
             provider,
-            model: None,
+            model,
             status: status::QUEUED,
             attempt: 0,
             depth: 0,
             created_by_agent: true,
             front: false,
             limits: Default::default(),
+            connector_id,
+            escalation_level: 0,
         },
     )
     .await?;
     Ok(())
+}
+
+/// Legacy provider usable: not paused/out of budget and credentials stored.
+async fn legacy_ready(st: &AppState, user: Uuid, provider: &str) -> Result<bool> {
+    Ok(!budget::is_blocked(&st.db, user, provider).await?
+        && queue::load_credential(st, user, provider).await?.is_some())
 }

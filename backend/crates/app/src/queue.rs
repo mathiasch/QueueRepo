@@ -48,17 +48,21 @@ pub struct NewTask {
     /// Insert at the head of the user's queue.
     pub front: bool,
     pub limits: TaskLimits,
+    /// Connector of the agent loop (`None` = legacy credential of `provider`).
+    pub connector_id: Option<Uuid>,
+    /// Position in the escalation chain of the project routing.
+    pub escalation_level: i32,
 }
 
 pub async fn insert_task(st: &AppState, t: NewTask) -> sqlx::Result<Task> {
     let task = sqlx::query_as::<_, Task>(
         "INSERT INTO tasks (id, user_id, project_id, parent_id, kind, title, prompt, context, provider, model, status,
                             attempt, depth, created_by_agent, position,
-                            max_runtime_secs, max_cost_usd, max_tokens, max_turns)
+                            max_runtime_secs, max_cost_usd, max_tokens, max_turns, connector_id, escalation_level)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
                  CASE WHEN $15 THEN (SELECT COALESCE(MIN(position), 0) - 1 FROM tasks WHERE user_id = $2 AND status = 'queued')
                       ELSE nextval('task_position_seq') END,
-                 $16,$17,$18,$19)
+                 $16,$17,$18,$19,$20,$21)
          RETURNING *",
     )
     .bind(Uuid::new_v4())
@@ -80,6 +84,8 @@ pub async fn insert_task(st: &AppState, t: NewTask) -> sqlx::Result<Task> {
     .bind(t.limits.max_cost_usd)
     .bind(t.limits.max_tokens)
     .bind(t.limits.max_turns)
+    .bind(t.connector_id)
+    .bind(t.escalation_level)
     .fetch_one(&st.db)
     .await?;
     st.emit(
@@ -228,10 +234,7 @@ pub async fn load_credential(
     provider: &str,
 ) -> anyhow::Result<Option<Credential>> {
     if provider == "mock" {
-        return Ok(Some(Credential {
-            kind: "none".into(),
-            secret: String::new(),
-        }));
+        return Ok(Some(Credential::legacy("none", "")));
     }
     let row: Option<(String, Vec<u8>)> = sqlx::query_as(
         "SELECT kind, secret_enc FROM provider_credentials WHERE user_id=$1 AND provider=$2",
@@ -244,7 +247,7 @@ pub async fn load_credential(
         None => Ok(None),
         Some((kind, enc)) => {
             let secret = String::from_utf8(crypto::decrypt(&st.cfg.master_key, &enc)?)?;
-            Ok(Some(Credential { kind, secret }))
+            Ok(Some(Credential::legacy(kind, secret)))
         }
     }
 }

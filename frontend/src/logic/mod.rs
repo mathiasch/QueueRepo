@@ -2,6 +2,7 @@
 //! `cargo test` (replaces the former Vitest suite).
 pub mod b64;
 pub mod budget;
+pub mod costs;
 pub mod diff;
 pub mod errors;
 pub mod format;

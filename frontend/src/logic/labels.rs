@@ -31,6 +31,7 @@ pub fn status_label(s: TaskStatus) -> &'static str {
         TaskStatus::PendingApproval => "Freigabe nötig",
         TaskStatus::Queued => "Wartet",
         TaskStatus::Running => "Läuft",
+        TaskStatus::WaitingBatch => "Wartet auf Anbieter",
         TaskStatus::WaitingInput => "Wartet auf dich",
         TaskStatus::Done => "Fertig",
         TaskStatus::Failed => "Fehlgeschlagen",
@@ -47,6 +48,9 @@ pub fn status_help(s: TaskStatus) -> &'static str {
         }
         TaskStatus::Queued => "Steht in der Warteschlange und startet, sobald ein Agent frei ist.",
         TaskStatus::Running => "Ein Agent arbeitet gerade daran.",
+        TaskStatus::WaitingBatch => {
+            "Ein Planungs-, Prüf- oder Analyseschritt läuft direkt beim Anbieter – im Batch-Tarif günstiger, kann aber bis zu 24 Stunden dauern. Andere Aufträge laufen weiter."
+        }
         TaskStatus::WaitingInput => "Der Agent hat eine Rückfrage und wartet auf deine Antwort.",
         TaskStatus::Done => "Erledigt, geprüft und im Projekt gespeichert.",
         TaskStatus::Failed => {
@@ -62,7 +66,7 @@ pub fn status_help(s: TaskStatus) -> &'static str {
 pub fn status_tone(s: TaskStatus) -> Tone {
     match s {
         TaskStatus::PendingApproval | TaskStatus::WaitingInput => Tone::Warning,
-        TaskStatus::Queued => Tone::Info,
+        TaskStatus::Queued | TaskStatus::WaitingBatch => Tone::Info,
         TaskStatus::Running => Tone::Run,
         TaskStatus::Done => Tone::Success,
         TaskStatus::Failed | TaskStatus::Blocked => Tone::Danger,
@@ -122,6 +126,7 @@ pub fn provider_label(p: &str) -> String {
         "claude" => "Claude".into(),
         "codex" => "Codex (GPT)".into(),
         "gemini" => "Gemini".into(),
+        "opencode" => "opencode".into(),
         "mock" => "Mock".into(),
         other => other.into(),
     }
@@ -216,6 +221,11 @@ pub mod help {
     pub const ONEMPTY: &str = "Ist die Warteschlange leer, kann die Queue selbstständig sinnvolle Arbeit vorschlagen – nur bei freiem Budget und wenn nichts auf dich wartet.";
     pub const TURNS: &str = "Ein Turn ist ein Arbeitsschritt des Agenten (eine Antwort inklusive Werkzeugaufrufen). Das Limit begrenzt, wie viele Schritte ein Lauf machen darf.";
     pub const TOKENS: &str = "Tokens sind die Abrechnungseinheit der KI-Anbieter (grob: ein Token ≈ ¾ Wort). Gezählt werden Eingabe, Ausgabe und Cache-Schreibvorgänge.";
+    pub const PLAN: &str = "Vor der Umsetzung hat ein (meist stärkeres) Modell einen kurzen Plan geschrieben. Der Agent hält sich daran, weicht aber ab, wenn der Code etwas anderes zeigt.";
+    pub const COSTS: &str = "Berechnet aus den verbrauchten Tokens und der Preistabelle (Listenpreise der Anbieter). Bei Abos zahlst du nicht pro Token – dann zeigt der Betrag, was der Auftrag per API gekostet hätte.";
+    pub const ROUTING: &str = "Welches Modell plant, umsetzt und prüft. Teure Modelle nur dort, wo sie sich lohnen: Planung und Prüfung sind kurze Einzelschritte und laufen günstig im Batch-Tarif.";
+    pub const RESIDENCY: &str = "Harte Regel für dieses Projekt: Aufträge, Planung und Prüfung laufen nur über Zugänge mit passendem Datenstandort. Der Server lehnt alles andere ab.";
+    pub const CONNECTORS: &str = "Zusätzliche Zugänge per API-Schlüssel, in der EU/Schweiz oder auf eigenen Servern. Schlüssel werden verschlüsselt gespeichert und nie wieder angezeigt.";
     pub const LIMITS: &str = "Schutz vor ausufernden Läufen. Leer = Standard. Laufzeit und Stillstand gelten je Lauf, Kosten und Tokens für den ganzen Auftrag.";
     pub const BUDGET: &str = "Rollierende Fenster pro Anbieter. Ist ein Budget erreicht, startet die Queue für diesen Anbieter nichts Neues, bis genug Verbrauch aus dem Fenster gefallen ist.";
     pub const AUTO_APPROVE: &str = "Schlägt ein Agent mehr neue Aufträge vor als hier eingestellt, musst du sie erst freigeben.";

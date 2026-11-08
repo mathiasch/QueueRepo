@@ -1,0 +1,2 @@
+{"type":"step_finish","timestamp":1762560002000,"sessionID":"ses_06","part":{"type":"step-finish","reason":"stop","cost":0,"tokens":{"input":990000,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}
+{"type":"error","timestamp":1762560003000,"sessionID":"ses_06","error":{"name":"ContextOverflowError","data":{"message":"prompt is too long"}}}

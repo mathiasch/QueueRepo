@@ -1,0 +1,2 @@
+{"type":"step_start","timestamp":1762560000000,"sessionID":"ses_02","part":{"type":"step-start"}}
+{"type":"error","timestamp":1762560001000,"sessionID":"ses_02","error":{"name":"APIError","data":{"message":"Rate limit exceeded: too many requests","statusCode":429,"isRetryable":true}}}

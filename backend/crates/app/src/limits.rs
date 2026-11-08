@@ -117,7 +117,7 @@ impl Guard {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use chrono::Utc;
     use uuid::Uuid;
@@ -143,6 +143,9 @@ mod tests {
             max_cost_usd: None,
             max_tokens: None,
             max_turns: None,
+            routing: None,
+            data_residency: "any".into(),
+            is_eval: false,
         }
     }
 
@@ -182,6 +185,10 @@ mod tests {
             failure_class: None,
             transient_retries: 0,
             not_before: None,
+            connector_id: None,
+            escalation_level: 0,
+            plan: None,
+            cost: None,
         }
     }
 

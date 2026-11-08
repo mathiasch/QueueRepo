@@ -103,6 +103,10 @@ pub(crate) mod fixtures {
             failure_class: None,
             transient_retries: 0,
             not_before: None,
+            connector_id: None,
+            escalation_level: 0,
+            plan: None,
+            cost: None,
         }
     }
 }

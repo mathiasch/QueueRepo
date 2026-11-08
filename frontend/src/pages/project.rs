@@ -6,20 +6,22 @@ use leptos_router::{
     NavigateOptions,
 };
 use queued_api::{
-    AddMember, Commit, FileView, ImportResult, Member, ProjectRole, ProjectView, PushResult, Task,
+    AddMember, Commit, CostSummary, FileView, ImportResult, Member, PresetInfo, ProjectRole,
+    ProjectView, PushResult, Residency, Routing, RoutingUpdate, StepMode, Target, Task,
     UpdateProject,
 };
 use uuid::Uuid;
 use wasm_bindgen::JsCast;
 
 use crate::api::{self, enc};
+use crate::logic::costs::{fmt_money_list, step_mode_label, target_text, RESIDENCIES};
 use crate::logic::format::{fmt_relative, parse_rfc3339, plural};
 use crate::logic::labels::{help, provider_label};
 use crate::logic::limits::{LimitField, LimitForm};
 use crate::nav::{set_title, with_query};
 use crate::store::{tz, use_store};
 use crate::ui::dialog::Confirm;
-use crate::ui::{Empty, Field, FieldIds, HelpTip, Ic, Icon};
+use crate::ui::{uid, Empty, Field, FieldIds, HelpTip, Ic, Icon};
 
 use super::projects::role_label;
 use super::queue::TaskRow;
@@ -191,7 +193,10 @@ pub fn ProjectPage() -> impl IntoView {
                             Tab::Files => view! { <Files id=pid can_edit=can_edit/> }.into_any(),
                             Tab::Git => view! { <GitLog p=p can_edit=can_edit/> }.into_any(),
                             Tab::Tasks => view! { <ProjectTasks id=pid/> }.into_any(),
-                            Tab::Settings => view! { <ProjectSettings p=p on_saved=Callback::new(move |_| reload())/> }.into_any(),
+                            Tab::Settings => view! {
+                                <ProjectRouting p=p.clone() on_saved=Callback::new(move |_| reload())/>
+                                <ProjectSettings p=p on_saved=Callback::new(move |_| reload())/>
+                            }.into_any(),
                             Tab::Members => view! { <Members id=pid is_owner=p.role == ProjectRole::Owner me=store.me.get_untracked().id/> }.into_any(),
                         }
                     }}
@@ -409,6 +414,154 @@ fn ProjectTasks(id: Uuid) -> impl IntoView {
     }
 }
 
+/// Model choice per step (presets) and the data-residency rule; costs of the project.
+#[component]
+fn ProjectRouting(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
+    let store = use_store();
+    let id = p.id;
+    let can_edit = p.role.can_edit();
+    let is_owner = p.role == ProjectRole::Owner;
+    let residency = RwSignal::new(p.data_residency);
+    let current = RwSignal::new(p.routing.clone());
+    let presets = RwSignal::new(None::<Result<Vec<PresetInfo>, String>>);
+    let costs = RwSignal::new(None::<CostSummary>);
+    let busy = RwSignal::new(false);
+    let load = move || {
+        spawn_local(async move {
+            if can_edit {
+                let r = api::get::<Vec<PresetInfo>>(&format!("/projects/{id}/presets"))
+                    .await
+                    .map_err(|e| e.message);
+                presets.set(Some(r));
+            }
+            if let Ok(c) = api::get::<CostSummary>(&format!("/costs?days=30&project_id={id}")).await
+            {
+                costs.set(Some(c));
+            }
+        });
+    };
+    load();
+    let save = move |routing: Option<Routing>, res: Residency| {
+        busy.set(true);
+        spawn_local(async move {
+            let body = RoutingUpdate {
+                routing,
+                data_residency: res,
+            };
+            match api::put::<_, ProjectView>(&format!("/projects/{id}/routing"), &body).await {
+                Ok(v) => {
+                    current.set(v.routing.clone());
+                    residency.set(v.data_residency);
+                    store.toast("Modellwahl gespeichert");
+                    on_saved.run(());
+                }
+                Err(e) => store.toast_error("Modellwahl nicht gespeichert", &e),
+            }
+            busy.set(false);
+        });
+    };
+    let res_name = uid("residency");
+    view! {
+        <section class="card settings-card" style="margin-top: var(--sp-4)" aria-labelledby="routing-title" data-testid="project-routing">
+            <header>
+                <span class="s-icon"><Icon icon=Ic::Gauge/></span>
+                <div>
+                    <h2 id="routing-title" class="row">"Modellwahl & Datenstandort" <HelpTip topic="Modellwahl" text=help::ROUTING align="align-start"/></h2>
+                    <p>"Welches Modell plant, umsetzt und prüft – und wo deine Daten verarbeitet werden dürfen."</p>
+                </div>
+            </header>
+            <fieldset class="form-section" disabled=!can_edit>
+                <legend class="row">"Datenstandort" <HelpTip topic="Datenstandort" text=help::RESIDENCY align="align-start"/></legend>
+                <div class="segmented" role="radiogroup" aria-label="Datenstandort">
+                    {RESIDENCIES.into_iter().map(|r| {
+                        let name = res_name.clone();
+                        view! {
+                            <label class="seg-radio">
+                                <input type="radio" name=name value=r.as_str() prop:checked=move || residency.get() == r
+                                    // Lowering the rule is an owner decision (also enforced by the server).
+                                    disabled=move || r == Residency::Any && !is_owner && residency.get() != Residency::Any
+                                    on:change=move |_| save(current.get_untracked(), r)/>
+                                <span>{r.label()}</span>
+                            </label>
+                        }
+                    }).collect_view()}
+                </div>
+            </fieldset>
+            <div class="form-section">
+                <h3>"So arbeitet dieses Projekt"</h3>
+                {move || match current.get() {
+                    None => view! { <p class="small muted" data-testid="routing-current">"Standard: Der Agent des Auftrags (bzw. dein Standard-Anbieter) setzt um und prüft. Keine Planung, kein Batch."</p> }.into_any(),
+                    Some(r) => {
+                        let cs = store.connectors.get();
+                        let exec = target_text(r.execute.target.as_ref(), &cs, provider_label, "Standard");
+                        let row = |label: &'static str, mode: Option<StepMode>, t: Option<&Target>| {
+                            let what = match mode {
+                                Some(StepMode::Off) => "aus".to_string(),
+                                _ => format!("{} · {}", target_text(t, &cs, provider_label, "wie Umsetzung"), mode.map(step_mode_label).unwrap_or("Agent")),
+                            };
+                            view! { <li><strong>{label}</strong>" "{what}</li> }
+                        };
+                        view! {
+                            <ul class="routing-steps" data-testid="routing-current">
+                                {row("Planung:", Some(r.plan.mode), r.plan.target.as_ref())}
+                                <li><strong>"Umsetzung:"</strong>" "{exec}{r.execute.flex.then_some(" · Flex (−50 %)")}
+                                    {(!r.execute.escalation.is_empty()).then(|| format!(" · bei Fehlschlag: {}", r.execute.escalation.join(" → ")))}</li>
+                                {row("Prüfung:", Some(r.review.mode), r.review.target.as_ref())}
+                                {row("Analyse bei leerer Warteschlange:", Some(r.analyze.mode), r.analyze.target.as_ref())}
+                            </ul>
+                        }.into_any()
+                    }
+                }}
+            </div>
+            {can_edit.then(|| view! {
+                <div class="form-section">
+                    <h3>"Vorlagen"</h3>
+                    {move || match presets.get() {
+                        None => view! { <p class="small muted" role="status">"Lade Vorlagen …"</p> }.into_any(),
+                        Some(Err(e)) => view! { <p class="alert tone-warning">{e}</p> }.into_any(),
+                        Some(Ok(list)) => view! {
+                            <div class="preset-grid">
+                                {list.into_iter().map(|pr| {
+                                    let active = Memo::new({ let pid = pr.id.clone(); move |_| current.with(|c| c.as_ref().and_then(|r| r.preset.clone()) == Some(pid.clone())) });
+                                    let routing = pr.routing.clone();
+                                    let res = if pr.residency == Residency::Any { None } else { Some(pr.residency) };
+                                    let available = pr.available;
+                                    view! {
+                                        <article class="preset" class:active=move || active.get() data-testid=format!("preset-{}", pr.id)>
+                                            <h4>{pr.label.clone()}</h4>
+                                            <p class="small">{pr.description.clone()}</p>
+                                            {(!pr.estimate.is_empty()).then(|| view! { <p class="small"><strong>{format!("ca. {} pro Versuch", fmt_money_list(&pr.estimate))}</strong>" (mittlerer Auftrag, Annahme)"</p> })}
+                                            {pr.missing.clone().filter(|_| !available).map(|m| view! { <p class="small muted">{m}</p> })}
+                                            <button class="btn sm" type="button" disabled=move || !available || busy.get() || active.get()
+                                                on:click=move |_| save(routing.clone(), res.unwrap_or_else(|| residency.get_untracked()))>
+                                                {move || if active.get() { "Aktiv" } else { "Übernehmen" }}
+                                            </button>
+                                        </article>
+                                    }
+                                }).collect_view()}
+                            </div>
+                            <button class="btn ghost sm" type="button" disabled=move || current.with(Option::is_none) || busy.get()
+                                on:click=move |_| save(None, residency.get_untracked())>"Zurück zum Standard"</button>
+                        }.into_any(),
+                    }}
+                </div>
+            })}
+            <div class="form-section">
+                <h3>"Kosten der letzten 30 Tage"</h3>
+                {move || costs.get().map(|c| view! {
+                    <p data-testid="project-cost"><strong>{fmt_money_list(&c.totals)}</strong>
+                        {(c.unknown_runs > 0).then(|| format!(" · {} Läufe ohne bekannten Preis", c.unknown_runs))}</p>
+                    {(!c.by_model.is_empty()).then(|| view! {
+                        <ul class="small muted">
+                            {c.by_model.iter().take(5).map(|r| view! { <li>{format!("{}: {}", r.label, crate::logic::costs::fmt_money(r.amount, &r.currency))}</li> }).collect_view()}
+                        </ul>
+                    })}
+                })}
+            </div>
+        </section>
+    }
+}
+
 #[component]
 fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
     let store = use_store();
@@ -440,7 +593,8 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
                 .join(", ")
         })
     };
-    let no_cost = not_enforced(|c| c.max_cost);
+    // Live cost guard: the CLI's own limit or live usage priced from the catalog.
+    let no_cost = not_enforced(|c| c.max_cost || c.live_usage);
     let no_turns = not_enforced(|c| c.max_turns);
 
     let save = move |ev: leptos::ev::SubmitEvent| {
@@ -604,7 +758,7 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
                             <Field ids=rp_ids.clone() label="Review-Anbieter" help=help::PROVIDER>
                                 <select id=rp_ids.id.clone() class="select" disabled=!can_edit prop:value=move || review_provider.get() on:change=move |ev| review_provider.set(event_target_value(&ev))>
                                     <option value="">"wie beim Auftrag"</option>
-                                    {store.meta.with_untracked(|m| m.providers.iter().map(|x| view! { <option value=x.clone()>{provider_label(x)}</option> }).collect_view())}
+                                    {store.meta.with_untracked(|m| m.providers.iter().filter(|x| m.credential_kinds.get(*x).is_some_and(|k| !k.is_empty())).map(|x| view! { <option value=x.clone()>{provider_label(x)}</option> }).collect_view())}
                                 </select>
                             </Field>
                             {text(review_model, "Review-Modell", "z. B. ein günstigeres Modell", help::MODEL, "Standard")}
@@ -626,9 +780,9 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
                 </div>
                 {(!no_cost.is_empty() || !no_turns.is_empty()).then(|| view! {
                     <p class="small muted">
-                        {(!no_cost.is_empty()).then(|| format!("Das Kostenlimit wird von {no_cost} nicht erzwungen (keine Kostenangabe der CLI). "))}
+                        {(!no_cost.is_empty()).then(|| format!("Das Kostenlimit wird bei {no_cost} erst nach dem Lauf geprüft (keine Verbrauchsdaten während des Laufs). "))}
                         {(!no_turns.is_empty()).then(|| format!("Das Turn-Limit wird von {no_turns} nicht unterstützt. "))}
-                        "Tokens dieser Anbieter werden erst nach dem Lauf geprüft – eine Überschreitung blockiert den Auftrag dann nachträglich. Kosten sind Schätzungen der CLI."
+                        "Tokens dieser Anbieter werden erst nach dem Lauf geprüft – eine Überschreitung blockiert den Auftrag dann nachträglich. Kosten werden aus den Tokens und der Preistabelle berechnet."
                     </p>
                 })}
             </section>

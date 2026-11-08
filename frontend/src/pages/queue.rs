@@ -11,7 +11,7 @@ use crate::logic::task::{failure_tag, finished_key, first_line, retry_hint};
 use crate::nav::{set_title, use_open_task};
 use crate::store::{tz, use_store, Store, ToastAction};
 use crate::ui::dialog::Confirm;
-use crate::ui::{Ic, Icon, StatusIcon, Tag};
+use crate::ui::{HelpTip, Ic, Icon, StatusIcon, StatusPill, Tag};
 
 use super::composer::Composer;
 use super::onboarding::{Onboarding, OnboardingState};
@@ -50,6 +50,7 @@ pub fn QueuePage() -> impl IntoView {
         })
     };
     let running = by(|s| s == TaskStatus::Running);
+    let waiting_batch = by(|s| s == TaskStatus::WaitingBatch);
     let attention = by(TaskStatus::needs_user);
     let queued = Memo::new(move |_| {
         let mut q: Vec<Task> = store.tasks.with(|ts| {
@@ -134,6 +135,16 @@ pub fn QueuePage() -> impl IntoView {
                     <h2 id="sec-running">"Läuft gerade"</h2>
                 </div>
                 <For each=move || running.get() key=row_key children=move |t| view! { <RunningCard t=t/> }/>
+            </section>
+        })}
+
+        {move || (!waiting_batch.with(Vec::is_empty)).then(|| view! {
+            <section class="section" aria-labelledby="sec-batch">
+                <div class="section-head">
+                    <h2 id="sec-batch">"Beim Anbieter"</h2>
+                    <HelpTip topic="Beim Anbieter" text=status_help(TaskStatus::WaitingBatch)/>
+                </div>
+                <For each=move || waiting_batch.get() key=row_key children=move |t| view! { <BatchCard t=t/> }/>
             </section>
         })}
 
@@ -268,10 +279,8 @@ fn RowMeta(t: Task) -> impl IntoView {
     let store = use_store();
     let pid = t.project_id;
     let project = move || store.project_name(pid);
-    let provider = match &t.model {
-        Some(m) => format!("{} · {m}", provider_label(&t.provider)),
-        None => provider_label(&t.provider),
-    };
+    let provider =
+        crate::logic::costs::access_text(&t, &store.connectors.get_untracked(), provider_label);
     let tt = t.clone();
     view! {
         <div class="meta">
@@ -428,6 +437,43 @@ fn RunningCard(t: Task) -> impl IntoView {
             <Steps phase=phase.into()/>
             {move || activity.get().map(|a| view! {
                 <p class="activity live"><Icon icon=Ic::Terminal class="sm"/><span>{a}</span></p>
+            })}
+        </article>
+    }
+}
+
+/// A task whose plan/review/analysis step waits for the provider.
+#[component]
+fn BatchCard(t: Task) -> impl IntoView {
+    let store = use_store();
+    let open = use_open_task();
+    let id = t.id;
+    let since = t.updated_at;
+    let activity = Memo::new(move |_| {
+        store
+            .last_event
+            .with(|m| m.get(&id).map(|e| first_line(&e.content, 160)))
+    });
+    let tc = t.clone();
+    view! {
+        <article class="card running-card" data-status="waiting_batch" data-task=id.to_string()>
+            <div class="head">
+                <StatusIcon status=TaskStatus::WaitingBatch/>
+                <div class="item-body grow">
+                    <button class="open" type="button" on:click=move |_| open(id)>{t.title.clone()}</button>
+                    <div class="row wrap">{kind_tags(&t)}<StatusPill status=TaskStatus::WaitingBatch/></div>
+                    <RowMeta t=t.clone()/>
+                </div>
+                <span class="pill tone-info" aria-label="Wartezeit">
+                    <Icon icon=Ic::Clock class="sm"/>
+                    {move || duration(Some(since), None, store.now.get())}
+                </span>
+                <button class="btn icon-only danger" type="button" title="Abbrechen" aria-label="Abbrechen" on:click=move |_| confirm_cancel_running(store, &tc)>
+                    <Icon icon=Ic::X/>
+                </button>
+            </div>
+            {move || activity.get().map(|a| view! {
+                <p class="activity"><Icon icon=Ic::Info class="sm"/><span>{a}</span></p>
             })}
         </article>
     }
