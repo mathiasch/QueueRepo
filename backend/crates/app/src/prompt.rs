@@ -2,6 +2,7 @@
 //! exactly the task + the handoff it needs, nothing more. The static parts are
 //! stable so provider-side prompt caching can kick in.
 use crate::models::{Project, Task};
+use queued_common::gate::GateFinding;
 
 pub const MAX_HANDOFF: usize = 4000;
 pub const MAX_DIFF: usize = 60_000;
@@ -94,12 +95,41 @@ pub fn fix_prompt(original_title: &str, original_prompt: &str, failure: &str) ->
     )
 }
 
-pub fn review(task: &Task, summary: &str, diff: &str) -> String {
+/// Review rubric (report P0.8: visible tests are trivially saturated; the
+/// reviewer must look for gaming, not only for bugs).
+pub const REVIEW_RUBRIC: &str = "Check, in this order:\n1. Is the task actually fulfilled (not only claimed in the summary)?\n2. Were tests, assertions, verify scripts, CI configuration or snapshots weakened, deleted, skipped (skip/xfail/ignore/only) or special-cased so that checks pass without the real behaviour?\n3. Hard-coded results, test-specific branches, mocked-out logic or swallowed errors that only make checks green?\n4. Bugs, security issues (secrets in code, injection, unsafe defaults), broken builds?\n5. Changes outside the scope of the task?\nReject if any of 1–4 applies; style nits are not defects.";
+
+fn approved_notes(approved: &[GateFinding]) -> String {
+    if approved.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("\n### Gate findings a human approved\nThe queue held these changes and a human approved them anyway. Judge whether they are justified by the task:\n");
+    for f in approved.iter().take(20) {
+        s.push_str(&format!(
+            "- {}{}{}\n",
+            queued_api::gate::finding_title(f.kind),
+            if f.path.is_empty() {
+                String::new()
+            } else {
+                format!(" – {}", f.path)
+            },
+            if f.detail.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", f.detail)
+            }
+        ));
+    }
+    s
+}
+
+pub fn review(task: &Task, summary: &str, diff: &str, approved: &[GateFinding]) -> String {
     format!(
-        "You are a strict code reviewer. Another agent just worked on the task below; its changes are in the current directory.\n\n### Task\n{}\n\n### Agent summary\n{}\n\n### Diff\n```diff\n{}\n```\n\nCheck: is the task fulfilled, are there bugs, security issues or broken builds? Inspect files only where the diff is unclear. Do NOT modify any files except `.queue/review.json`.\nWrite `.queue/review.json`: {{\"approved\":true|false,\"issues\":[\"concrete, actionable issue\", …]}}\nApprove unless there are real defects or the task is not fulfilled; style nits are not defects.",
+        "You are a strict code reviewer. Another agent just worked on the task below; its changes are in the current directory.\n\n### Task\n{}\n\n### Agent summary\n{}\n\n### Diff\n```diff\n{}\n```\n{}\n{REVIEW_RUBRIC}\nInspect files only where the diff is unclear. Do NOT modify any files except `.queue/review.json`.\nWrite `.queue/review.json`: {{\"approved\":true|false,\"issues\":[\"concrete, actionable issue\", …]}}",
         cut(task.prompt.trim(), 6000),
         cut(summary.trim(), 2000),
-        cut(diff, MAX_DIFF)
+        cut(diff, MAX_DIFF),
+        approved_notes(approved),
     )
 }
 
@@ -217,7 +247,7 @@ pub fn plan_request(task: &Task, parent: Option<&Parent>) -> String {
 /// Review step as one request: the answer must be the review JSON.
 pub fn review_request(task: &Task, summary: &str, diff: &str) -> String {
     format!(
-        "You are a strict code reviewer. Another agent worked on the task below.\n\n### Task\n{}\n\n### Agent summary\n{}\n\n### Diff\n```diff\n{}\n```\n\nCheck: is the task fulfilled, are there bugs, security issues or broken builds? Approve unless there are real defects or the task is not fulfilled; style nits are not defects.\nAnswer ONLY with JSON: {{\"approved\":true|false,\"issues\":[\"concrete, actionable issue\", …]}}",
+        "You are a strict code reviewer. Another agent worked on the task below.\n\n### Task\n{}\n\n### Agent summary\n{}\n\n### Diff\n```diff\n{}\n```\n\n{REVIEW_RUBRIC}\nAnswer ONLY with JSON: {{\"approved\":true|false,\"issues\":[\"concrete, actionable issue\", …]}}",
         cut(task.prompt.trim(), 6000),
         cut(summary.trim(), 2000),
         cut(diff, MAX_DIFF)
@@ -280,6 +310,11 @@ mod tests {
             routing: None,
             data_residency: "any".into(),
             is_eval: false,
+            trust_repo_config: false,
+            protected_paths: None,
+            test_guard: true,
+            setup_guard: true,
+            secret_allowlist: vec![],
         }
     }
 
@@ -323,6 +358,8 @@ mod tests {
             escalation_level: 0,
             plan: None,
             cost: None,
+            gate: None,
+            allow_test_changes: false,
         }
     }
 
@@ -384,9 +421,29 @@ mod tests {
     #[test]
     fn review_prompt_truncates_large_diffs() {
         let diff = "+x\n".repeat(MAX_DIFF);
-        let p = review(&task("x", ""), "sum", &diff);
+        let p = review(&task("x", ""), "sum", &diff, &[]);
         assert!(p.len() < MAX_DIFF + 10_000);
         assert!(p.contains(".queue/review.json"));
+    }
+
+    #[test]
+    fn review_prompt_has_rubric_and_approved_findings() {
+        use queued_common::gate::{FindingKind, GateFinding};
+        let p = review(&task("x", ""), "sum", "+a", &[]);
+        assert!(p.contains("strict code reviewer"), "mock relies on it");
+        assert!(p.contains("weakened, deleted, skipped"));
+        assert!(!p.contains("Gate findings"));
+        let f = GateFinding {
+            kind: FindingKind::ProtectedChanged,
+            path: "tests/a.py".into(),
+            line: None,
+            detail: "geändert".into(),
+            fingerprint: None,
+        };
+        let p = review(&task("x", ""), "sum", "+a", &[f]);
+        assert!(p.contains("Gate findings a human approved"));
+        assert!(p.contains("Geschützte Datei geändert – tests/a.py (geändert)"));
+        assert!(review_request(&task("x", ""), "s", "+a").contains("Hard-coded results"));
     }
 
     #[test]

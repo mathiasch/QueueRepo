@@ -116,6 +116,7 @@ async fn run_script(
         egress: Default::default(),
         cache: None,
         secret_env: vec![],
+        home_env: vec![],
     };
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -193,14 +194,21 @@ pub async fn start(
         if !run_script(st, pid, "setup", &case.setup).await? {
             anyhow::bail!("setup of eval case {} failed", case.id);
         }
-        st.runner
+        let committed = st
+            .runner
             .commit(
                 pid,
                 &format!("eval setup: {}", case.id),
                 "queue-eval",
                 "eval@localhost",
+                &[],
             )
             .await?;
+        anyhow::ensure!(
+            committed.blocked.is_empty(),
+            "eval case {} setup contains a possible secret",
+            case.id
+        );
         let exec = match routing::resolve_execute(
             st,
             user,
@@ -240,6 +248,7 @@ pub async fn start(
                 limits: Default::default(),
                 connector_id: exec.connector_id,
                 escalation_level: 0,
+                allow_test_changes: false,
             },
         )
         .await?;

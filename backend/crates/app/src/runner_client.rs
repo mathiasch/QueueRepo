@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
-use queued_common::*;
+use queued_common::{gate, *};
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -102,27 +102,103 @@ impl RunnerClient {
         Ok(())
     }
 
-    pub async fn begin(&self, ws: Uuid, remote: Option<GitRemote>) -> Result<BeginResult> {
-        self.post(self.url(ws, "/begin"), &BeginTask { remote })
-            .await
+    pub async fn begin(
+        &self,
+        ws: Uuid,
+        remote: Option<GitRemote>,
+        allow: &[String],
+    ) -> Result<BeginResult> {
+        self.post(
+            self.url(ws, "/begin"),
+            &BeginTask {
+                remote,
+                allow: allow.to_vec(),
+            },
+        )
+        .await
     }
 
+    /// Commits unless the changes contain a secret outside `allow`.
     pub async fn commit(
         &self,
         ws: Uuid,
         message: &str,
         author_name: &str,
         author_email: &str,
-    ) -> Result<String> {
+        allow: &[String],
+    ) -> Result<CommitOutcome> {
         let req = CommitRequest {
             message: message.into(),
             author_name: author_name.into(),
             author_email: author_email.into(),
+            allow: allow.to_vec(),
         };
-        Ok(self
-            .post::<_, Sha>(self.url(ws, "/commit"), &req)
-            .await?
-            .sha)
+        self.post(self.url(ws, "/commit"), &req).await
+    }
+
+    /// Gate check of the working tree (WP03).
+    pub async fn inspect(
+        &self,
+        ws: Uuid,
+        req: &gate::InspectRequest,
+    ) -> Result<gate::InspectResult> {
+        self.post(self.url(ws, "/inspect"), req).await
+    }
+
+    /// Parks the working tree under `refs/queue/held/<task>`.
+    pub async fn hold(&self, ws: Uuid, task: Uuid, base: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .post(
+                self.url(ws, "/hold"),
+                &gate::HoldRequest {
+                    task: task.simple().to_string(),
+                    base: base.to_string(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn release(&self, ws: Uuid, req: &gate::ReleaseRequest) -> Result<CommitOutcome> {
+        self.post(self.url(ws, "/release"), req).await
+    }
+
+    pub async fn held_diff(&self, ws: Uuid, task: Uuid) -> Result<DiffResult> {
+        self.get(self.url(ws, &format!("/held/{}", task.simple())))
+            .await
+    }
+
+    pub async fn discard_held(&self, ws: Uuid, task: Uuid) -> Result<()> {
+        let r = self
+            .http
+            .delete(self.url(ws, &format!("/held/{}", task.simple())))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("runner unreachable")?;
+        Self::check(r).await?;
+        Ok(())
+    }
+
+    pub async fn baseline_check(
+        &self,
+        ws: Uuid,
+        req: &gate::BaselineCheck,
+    ) -> Result<gate::BaselineResult> {
+        self.post(self.url(ws, "/baseline/check"), req).await
+    }
+
+    pub async fn baseline_approve(&self, ws: Uuid, name: &str, sha: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .post(
+                self.url(ws, "/baseline/approve"),
+                &gate::BaselineApprove {
+                    name: name.into(),
+                    sha: sha.into(),
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn diff(
@@ -212,9 +288,8 @@ impl RunnerClient {
         Ok(Self::check(r).await?.json().await?)
     }
 
-    pub async fn push(&self, ws: Uuid, remote: GitRemote) -> Result<PushResult> {
-        self.post(self.url(ws, "/push"), &PushRequest { remote })
-            .await
+    pub async fn push(&self, ws: Uuid, req: &PushRequest) -> Result<PushResult> {
+        self.post(self.url(ws, "/push"), req).await
     }
 
     pub async fn log(&self, ws: Uuid, limit: usize) -> Result<Vec<Commit>> {

@@ -5,7 +5,12 @@
 //! `POST /v1/exec` answers with a stream of NDJSON [`ExecFrame`]s.
 use serde::{Deserialize, Serialize};
 
+pub mod gate;
+pub mod glob;
 pub mod net;
+#[cfg(feature = "scan")]
+pub mod secrets;
+pub use gate::{CommitOutcome, FindingKind, GateFinding};
 pub use net::{EgressPolicy, EgressVerdict, NetMode};
 
 pub const API_PREFIX: &str = "/v1";
@@ -34,6 +39,10 @@ pub struct BeginTask {
     /// Pull (fast-forward only) before the task if set.
     #[serde(default)]
     pub remote: Option<GitRemote>,
+    /// Approved secret fingerprints of the project: leftovers are committed
+    /// as WIP only if they contain no other secret (else quarantined).
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +58,9 @@ pub struct CommitRequest {
     pub message: String,
     pub author_name: String,
     pub author_email: String,
+    /// Approved secret fingerprints; any other secret blocks the commit.
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,12 +100,27 @@ pub struct ImportResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PushRequest {
     pub remote: GitRemote,
+    /// Push exactly this commit (default: HEAD).
+    #[serde(default)]
+    pub sha: Option<String>,
+    /// A human approved pushing to the remote's default branch.
+    #[serde(default)]
+    pub allow_protected: bool,
+    /// Approved secret fingerprints for the scan of the pushed commits.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// A human approved the push as a whole (skips the secret scan).
+    #[serde(default)]
+    pub allow_secrets: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PushResult {
     pub ok: bool,
     pub output: String,
+    /// Nothing was pushed: the push needs a human decision.
+    #[serde(default)]
+    pub held: Vec<GateFinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +172,11 @@ pub struct ExecRequest {
     /// them after the run ([`ExecFrame::Exit::leaks`]).
     #[serde(default)]
     pub secret_env: Vec<String>,
+    /// Variables whose value is a path inside the run's private $HOME
+    /// (`(name, home-relative path)`); the runner prefixes the home path the
+    /// process sees (container or host).
+    #[serde(default)]
+    pub home_env: Vec<(String, String)>,
 }
 
 /// Dependency cache of a setup run. The runner derives the key from

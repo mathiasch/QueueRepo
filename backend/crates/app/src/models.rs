@@ -15,6 +15,7 @@ pub mod status {
     pub const RUNNING: &str = "running";
     pub const WAITING_BATCH: &str = "waiting_batch";
     pub const WAITING_INPUT: &str = "waiting_input";
+    pub const HELD: &str = "held";
     pub const DONE: &str = "done";
     pub const FAILED: &str = "failed";
     pub const BLOCKED: &str = "blocked";
@@ -49,6 +50,12 @@ pub struct Project {
     pub data_residency: String,
     /// Project created by an eval run (hidden from the project list).
     pub is_eval: bool,
+    /// WP03 protection settings.
+    pub trust_repo_config: bool,
+    pub protected_paths: Option<Vec<String>>,
+    pub test_guard: bool,
+    pub setup_guard: bool,
+    pub secret_allowlist: Vec<String>,
 }
 
 impl Project {
@@ -56,6 +63,13 @@ impl Project {
         self.routing
             .as_ref()
             .and_then(|r| serde_json::from_value(r.clone()).ok())
+    }
+
+    /// Effective protected path globs.
+    pub fn protected(&self) -> Vec<String> {
+        self.protected_paths
+            .clone()
+            .unwrap_or_else(queued_api::gate::default_protected)
     }
 
     pub fn residency(&self) -> Residency {
@@ -187,7 +201,8 @@ mod tests {
 
     #[test]
     fn failure_class_roundtrip_matches_db_check() {
-        let sql = include_str!("../migrations/0003_cli_contract_limits.sql");
+        // The current CHECK lives in the newest migration that redefines it.
+        let sql = include_str!("../migrations/0006_gate.sql");
         for c in FailureClass::ALL {
             assert_eq!(FailureClass::parse(c.as_str()), Some(c));
             assert!(

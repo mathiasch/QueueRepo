@@ -2124,8 +2124,10 @@ dependencies = [
 name = "queued-common"
 version = "0.2.0"
 dependencies = [
+ "regex",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

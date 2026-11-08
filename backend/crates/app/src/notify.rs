@@ -21,6 +21,15 @@ pub async fn notify(st: &AppState, user_id: Uuid, n: Note<'_>) {
 
 async fn notify_inner(st: &AppState, user_id: Uuid, n: &Note<'_>) -> anyhow::Result<()> {
     let id = Uuid::new_v4();
+    // Notifications leave the server (ntfy, Web Push): never with a token.
+    let redacted = Note {
+        kind: n.kind,
+        title: queued_common::secrets::redact(&n.title),
+        body: queued_common::secrets::redact(&n.body),
+        task_id: n.task_id,
+        push: n.push,
+    };
+    let n = &redacted;
     sqlx::query("INSERT INTO notifications (id, user_id, kind, title, body, task_id) VALUES ($1,$2,$3,$4,$5,$6)")
         .bind(id)
         .bind(user_id)

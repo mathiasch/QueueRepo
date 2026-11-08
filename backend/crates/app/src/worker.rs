@@ -221,7 +221,7 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
     }
     let busy: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM tasks WHERE user_id=$1
-                        AND status IN ('queued','running','waiting_batch','waiting_input','pending_approval'))",
+                        AND status IN ('queued','running','waiting_batch','waiting_input','pending_approval','held'))",
     )
     .bind(s.user_id)
     .fetch_one(&st.db)
@@ -308,6 +308,7 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
             limits: Default::default(),
             connector_id,
             escalation_level: 0,
+            allow_test_changes: false,
         },
     )
     .await?;

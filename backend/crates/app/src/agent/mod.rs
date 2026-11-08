@@ -145,6 +145,8 @@ pub struct Invocation {
     pub writeback: Option<String>,
     /// Files placed in `<workspace>/.queue/` before the run (e.g. schemas).
     pub queue_files: Vec<(String, String)>,
+    /// Variables pointing into the run's $HOME (`(name, home-relative path)`).
+    pub home_env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +371,7 @@ pub fn invocation(
         home_files: vec![],
         writeback: None,
         queue_files: vec![],
+        home_env: vec![],
     };
     match provider {
         "claude" => claude::invocation(&mut inv, model, cred, limits, kind)?,
@@ -379,6 +382,64 @@ pub fn invocation(
         p => bail!("unknown provider {p}"),
     }
     Ok(inv)
+}
+
+/// Gemini system settings (highest precedence, above the workspace settings
+/// a trusted folder would load): no hooks, no tool discovery/call commands,
+/// no MCP server command, no `.env` from the project directory. From the
+/// 0.67.0 bundle: `mergeSettings` (system merged last), `loadCliConfig`
+/// (`enableHooks: settings.hooksConfig.enabled`, `toolDiscoveryCommand`,
+/// `mcpServerCommand`), `findEnvFile` (`advanced.ignoreLocalEnv`).
+pub const GEMINI_SYSTEM_SETTINGS: &str = r#"{"hooksConfig":{"enabled":false},"tools":{"discoveryCommand":"","callCommand":""},"mcp":{"serverCommand":""},"advanced":{"ignoreLocalEnv":true}}"#;
+pub const GEMINI_SYSTEM_SETTINGS_FILE: &str = ".gemini/queue-system-settings.json";
+
+/// WP03: keep the CLI from running configuration out of the repository
+/// (hooks, MCP servers, settings with `env`/helpers, plugins) unless the
+/// project owner trusts it. Codex needs nothing: it loads the project
+/// `.codex/config.toml` only for trusted projects, and Queue never marks a
+/// workspace as trusted (strings of the 0.167.0 binary; not executed).
+pub fn restrict_repo_config(inv: &mut Invocation, provider: &str) {
+    match provider {
+        // `--setting-sources user`: no `.claude/settings{,.local}.json` of the
+        // project; `--strict-mcp-config` without `--mcp-config`: no `.mcp.json`
+        // (both in `--help` of the installed 2.1.319).
+        "claude" => inv
+            .args
+            .extend(["--setting-sources", "user", "--strict-mcp-config"].map(String::from)),
+        "gemini" => {
+            inv.home_files.push((
+                GEMINI_SYSTEM_SETTINGS_FILE.into(),
+                GEMINI_SYSTEM_SETTINGS.into(),
+            ));
+            inv.home_env.push((
+                "GEMINI_CLI_SYSTEM_SETTINGS_PATH".into(),
+                GEMINI_SYSTEM_SETTINGS_FILE.into(),
+            ));
+            // MCP servers are allowed only under this unguessable name, so
+            // none of the workspace's servers start (`isBlockedBySettings`).
+            inv.args.extend([
+                "--allowed-mcp-server-names".into(),
+                format!("queue-none-{}", uuid::Uuid::new_v4().simple()),
+            ]);
+        }
+        // Disables project `opencode.json(c)`, `.opencode/` (plugins, agents,
+        // commands) and project AGENTS.md (`ConfigPaths`, 1.19.5).
+        "opencode" => inv
+            .env
+            .push(("OPENCODE_DISABLE_PROJECT_CONFIG".into(), "1".into())),
+        _ => {}
+    }
+}
+
+/// Repository files a CLI loads even when Queue restricts its configuration
+/// (watched by the `agent-config` baseline): Gemini must trust the workspace
+/// to run tools headless and then always reads `.gemini/.env` (0.67.0
+/// `findEnvFile`), which may set variables Queue did not set.
+pub fn always_loaded_config(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "gemini" => &[".gemini/.env"],
+        _ => &[],
+    }
 }
 
 pub(crate) fn trunc(s: &str, n: usize) -> String {
@@ -478,6 +539,100 @@ pub fn parse_line(provider: &str, line: &str, st: &mut ParseState) -> Vec<AgentE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_config_is_restricted_per_cli() {
+        let none = RunLimits::default();
+        let inv = |p: &str, kind: &str| {
+            let mut i = invocation(
+                p,
+                None,
+                &Credential::legacy(kind, "k"),
+                &none,
+                RunKind::Agent,
+            )
+            .unwrap();
+            let before = i.args.clone();
+            restrict_repo_config(&mut i, p);
+            (before, i)
+        };
+        let (before, c) = inv("claude", "api_key");
+        assert_eq!(c.args.len(), before.len() + 3);
+        let joined = c.args.join(" ");
+        assert!(
+            joined.contains("--setting-sources user --strict-mcp-config"),
+            "{joined}"
+        );
+        assert!(!c.args.contains(&"--mcp-config".to_string()));
+        assert!(
+            !c.args.contains(&"--bare".to_string()),
+            "--bare would ignore OAuth tokens"
+        );
+
+        let (_, g) = inv("gemini", "api_key");
+        let settings = g
+            .home_files
+            .iter()
+            .find(|(p, _)| p == GEMINI_SYSTEM_SETTINGS_FILE)
+            .map(|(_, c)| serde_json::from_str::<Value>(c).unwrap())
+            .unwrap();
+        assert_eq!(settings["hooksConfig"]["enabled"], false);
+        assert_eq!(settings["advanced"]["ignoreLocalEnv"], true);
+        assert_eq!(settings["tools"]["discoveryCommand"], "");
+        assert_eq!(
+            g.home_env,
+            vec![(
+                "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
+                GEMINI_SYSTEM_SETTINGS_FILE.to_string()
+            )]
+        );
+        let i = g
+            .args
+            .iter()
+            .position(|a| a == "--allowed-mcp-server-names")
+            .unwrap();
+        assert!(g.args[i + 1].starts_with("queue-none-") && g.args[i + 1].len() > 30);
+        // Unguessable per run.
+        let (_, g2) = inv("gemini", "api_key");
+        let j = g2
+            .args
+            .iter()
+            .position(|a| a == "--allowed-mcp-server-names")
+            .unwrap();
+        assert_ne!(g.args[i + 1], g2.args[j + 1]);
+        // Trust stays on (headless tools need it); the user settings are untouched.
+        assert!(g
+            .env
+            .contains(&("GEMINI_CLI_TRUST_WORKSPACE".into(), "true".into())));
+
+        let mut o = invocation(
+            "opencode",
+            Some("mistral-large-4"),
+            &Credential {
+                kind: "connector:mistral".into(),
+                secret: "k".into(),
+                conn: Some(ConnCfg {
+                    id: None,
+                    kind: "mistral".into(),
+                    label: "m".into(),
+                    config: serde_json::json!({}),
+                    flex: false,
+                }),
+            },
+            &none,
+            RunKind::Agent,
+        )
+        .unwrap();
+        restrict_repo_config(&mut o, "opencode");
+        assert!(o
+            .env
+            .contains(&("OPENCODE_DISABLE_PROJECT_CONFIG".into(), "1".into())));
+
+        let (before, x) = inv("codex", "api_key");
+        assert_eq!(x.args, before, "codex never trusts the workspace by itself");
+        assert_eq!(always_loaded_config("gemini"), &[".gemini/.env"]);
+        assert!(always_loaded_config("claude").is_empty());
+    }
 
     #[test]
     fn egress_hosts_per_access() {

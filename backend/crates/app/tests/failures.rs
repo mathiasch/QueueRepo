@@ -426,12 +426,24 @@ async fn review_rate_limit_pauses_review_provider(pool: PgPool) {
     )
     .await;
     let t = a.task(&p, "MOCK_REVIEW_LIMIT change").await;
-    a.wait_status(&t, &["done"]).await;
-    let ev = a.events_of(&t).await;
-    assert!(
-        has_event(&ev, "review", "Review übersprungen: rate_limit"),
-        "{ev:?}"
+    // WP03 (WP01-N1): the review is retried as its own phase, never skipped
+    // to `done`; the paused provider keeps the task waiting in the queue.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let tj = loop {
+        let tj = a.task_json(&t).await;
+        if tj["task"]["gate"]["resume"] == "review" && tj["task"]["status"] == "queued" {
+            break tj;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{tj}");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    };
+    assert_eq!(
+        tj["task"]["gate"]["findings"][0]["kind"],
+        "review_unavailable"
     );
+    let ev = a.events_of(&t).await;
+    assert!(has_event(&ev, "review", "nur das Review wird"), "{ev:?}");
+    assert!(!has_event(&ev, "status", "Erledigt"), "{ev:?}");
     let l = a.limit("mock").await;
     assert!(!l["limited_until"].is_null(), "{l}");
     assert_eq!(l["blocked"], true);

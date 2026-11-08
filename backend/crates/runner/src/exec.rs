@@ -153,6 +153,30 @@ pub fn build_command(
     cmd
 }
 
+/// `ExecRequest::home_env`: absolute paths inside the HOME the process sees
+/// (`/home/agent` in containers, the run's home directory with engine `none`).
+pub fn home_env(
+    cfg: &RunnerConfig,
+    req: &ExecRequest,
+    home: &Path,
+) -> Result<Vec<(String, String)>> {
+    let base = match cfg.engine {
+        Engine::None => home.display().to_string(),
+        _ => "/home/agent".to_string(),
+    };
+    req.home_env
+        .iter()
+        .map(|(k, rel)| {
+            anyhow::ensure!(safe_rel(rel), "invalid home path");
+            anyhow::ensure!(
+                !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "invalid variable name"
+            );
+            Ok((k.clone(), format!("{base}/{rel}")))
+        })
+        .collect()
+}
+
 /// CLIs probed by `GET /v1/cli-status`: a fixed list (no caller input).
 /// `agy` = Antigravity, the reported successor of the Gemini CLI.
 pub const PROBED_CLIS: [&str; 5] = ["claude", "codex", "gemini", "opencode", "agy"];
@@ -184,6 +208,7 @@ pub async fn probe(cfg: &RunnerConfig) -> Result<Vec<CliProbe>> {
             egress: Default::default(),
             cache: None,
             secret_env: vec![],
+            home_env: vec![],
         };
         let mut cmd = build_command(cfg, &req, &ws, &home, &Sandbox::default());
         let version = match tokio::time::timeout(Duration::from_secs(20), cmd.output()).await {
@@ -450,6 +475,7 @@ async fn run_inner(
             sb.cache_dir = Some(c.dir.clone());
         }
     }
+    sb.env.extend(home_env(cfg, req, &home)?);
     let proxy = start_egress(cfg, req, egress_dir, tx, &mut sb).await?;
 
     let mut child = build_command(cfg, req, &workspace, &home, &sb)
@@ -630,6 +656,7 @@ mod tests {
             egress: Default::default(),
             cache: None,
             secret_env: vec![],
+            home_env: vec![],
         }
     }
 
@@ -649,6 +676,46 @@ mod tests {
             v.push(f);
         }
         v
+    }
+
+    #[tokio::test]
+    async fn home_env_points_into_the_run_home() {
+        let t = tempfile::tempdir().unwrap();
+        let c = cfg(t.path(), Engine::None);
+        let mut r = req(
+            "sh",
+            &[
+                "-c",
+                r#"echo "$GEMINI_CLI_SYSTEM_SETTINGS_PATH"; cat "$GEMINI_CLI_SYSTEM_SETTINGS_PATH""#,
+            ],
+        );
+        r.home_files = vec![(".gemini/s.json".into(), "{\"a\":1}".into())];
+        r.home_env = vec![(
+            "GEMINI_CLI_SYSTEM_SETTINGS_PATH".into(),
+            ".gemini/s.json".into(),
+        )];
+        let frames = collect(&c, r, CancellationToken::new()).await;
+        let out: Vec<String> = frames
+            .iter()
+            .filter_map(|f| match f {
+                ExecFrame::Out { line } => Some(line.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(out[0].ends_with("/home/.gemini/s.json"), "{out:?}");
+        assert_eq!(out[1], "{\"a\":1}");
+        // Containers see the fixed home path; traversal is refused.
+        let dc = cfg(t.path(), Engine::Docker);
+        let mut r2 = req("x", &[]);
+        r2.home_env = vec![("P".into(), "a/b".into())];
+        assert_eq!(
+            home_env(&dc, &r2, t.path()).unwrap(),
+            vec![("P".to_string(), "/home/agent/a/b".to_string())]
+        );
+        r2.home_env = vec![("P".into(), "../x".into())];
+        assert!(home_env(&dc, &r2, t.path()).is_err());
+        r2.home_env = vec![("A=B".into(), "x".into())];
+        assert!(home_env(&dc, &r2, t.path()).is_err());
     }
 
     #[tokio::test]

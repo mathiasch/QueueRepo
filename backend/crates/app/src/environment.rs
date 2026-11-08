@@ -115,6 +115,14 @@ pub async fn secret_infos(db: &sqlx::PgPool, project: Uuid) -> sqlx::Result<Vec<
 }
 
 /// Decrypted secrets of a project (only ever sent to the setup phase).
+/// The project has at least one secret (setup runs with secrets).
+pub async fn has_secrets(st: &AppState, project: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM project_secrets WHERE project_id=$1)")
+        .bind(project)
+        .fetch_one(&st.db)
+        .await
+}
+
 pub async fn secret_values(st: &AppState, project: Uuid) -> anyhow::Result<Vec<(String, String)>> {
     let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
         "SELECT name, value_enc FROM project_secrets WHERE project_id=$1 ORDER BY name",

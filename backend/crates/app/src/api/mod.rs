@@ -1,6 +1,7 @@
 mod credentials;
 mod environment;
 mod evals;
+mod gate;
 pub mod limits;
 mod projects;
 mod providers;
@@ -132,6 +133,10 @@ pub fn router(st: AppState) -> Router {
         .route("/tasks/{id}/move", post(tasks::move_task))
         .route("/tasks/{id}/diff", get(tasks::diff))
         .route("/tasks/{id}/revert", post(tasks::revert))
+        .route("/tasks/{id}/gate/approve", post(gate::approve))
+        .route("/tasks/{id}/gate/reject", post(gate::reject))
+        .route("/tasks/{id}/gate/diff", get(gate::diff))
+        .route("/projects/{id}/protection", get(gate::get).put(gate::put))
         // Unknown API paths get a JSON 404 instead of the SPA's index.html.
         .fallback(|| async { AppError::not_found() });
 

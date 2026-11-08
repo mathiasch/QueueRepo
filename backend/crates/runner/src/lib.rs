@@ -18,7 +18,7 @@ use axum::{
 };
 use exec::Engine;
 use futures::StreamExt;
-use queued_common::*;
+use queued_common::{gate, *};
 use serde::Deserialize;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -110,6 +110,11 @@ impl RunnerState {
             .clone()
     }
 
+    /// Key of the secret fingerprints (stable as long as the token is).
+    pub fn scan_key(&self) -> &[u8] {
+        self.cfg.token.as_bytes()
+    }
+
     fn repo(&self, id: &str) -> Result<Repo, ApiErr> {
         if !valid_name(id) {
             return Err(ApiErr(
@@ -174,6 +179,15 @@ pub fn router(st: RunnerState) -> Router {
             post(import).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
         )
         .route("/workspaces/{id}/push", post(push))
+        .route("/workspaces/{id}/inspect", post(inspect))
+        .route("/workspaces/{id}/hold", post(hold))
+        .route("/workspaces/{id}/release", post(release))
+        .route(
+            "/workspaces/{id}/held/{task}",
+            get(held_diff).delete(discard_held),
+        )
+        .route("/workspaces/{id}/baseline/check", post(baseline_check))
+        .route("/workspaces/{id}/baseline/approve", post(baseline_approve))
         .route("/workspaces/{id}/log", get(log))
         .route("/workspaces/{id}/queue/{name}", get(queue_file))
         .route("/exec", post(exec_start))
@@ -254,22 +268,111 @@ async fn begin(
     let repo = existing(&st, &id)?;
     let l = st.lock(&id).await;
     let _g = l.lock().await;
-    Ok(Json(repo.begin(req.remote.as_ref()).await?))
+    Ok(Json(
+        repo.begin(req.remote.as_ref(), st.scan_key(), &req.allow)
+            .await?,
+    ))
 }
 
+/// Commits unless the changes contain a secret outside `allow` (WP03).
 async fn commit(
     State(st): State<RunnerState>,
     Path(id): Path<String>,
     Json(req): Json<CommitRequest>,
-) -> R<Json<Sha>> {
+) -> R<Json<CommitOutcome>> {
     let repo = existing(&st, &id)?;
     let l = st.lock(&id).await;
     let _g = l.lock().await;
-    Ok(Json(Sha {
-        sha: repo
-            .commit(&req.message, &req.author_name, &req.author_email)
-            .await?,
-    }))
+    Ok(Json(
+        repo.commit_checked(
+            &req.message,
+            &req.author_name,
+            &req.author_email,
+            st.scan_key(),
+            &req.allow,
+        )
+        .await?,
+    ))
+}
+
+async fn inspect(
+    State(st): State<RunnerState>,
+    Path(id): Path<String>,
+    Json(req): Json<gate::InspectRequest>,
+) -> R<Json<gate::InspectResult>> {
+    let repo = existing(&st, &id)?;
+    let l = st.lock(&id).await;
+    let _g = l.lock().await;
+    Ok(Json(repo.inspect(&req, st.scan_key()).await?))
+}
+
+async fn hold(
+    State(st): State<RunnerState>,
+    Path(id): Path<String>,
+    Json(req): Json<gate::HoldRequest>,
+) -> R<Json<serde_json::Value>> {
+    let repo = existing(&st, &id)?;
+    let l = st.lock(&id).await;
+    let _g = l.lock().await;
+    let r = repo.hold(&req.task, &req.base).await?;
+    Ok(Json(serde_json::json!({ "ref": r })))
+}
+
+async fn release(
+    State(st): State<RunnerState>,
+    Path(id): Path<String>,
+    Json(req): Json<gate::ReleaseRequest>,
+) -> R<Json<CommitOutcome>> {
+    let repo = existing(&st, &id)?;
+    let l = st.lock(&id).await;
+    let _g = l.lock().await;
+    Ok(Json(repo.release(&req, st.scan_key()).await?))
+}
+
+async fn held_diff(
+    State(st): State<RunnerState>,
+    Path((id, task)): Path<(String, String)>,
+) -> R<Json<DiffResult>> {
+    let repo = existing(&st, &id)?;
+    let (diff, changed) = repo
+        .held_diff(&task, 2_000_000)
+        .await
+        .map_err(|e| ApiErr(StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    Ok(Json(DiffResult { diff, changed }))
+}
+
+async fn discard_held(
+    State(st): State<RunnerState>,
+    Path((id, task)): Path<(String, String)>,
+) -> R<Json<serde_json::Value>> {
+    let repo = existing(&st, &id)?;
+    let l = st.lock(&id).await;
+    let _g = l.lock().await;
+    repo.discard(&task).await?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn baseline_check(
+    State(st): State<RunnerState>,
+    Path(id): Path<String>,
+    Json(req): Json<gate::BaselineCheck>,
+) -> R<Json<gate::BaselineResult>> {
+    let repo = existing(&st, &id)?;
+    let l = st.lock(&id).await;
+    let _g = l.lock().await;
+    Ok(Json(repo.baseline_check(&req).await?))
+}
+
+async fn baseline_approve(
+    State(st): State<RunnerState>,
+    Path(id): Path<String>,
+    Json(req): Json<gate::BaselineApprove>,
+) -> R<Json<serde_json::Value>> {
+    let repo = existing(&st, &id)?;
+    let l = st.lock(&id).await;
+    let _g = l.lock().await;
+    repo.baseline_approve(&req).await?;
+    Ok(Json(serde_json::json!({"ok": true})))
 }
 
 #[derive(Deserialize)]
@@ -370,11 +473,23 @@ async fn push(
     let repo = existing(&st, &id)?;
     let l = st.lock(&id).await;
     let _g = l.lock().await;
-    Ok(Json(match repo.push(&req.remote).await {
-        Ok(output) => PushResult { ok: true, output },
+    let opt = git::PushOptions {
+        sha: req.sha.as_deref(),
+        allow_protected: req.allow_protected,
+        allow: &req.allow,
+        allow_secrets: req.allow_secrets,
+        key: st.scan_key(),
+    };
+    Ok(Json(match repo.push_checked(&req.remote, &opt).await {
+        Ok(o) => PushResult {
+            ok: o.held.is_empty(),
+            output: o.output,
+            held: o.held,
+        },
         Err(e) => PushResult {
             ok: false,
             output: format!("{e:#}"),
+            held: vec![],
         },
     }))
 }
@@ -603,6 +718,7 @@ mod tests {
             egress: Default::default(),
             cache: None,
             secret_env: vec![],
+            home_env: vec![],
         };
         let body = c
             .post(format!("{a}/v1/exec"))

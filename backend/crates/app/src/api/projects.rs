@@ -524,7 +524,26 @@ pub async fn push(
     let p = load(&st, id).await?;
     let remote =
         project_remote(&st, &p).ok_or_else(|| AppError::bad_request("no git remote configured"))?;
-    let r = st.runner.push(id, remote).await.map_err(runner_err)?;
+    // A person clicked "Push": that approves the target branch. The secret
+    // scan of the pushed commits still applies (WP03).
+    let req = queued_common::PushRequest {
+        remote,
+        sha: None,
+        allow_protected: true,
+        allow: p.secret_allowlist.clone(),
+        allow_secrets: false,
+    };
+    let r = st.runner.push(id, &req).await.map_err(runner_err)?;
+    if !r.held.is_empty() {
+        return Err(AppError::conflict(format!(
+            "Push blockiert – mögliches Geheimnis in noch nicht hochgeladenen Commits: {}. Bitte entfernen (neuer Commit reicht nicht, der alte Commit enthält es weiterhin) oder außerhalb von Queue pushen.",
+            r.held
+                .iter()
+                .map(|f| format!("{} ({})", f.detail, f.path))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )));
+    }
     if !r.ok {
         return Err(AppError::bad_request(format!("push failed: {}", r.output)));
     }

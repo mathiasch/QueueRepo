@@ -30,6 +30,10 @@ use crate::{
     state::AppState,
 };
 use queued_api::{add_money, StepCost, StepMode, Target, TaskCost};
+use queued_common::{gate::GateFinding, secrets};
+
+#[path = "runner_gate.rs"]
+mod gate;
 
 /// Agent-generated tasks deeper than this always need approval (loop guard).
 const MAX_AUTO_DEPTH: i32 = 3;
@@ -115,7 +119,7 @@ async fn block_running(
 ) -> bool {
     let n = sqlx::query(
         "UPDATE tasks SET status='blocked', failure_class=$2, error=$3, usage=$4, not_before=NULL,
-                finished_at=now(), updated_at=now()
+                gate=NULL, gate_pending=NULL, finished_at=now(), updated_at=now()
          WHERE id=$1 AND status='running'",
     )
     .bind(id)
@@ -162,6 +166,7 @@ fn class_label(c: FailureClass) -> &'static str {
         FailureClass::LimitTokens => "Limit: Tokens",
         FailureClass::LimitTurns => "Limit: Turns",
         FailureClass::Cancelled => "abgebrochen",
+        FailureClass::Gate => "Freigabe abgelehnt",
     }
 }
 
@@ -245,6 +250,8 @@ pub(crate) struct RunOutcome {
     pub cli_limit: Option<LimitKind>,
     pub guard_limit: Option<LimitKind>,
     pub structured: Option<Value>,
+    /// Token formats seen in the agent's output (masked, WP03).
+    pub log_findings: Vec<GateFinding>,
     /// Runner unreachable / stream interrupted / process could not start.
     pub infra_error: Option<String>,
     pub stderr_tail: String,
@@ -614,6 +621,32 @@ async fn run_inner(
     .await;
 
     let routing = project.routing();
+    let remote = project_remote(st, &project);
+    let env = environment::load(&st.db, project.id).await?;
+    let commits = Committer {
+        st,
+        task,
+        project_id: project.id,
+        author_name: &author_name,
+        author_email: &author_email,
+        allow: &project.secret_allowlist,
+    };
+    // Approved gate (WP03): continue where the task was held.
+    if let Some(g) = task.gate_parsed().filter(|g| g.resume.is_some()) {
+        let flow = gate::Flow {
+            st,
+            task,
+            project: &project,
+            settings: &settings,
+            env: &env,
+            lim: &lim,
+            routing: routing.as_ref(),
+            remote: remote.clone(),
+            cancel,
+            commits: &commits,
+        };
+        return gate::resume(&flow, g, usage).await;
+    }
     // Flex applies to the agent loop of the routing's own access.
     let exec_flex = routing.as_ref().is_some_and(|r| {
         r.execute.flex
@@ -665,10 +698,16 @@ async fn run_inner(
         }
     }
 
-    let remote = project_remote(st, &project);
     let before = prepare_workspace(st, task, &project, remote.clone()).await?;
-    let env = environment::load(&st.db, project.id).await?;
     if env.has_setup() {
+        // WP02-N1: the setup runs repository code with the secrets – only on
+        // setup files a human approved.
+        if project.setup_guard
+            && environment::has_secrets(st, project.id).await?
+            && gate::check_setup(st, task, &project, &env, usage).await?
+        {
+            return Ok(());
+        }
         match run_setup(st, task, &project, &env, cancel).await? {
             SetupOutcome::Ready => {}
             SetupOutcome::Cancelled => {
@@ -683,6 +722,9 @@ async fn run_inner(
                 return Ok(());
             }
         }
+    }
+    if gate::check_agent_config(st, task, &project, &acc.provider, usage).await? {
+        return Ok(());
     }
     let prompt = build_prompt(st, task, &project, &settings).await?;
     let meter = meter_for(
@@ -710,19 +752,13 @@ async fn run_inner(
             used_before: usage,
             meter,
             env: &env,
+            trust_repo_config: project.trust_repo_config,
         },
         cancel,
     )
     .await?;
     record_run_usage(st, task, &acc, &out, usage).await?;
 
-    let commits = Committer {
-        st,
-        task,
-        project_id: project.id,
-        author_name: &author_name,
-        author_email: &author_email,
-    };
     let user_cancel = cancel.is_cancelled();
     let contract = if early(&out, user_cancel, &acc.provider, &lim, usage).is_none() {
         let file = st.runner.queue_file(project.id, "result.json").await?;
@@ -752,162 +788,53 @@ async fn run_inner(
     let Some(next) = interrupted(&commits, &acc, disposition, &lim, usage).await? else {
         return Ok(());
     };
-    let (result, mut failure) = next.into_result(&out);
+    let (result, failure) = next.into_result(&out);
     let summary = result
         .summary
         .clone()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| cut(&out.final_text, 1500));
     let handoff = result.handoff.clone().map(|h| cut(&h, prompt::MAX_HANDOFF));
-
-    let after = commits.commit("").await?;
-    set_snapshot_after(st, task.id, &after).await?;
-
-    if failure.is_none()
-        && result.status.as_deref() == Some("needs_input")
-        && !result.questions.is_empty()
-    {
-        finish(
-            st,
-            task.id,
-            Finish {
-                status: status::WAITING_INPUT,
-                summary: Some(summary),
-                handoff,
-                error: None,
-                review: None,
-                questions: Some(json!(result.questions)),
-                usage,
-                failure_class: None,
-            },
-        )
-        .await?;
-        notify(
-            st,
-            task.user_id,
-            Note {
-                kind: "question",
-                title: format!("Rückfrage: {}", task.title),
-                body: result.questions.join("\n"),
-                task_id: Some(task.id),
-                push: true,
-            },
-        )
-        .await;
-        return Ok(());
-    }
-
-    let mut review_json = None;
-    if failure.is_none() && task.kind != "onempty" {
-        if let Some(cmd) = project
-            .verify_command
-            .as_deref()
-            .filter(|c| !c.trim().is_empty())
-        {
-            event(st, task, "verify", &format!("$ {cmd}")).await;
-            let verdict = run_verify(st, task, cmd, cancel, &env).await?;
-            if cancel.is_cancelled() {
-                // A user cancel stops the verify command – not a task failure.
-                finish_cancelled(st, task.id, Some(summary), handoff, usage).await?;
-                return Ok(());
-            }
-            if let Err(msg) = verdict {
-                failure = Some(format!("Verifikation `{cmd}` fehlgeschlagen:\n{msg}"));
-            }
-        }
-        let review_route = routing.as_ref().map(|r| r.review.clone());
-        if failure.is_none() && project.review_enabled && before != after {
-            if let Some(route) = review_route
-                .as_ref()
-                .filter(|r| matches!(r.mode, StepMode::Sync | StepMode::Batch))
-            {
-                let pending = PendingReview {
-                    summary: summary.clone(),
-                    handoff: handoff.clone(),
-                    follow_ups: result.follow_up_tasks.clone(),
-                    before: before.clone(),
-                    after: after.clone(),
-                };
-                if defer_review(
-                    st,
-                    task,
-                    &project,
-                    routing.as_ref().expect("route"),
-                    route,
-                    &pending,
-                    usage,
-                )
-                .await?
-                {
-                    return Ok(());
-                }
-            }
-            match run_review(
-                st,
-                task,
-                &project,
-                ReviewCtx {
-                    before: &before,
-                    after: &after,
-                    summary: &summary,
-                    route: review_route
-                        .as_ref()
-                        .filter(|r| r.mode == StepMode::Harness),
-                    exec: &acc,
-                    env: &env,
-                },
-                cancel,
-                usage,
-                &lim,
-            )
-            .await?
-            {
-                ReviewOutcome::Reviewed(r) => {
-                    if !r.approved {
-                        failure = Some(format!("Review abgelehnt:\n- {}", r.issues.join("\n- ")));
-                    }
-                    review_json = Some(json!(r));
-                }
-                ReviewOutcome::Skipped(why) => {
-                    let msg = if why.is_empty() {
-                        "Review übersprungen".to_string()
-                    } else {
-                        format!("Review übersprungen: {why}")
-                    };
-                    event(st, task, "review", &msg).await
-                }
-                ReviewOutcome::Cancelled => {
-                    finish_cancelled(st, task.id, Some(summary), handoff, usage).await?;
-                    return Ok(());
-                }
-                ReviewOutcome::Blocked(class, reason) => {
-                    event(st, task, "guard", &reason).await;
-                    if block_running(st, task.id, class, &reason, usage).await {
-                        notify_blocked(st, task, &reason).await;
-                    }
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    let end = End {
+    let pending = gate::Pending {
         summary,
         handoff,
-        review: review_json,
-        usage,
+        follow_ups: result.follow_up_tasks.clone(),
+        failure,
+        questions: if result.status.as_deref() == Some("needs_input") {
+            result.questions.clone()
+        } else {
+            vec![]
+        },
+        before: before.clone(),
+        after: None,
+        approved: vec![],
+        review: None,
     };
-    match failure {
-        None => {
-            if project.auto_push && before != after {
-                if let Some(r) = remote {
-                    push(st, task, &project, r).await?;
-                }
-            }
-            finish_done(st, task, &settings, end, result.follow_up_tasks).await
-        }
-        Some(f) => finish_failed(st, task, &settings, end, &f).await,
+    let flow = gate::Flow {
+        st,
+        task,
+        project: &project,
+        settings: &settings,
+        env: &env,
+        lim: &lim,
+        routing: routing.as_ref(),
+        remote,
+        cancel,
+        commits: &commits,
+    };
+    // WP03: secrets, protected paths and weakened tests are checked before
+    // anything is committed, verified, reviewed or pushed.
+    if gate::check_changes(&flow, &pending, &out.log_findings, usage).await? {
+        return Ok(());
     }
+    let Some(after) = gate::commit(&flow, &pending, usage).await? else {
+        return Ok(());
+    };
+    let pending = gate::Pending {
+        after: Some(after),
+        ..pending
+    };
+    gate::after_commit(&flow, pending, Some(&acc), gate::Step::Verify, usage).await
 }
 
 /// `init` + `begin` (pull, WIP commit of leftovers) and the task's diff base.
@@ -926,7 +853,10 @@ async fn prepare_workspace(
             },
         )
         .await?;
-    let begin = st.runner.begin(project.id, remote).await?;
+    let begin = st
+        .runner
+        .begin(project.id, remote, &project.secret_allowlist)
+        .await?;
     for w in &begin.warnings {
         event(st, task, "status", &format!("git: {w}")).await;
     }
@@ -1194,32 +1124,6 @@ async fn meter_for(st: &AppState, a: &RunAccess, model: Option<&str>, step: &'st
     )
 }
 
-async fn push(st: &AppState, task: &Task, project: &Project, r: GitRemote) -> anyhow::Result<()> {
-    let p = st.runner.push(project.id, r).await?;
-    event(
-        st,
-        task,
-        if p.ok { "status" } else { "error" },
-        &format!("git push: {}", if p.ok { "ok" } else { &p.output }),
-    )
-    .await;
-    if !p.ok {
-        notify(
-            st,
-            task.user_id,
-            Note {
-                kind: "push_failed",
-                title: format!("Push fehlgeschlagen: {}", project.name),
-                body: cut(&p.output, 400),
-                task_id: Some(task.id),
-                push: false,
-            },
-        )
-        .await;
-    }
-    Ok(())
-}
-
 /// What the end of the result flow records on the task.
 struct End<'a> {
     summary: String,
@@ -1358,6 +1262,8 @@ struct Committer<'a> {
     project_id: Uuid,
     author_name: &'a str,
     author_email: &'a str,
+    /// Approved secret fingerprints of the project.
+    allow: &'a [String],
 }
 
 impl Committer<'_> {
@@ -1368,7 +1274,8 @@ impl Committer<'_> {
         )
     }
 
-    async fn commit(&self, suffix: &str) -> anyhow::Result<String> {
+    /// Commit through the runner's secret scanner (WP03).
+    async fn commit(&self, suffix: &str) -> anyhow::Result<queued_common::CommitOutcome> {
         self.st
             .runner
             .commit(
@@ -1376,6 +1283,7 @@ impl Committer<'_> {
                 &self.message(suffix),
                 self.author_name,
                 self.author_email,
+                self.allow,
             )
             .await
     }
@@ -1395,7 +1303,25 @@ impl Committer<'_> {
     /// run's `begin` commits leftovers as WIP anyway.
     async fn partial(&self, suffix: String) -> Option<String> {
         match self.commit(&suffix).await {
-            Ok(sha) => Some(sha),
+            Ok(o) if o.blocked.is_empty() => Some(o.sha),
+            Ok(o) => {
+                // The leftovers stay uncommitted; the next `begin` quarantines them.
+                event(
+                    self.st,
+                    self.task,
+                    "gate",
+                    &format!(
+                        "Teil-Commit nicht angelegt – mögliches Geheimnis: {}",
+                        o.blocked
+                            .iter()
+                            .map(|f| format!("{} ({})", f.detail, f.path))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                )
+                .await;
+                None
+            }
             Err(err) => {
                 tracing::warn!("task {}: partial commit failed: {err:#}", self.task.id);
                 None
@@ -1707,6 +1633,8 @@ struct RunSpec<'a> {
     meter: Meter,
     /// Project environment: variables and the agent network policy.
     env: &'a Env,
+    /// The owner allows the CLI to load configuration from the repository.
+    trust_repo_config: bool,
 }
 
 async fn agent_run(
@@ -1741,8 +1669,11 @@ async fn agent_run(
         }
         None => spec.cred,
     };
-    let inv = agent::invocation(spec.provider, spec.model, cred, &run_limits, spec.kind)
+    let mut inv = agent::invocation(spec.provider, spec.model, cred, &run_limits, spec.kind)
         .map_err(|e| RunError::Config(format!("{e:#}")))?;
+    if !spec.trust_repo_config {
+        agent::restrict_repo_config(&mut inv, spec.provider);
+    }
     let mut unsupported = vec![];
     if spec.limits.turns.is_some() && !caps.max_turns {
         unsupported.push("Turn-Limit");
@@ -1799,6 +1730,7 @@ async fn agent_run(
         egress,
         cache: None,
         secret_env: vec![],
+        home_env: inv.home_env.clone(),
         home_files: inv.home_files.clone(),
         read_back: inv.writeback.iter().cloned().collect(),
         stdin: Some(spec.prompt),
@@ -1825,10 +1757,30 @@ async fn agent_run(
         let mut o = RunOutcome::default();
         let mut stderr_events = 0;
         let mut elog = EgressLog::new(phase);
+        let scan_log = spec.kind == RunKind::Agent;
+        let key = st.cfg.master_key;
+        let seen_log = |o: &mut RunOutcome, text: &str| {
+            if !scan_log {
+                return;
+            }
+            for h in secrets::scan_high_confidence(text) {
+                let f = GateFinding {
+                    kind: queued_common::FindingKind::SecretInLog,
+                    path: String::new(),
+                    line: None,
+                    detail: h.masked(text),
+                    fingerprint: Some(secrets::fingerprint(&key, h.rule, h.value(text))),
+                };
+                if o.log_findings.len() < 20 && !o.log_findings.contains(&f) {
+                    o.log_findings.push(f);
+                }
+            }
+        };
         while let Some(frame) = rx.recv().await {
             match frame {
                 f @ ExecFrame::Egress { .. } => elog.on(st, task, &f).await,
                 ExecFrame::Out { line } => {
+                    seen_log(&mut o, &line);
                     for ev in agent::parse_line(provider, &line, &mut ps) {
                         match ev {
                             AgentEvent::Text(t) if !t.trim().is_empty() => {
@@ -1891,6 +1843,7 @@ async fn agent_run(
                     }
                 }
                 ExecFrame::Err { line } => {
+                    seen_log(&mut o, &line);
                     o.stderr_tail.push_str(&line);
                     o.stderr_tail.push('\n');
                     if o.stderr_tail.len() > 8000 {
@@ -2038,6 +1991,7 @@ async fn run_setup(
         egress,
         cache,
         secret_env: secrets.iter().map(|(n, _)| n.clone()).collect(),
+        home_env: vec![],
     };
     let values: Vec<String> = secrets.into_iter().map(|(_, v)| v).collect();
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(512);
@@ -2153,6 +2107,7 @@ async fn run_verify(
         egress: env.verify_policy(),
         cache: None,
         secret_env: vec![],
+        home_env: vec![],
     };
     let enforced = environment::sandbox(st).await.egress_enforced;
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(512);
@@ -2205,8 +2160,12 @@ async fn run_verify(
 
 enum ReviewOutcome {
     Reviewed(ReviewResult),
-    /// Review not possible (reason for the log); the task continues.
-    Skipped(String),
+    /// Review not possible. `retry`: transient (provider/infra/pause), the
+    /// review phase is retried; otherwise a human decides (WP03, WP01-N1).
+    Unavailable {
+        why: String,
+        retry: bool,
+    },
     Cancelled,
     Blocked(FailureClass, String),
 }
@@ -2220,6 +2179,29 @@ struct ReviewCtx<'a> {
     /// Access of the agent loop (default reviewer).
     exec: &'a RunAccess,
     env: &'a Env,
+    /// Gate findings a human approved (context for the reviewer).
+    approved: &'a [GateFinding],
+}
+
+/// Another legacy provider (not `exclude`) with stored credentials that the
+/// data-residency rule allows and that is neither paused nor out of budget.
+async fn other_reviewer(
+    st: &AppState,
+    user: Uuid,
+    project: &Project,
+    exclude: &str,
+) -> anyhow::Result<Option<String>> {
+    for p in ["claude", "codex", "gemini"] {
+        if p == exclude || !st.cfg.providers().contains(&p) {
+            continue;
+        }
+        if let AccessResult::Ok(a) = access_for(st, user, project, None, p, false).await? {
+            if !access_blocked(st, user, &a).await? {
+                return Ok(Some(p.to_string()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Reviewer target: routing route, legacy review provider, or the access
@@ -2261,7 +2243,42 @@ async fn run_review(
     usage: &mut Usage,
     lim: &EffectiveLimits,
 ) -> Result<ReviewOutcome, RunError> {
-    let (connector, provider, model) = review_target(task, project, rc.route);
+    let (mut connector, mut provider, mut model) = review_target(task, project, rc.route);
+    // Without an explicit reviewer: prefer another provider than the one
+    // that implemented (self-preference of LLM judges, report P0.8).
+    let explicit = rc.route.is_some_and(|r| r.target.is_some())
+        || project
+            .review_provider
+            .as_deref()
+            .is_some_and(|p| !p.is_empty());
+    if !explicit {
+        match other_reviewer(st, task.user_id, project, &rc.exec.provider).await? {
+            Some(p) => {
+                event(
+                    st,
+                    task,
+                    "review",
+                    &format!(
+                        "Review durch einen anderen Anbieter ({p}) als die Umsetzung ({})",
+                        rc.exec.provider
+                    ),
+                )
+                .await;
+                connector = None;
+                provider = p;
+                model = None;
+            }
+            None => {
+                event(
+                    st,
+                    task,
+                    "review",
+                    "Review durch denselben Anbieter – kein anderer Zugang verfügbar",
+                )
+                .await
+            }
+        }
+    }
     let same = connector == rc.exec.connector_id && provider == rc.exec.provider;
     let acc_owned;
     let acc: &RunAccess = if same && connector.is_some() {
@@ -2272,7 +2289,12 @@ async fn run_review(
                 acc_owned = a;
                 &acc_owned
             }
-            AccessResult::Missing(_) => return Ok(ReviewOutcome::Skipped(String::new())),
+            AccessResult::Missing(m) => {
+                return Ok(ReviewOutcome::Unavailable {
+                    why: m,
+                    retry: false,
+                })
+            }
             // Residency or a vanished access must never be skipped silently.
             AccessResult::Denied(msg) => {
                 return Ok(ReviewOutcome::Blocked(
@@ -2283,7 +2305,10 @@ async fn run_review(
         }
     };
     if access_blocked(st, task.user_id, acc).await? {
-        return Ok(ReviewOutcome::Skipped(String::new()));
+        return Ok(ReviewOutcome::Unavailable {
+            why: format!("{} ist pausiert oder das Budget ist erschöpft", acc.label),
+            retry: true,
+        });
     }
     event(st, task, "review", &format!("Review via {}", acc.label)).await;
     let diff = st
@@ -2299,13 +2324,14 @@ async fn run_review(
             provider: &acc.provider,
             model: model.as_deref(),
             cred: &acc.cred,
-            prompt: prompt::review(task, rc.summary, &diff),
+            prompt: prompt::review(task, rc.summary, &secrets::redact(&diff), rc.approved),
             kind: RunKind::Review,
             label: "review",
             limits: lim,
             used_before: usage,
             meter,
             env: rc.env,
+            trust_repo_config: project.trust_repo_config,
         },
         cancel,
     )
@@ -2313,9 +2339,10 @@ async fn run_review(
     {
         Ok(o) => o,
         Err(RunError::Config(msg)) => {
-            return Ok(ReviewOutcome::Skipped(format!(
-                "Konfigurationsfehler: {msg}"
-            )))
+            return Ok(ReviewOutcome::Unavailable {
+                why: format!("Konfigurationsfehler: {msg}"),
+                retry: false,
+            })
         }
         Err(e) => return Err(e),
     };
@@ -2329,8 +2356,20 @@ async fn run_review(
             Disposition::Blocked { class, reason } => {
                 ReviewOutcome::Blocked(class, format!("{reason} (Review)"))
             }
-            Disposition::Requeue { class, .. } => ReviewOutcome::Skipped(class.as_str().into()),
-            _ => ReviewOutcome::Skipped(String::new()),
+            Disposition::Requeue { class, reason } => ReviewOutcome::Unavailable {
+                why: format!("{}: {}", class_label(class), cut(&reason, 300)),
+                retry: true,
+            },
+            Disposition::RateLimited(_) | Disposition::AuthPaused(_) => {
+                ReviewOutcome::Unavailable {
+                    why: format!("{} ist pausiert (Limit/Anmeldung)", acc.label),
+                    retry: true,
+                }
+            }
+            _ => ReviewOutcome::Unavailable {
+                why: "Review-Lauf abgebrochen".into(),
+                retry: true,
+            },
         });
     }
     let file = st.runner.queue_file(project.id, "review.json").await?;
@@ -2362,13 +2401,21 @@ async fn run_review(
         }
     }
     if review.is_none() {
-        if let Some((c, _)) = &out.failure {
-            return Ok(ReviewOutcome::Skipped(c.class().as_str().into()));
+        if let Some((c, msg)) = &out.failure {
+            return Ok(ReviewOutcome::Unavailable {
+                why: format!("{}: {}", class_label(c.class()), cut(msg, 300)),
+                retry: c.class().is_transient()
+                    || matches!(
+                        c.class(),
+                        FailureClass::RateLimit | FailureClass::ProviderAuth
+                    ),
+            });
         }
-        if caps.structured_output {
-            return Ok(ReviewOutcome::Skipped("kein Review-Ergebnis".into()));
-        }
-        return Ok(ReviewOutcome::Skipped(String::new()));
+        let _ = caps;
+        return Ok(ReviewOutcome::Unavailable {
+            why: "der Review-Agent hat kein Ergebnis geliefert".into(),
+            retry: true,
+        });
     }
     let r = review.expect("checked");
     event(
@@ -2636,7 +2683,18 @@ pub(crate) async fn complete_review(
         .fetch_one(&st.db)
         .await?;
     let settings = queue::load_settings(st, task.user_id).await?;
-    let (review, failure) = match outcome {
+    let mut pending = gate::Pending {
+        summary: p.summary,
+        handoff: p.handoff,
+        follow_ups: p.follow_ups,
+        failure: None,
+        questions: vec![],
+        before: p.before,
+        after: Some(p.after),
+        approved: vec![],
+        review: None,
+    };
+    let res = match outcome {
         Ok(r) => {
             event(
                 st,
@@ -2649,31 +2707,31 @@ pub(crate) async fn complete_review(
                 },
             )
             .await;
-            let failure =
+            pending.failure =
                 (!r.approved).then(|| format!("Review abgelehnt:\n- {}", r.issues.join("\n- ")));
-            (Some(json!(r)), failure)
+            pending.review = Some(json!(r));
+            gate::finish_flow(st, task, &project, &settings, pending, None, usage).await
         }
+        // WP01-N1: a review that did not happen never ends as `done`.
         Err(why) => {
-            event(st, task, "review", &format!("Review übersprungen: {why}")).await;
-            (None, None)
+            gate::hold(
+                st,
+                task,
+                queued_api::gate::GateStage::Review,
+                vec![GateFinding {
+                    kind: queued_common::FindingKind::ReviewUnavailable,
+                    path: String::new(),
+                    line: None,
+                    detail: why,
+                    fingerprint: None,
+                }],
+                &pending,
+                None,
+                false,
+                usage,
+            )
+            .await
         }
-    };
-    let end = End {
-        summary: p.summary,
-        handoff: p.handoff,
-        review,
-        usage,
-    };
-    let res = match failure {
-        None => {
-            if project.auto_push && p.before != p.after {
-                if let Some(r) = project_remote(st, &project) {
-                    push(st, task, &project, r).await?;
-                }
-            }
-            finish_done(st, task, &settings, end, p.follow_ups).await
-        }
-        Some(f) => finish_failed(st, task, &settings, end, &f).await,
     };
     res.map_err(|e| match e {
         RunError::Config(m) => anyhow::anyhow!(m),
@@ -2831,6 +2889,7 @@ async fn create_followups(
                 limits: TaskLimits::default(),
                 connector_id,
                 escalation_level: 0,
+                allow_test_changes: false,
             },
         )
         .await?;
@@ -2932,6 +2991,7 @@ async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Resu
             limits: TaskLimits::of(failed),
             connector_id: failed.connector_id,
             escalation_level: level,
+            allow_test_changes: false,
         },
     )
     .await?;

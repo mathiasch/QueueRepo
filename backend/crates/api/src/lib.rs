@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 mod costs;
 pub mod env;
+pub mod gate;
 mod providers;
 pub use costs::*;
 pub use providers::*;
@@ -107,6 +108,8 @@ pub enum TaskStatus {
     /// (batch API or synchronous call). Occupies no slot, locks no project.
     WaitingBatch,
     WaitingInput,
+    /// A gate holds the task until a human decides (WP03, see `Task::gate`).
+    Held,
     Done,
     Failed,
     Blocked,
@@ -114,12 +117,13 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
-    pub const ALL: [TaskStatus; 9] = [
+    pub const ALL: [TaskStatus; 10] = [
         Self::PendingApproval,
         Self::Queued,
         Self::Running,
         Self::WaitingBatch,
         Self::WaitingInput,
+        Self::Held,
         Self::Done,
         Self::Failed,
         Self::Blocked,
@@ -133,6 +137,7 @@ impl TaskStatus {
             Self::Running => "running",
             Self::WaitingBatch => "waiting_batch",
             Self::WaitingInput => "waiting_input",
+            Self::Held => "held",
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Blocked => "blocked",
@@ -154,7 +159,10 @@ impl TaskStatus {
 
     /// The user has to do something (answer or approve).
     pub fn needs_user(self) -> bool {
-        matches!(self, Self::WaitingInput | Self::PendingApproval)
+        matches!(
+            self,
+            Self::WaitingInput | Self::PendingApproval | Self::Held
+        )
     }
 
     /// Title, prompt, context, provider and limits may still be changed.
@@ -173,6 +181,7 @@ impl TaskStatus {
                 | Self::Running
                 | Self::WaitingBatch
                 | Self::WaitingInput
+                | Self::Held
         )
     }
 
@@ -204,10 +213,12 @@ pub enum FailureClass {
     LimitTokens,
     LimitTurns,
     Cancelled,
+    /// A human rejected a gate (WP03): changes discarded or task stopped.
+    Gate,
 }
 
 impl FailureClass {
-    pub const ALL: [FailureClass; 12] = [
+    pub const ALL: [FailureClass; 13] = [
         Self::Task,
         Self::RateLimit,
         Self::ProviderTransient,
@@ -220,6 +231,7 @@ impl FailureClass {
         Self::LimitTokens,
         Self::LimitTurns,
         Self::Cancelled,
+        Self::Gate,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -236,6 +248,7 @@ impl FailureClass {
             Self::LimitTokens => "limit_tokens",
             Self::LimitTurns => "limit_turns",
             Self::Cancelled => "cancelled",
+            Self::Gate => "gate",
         }
     }
 
@@ -334,6 +347,13 @@ pub struct Task {
     /// [`TaskCost`] as JSON, see [`Task::cost_parsed`].
     #[serde(default)]
     pub cost: Option<Value>,
+    /// [`gate::TaskGate`] as JSON while a gate holds the task (WP03).
+    #[serde(default)]
+    pub gate: Option<Value>,
+    /// Created by a human as test task: changes to protected paths and
+    /// tests need no approval (agent-created tasks never get this).
+    #[serde(default)]
+    pub allow_test_changes: bool,
 }
 
 impl Task {
@@ -357,6 +377,12 @@ impl Task {
             .as_ref()
             .and_then(|q| serde_json::from_value(q.clone()).ok())
             .unwrap_or_default()
+    }
+
+    pub fn gate_parsed(&self) -> Option<gate::TaskGate> {
+        self.gate
+            .as_ref()
+            .and_then(|g| serde_json::from_value(g.clone()).ok())
     }
 
     pub fn review_result(&self) -> Option<ReviewResult> {
@@ -452,6 +478,9 @@ pub struct CreateTask {
     pub connector_id: Option<Uuid>,
     #[serde(default)]
     pub front: bool,
+    /// Test task: may change protected paths/tests without approval.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_test_changes: bool,
     #[serde(flatten)]
     pub limits: TaskLimitFields,
 }
@@ -882,7 +911,8 @@ mod tests {
             "updated_at": "2026-01-01T10:00:00Z", "max_runtime_secs": 60, "max_cost_usd": null,
             "max_tokens": null, "max_turns": 3, "failure_class": "limit_tokens",
             "transient_retries": 0, "not_before": null,
-            "connector_id": null, "escalation_level": 0, "plan": null, "cost": null
+            "connector_id": null, "escalation_level": 0, "plan": null, "cost": null,
+            "gate": null, "allow_test_changes": false
         })
     }
 
@@ -946,6 +976,7 @@ mod tests {
             parent_id: None,
             connector_id: None,
             front: true,
+            allow_test_changes: false,
             limits: TaskLimitFields {
                 max_runtime_secs: Some(Some(90)),
                 ..Default::default()

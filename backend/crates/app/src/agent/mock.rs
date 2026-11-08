@@ -11,7 +11,12 @@
 //! codex/gemini that report usage only at the end), MOCK_SOLUTION_B64:<b64>
 //! (runs the decoded shell script in the workspace – eval set, see `eval.rs`),
 //! MOCK_ENV (writes the names of its environment variables to MOCK_ENV.txt),
-//! MOCK_NET:<url> (fetches the URL through the run's egress proxy, WP02).
+//! MOCK_NET:<url> (fetches the URL through the run's egress proxy, WP02),
+//! WP03: MOCK_SECRET (writes a freshly generated fake GitHub token into
+//! `config/credentials.py`), MOCK_SECRET_LOG (prints such a token),
+//! MOCK_SELF_COMMIT (commits a fake token itself), MOCK_EDIT_TEST (changes
+//! the existing `tests/test_core.py`), MOCK_SKIP_TEST (adds a skipped test),
+//! MOCK_REVIEW_DOWN (the review run always fails transiently).
 use serde_json::Value;
 
 use super::{
@@ -29,6 +34,7 @@ case "$P" in
   *"strict code reviewer"*)
     case "$P" in
       *MOCK_REVIEW_LIMIT*) echo '{"type":"error","category":"rate_limit","text":"usage limit reached|'$(( $(date +%s) + 120 ))'"}'; exit 1;;
+      *MOCK_REVIEW_DOWN*) echo '{"type":"error","category":"overloaded","text":"API Error: 529 overloaded"}'; exit 1;;
     esac
     echo '{"approved":true,"issues":[]}' > .queue/review.json
     echo '{"type":"final","text":"review ok"}'; exit 0;;
@@ -55,6 +61,18 @@ case "$P" in
 esac
 case "$P" in
   *MOCK_ENV*) env | cut -d= -f1 | sort > MOCK_ENV.txt;;
+esac
+fake_token() { printf 'gh%s_%s' p "$(head -c 400 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 36)"; }
+case "$P" in
+  *MOCK_SECRET_LOG*) echo '{"type":"text","text":"found key '"$(fake_token)"' in env"}';;
+  *MOCK_SECRET*) mkdir -p config; echo "GITHUB_TOKEN = \"$(fake_token)\"" > config/credentials.py;;
+esac
+case "$P" in
+  *MOCK_SELF_COMMIT*) echo "token: $(fake_token)" > leaked.txt; git add leaked.txt; git -c user.name=a -c user.email=a@x commit -q -m "agent commit";;
+esac
+case "$P" in
+  *MOCK_EDIT_TEST*) mkdir -p tests; echo 'WEAKENED = True' >> tests/test_core.py;;
+  *MOCK_SKIP_TEST*) mkdir -p tests; printf 'import pytest\n\n@pytest.mark.skip\ndef test_later():\n    assert False\n' > tests/test_skip.py;;
 esac
 case "$P" in
   *MOCK_NET:*) U=$(printf '%s\n' "$P" | sed -n 's/.*MOCK_NET:\([^ ]*\).*/\1/p' | head -n 1)

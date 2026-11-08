@@ -146,6 +146,11 @@ pub(crate) mod tests {
             routing: None,
             data_residency: "any".into(),
             is_eval: false,
+            trust_repo_config: false,
+            protected_paths: None,
+            test_guard: true,
+            setup_guard: true,
+            secret_allowlist: vec![],
         }
     }
 
@@ -189,6 +194,8 @@ pub(crate) mod tests {
             escalation_level: 0,
             plan: None,
             cost: None,
+            gate: None,
+            allow_test_changes: false,
         }
     }
 

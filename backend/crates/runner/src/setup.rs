@@ -248,10 +248,20 @@ pub async fn scrub(
     notes
 }
 
+/// Git on the (agent- and setup-controlled) workspace: hardened like every
+/// other git call of the runner (WP03), never with the repository's hooks,
+/// filters or other configured programs.
 async fn git_ok(dir: &Path, args: &[&str]) -> bool {
+    let repo = crate::git::Repo {
+        dir: dir.to_path_buf(),
+    };
+    if repo.harden().await.is_err() {
+        return false;
+    }
     tokio::process::Command::new("git")
-        .args(["-c", "safe.directory=*"])
+        .args(crate::git::HARDEN)
         .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .current_dir(dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

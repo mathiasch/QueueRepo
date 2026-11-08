@@ -12,7 +12,7 @@ name = "queued"
 path = "src/main.rs"
 
 [dependencies]
-queued-common = { path = "../common" }
+queued-common = { path = "../common", features = ["scan"] }
 queued-api = { path = "../api", features = ["sqlx"] }
 anyhow.workspace = true
 axum.workspace = true

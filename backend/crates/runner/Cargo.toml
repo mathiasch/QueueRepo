@@ -12,7 +12,7 @@ name = "queued-runner"
 path = "src/main.rs"
 
 [dependencies]
-queued-common = { path = "../common" }
+queued-common = { path = "../common", features = ["scan"] }
 anyhow.workspace = true
 axum.workspace = true
 tokio.workspace = true

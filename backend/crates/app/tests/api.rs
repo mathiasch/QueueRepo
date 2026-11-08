@@ -647,22 +647,41 @@ async fn clones_remote_and_auto_pushes(pool: PgPool) {
     )
     .await;
     let t = a.task(&p, "pushed change").await;
+    // WP03: never an automatic push to the default branch without approval.
+    let h1 = a.wait_status(&t, &["held"]).await;
+    assert_eq!(h1["task"]["gate"]["stage"], "push", "{h1}");
+    assert_eq!(h1["task"]["gate"]["findings"][0]["kind"], "push_protected");
+    let remote_log = || {
+        let log = std::process::Command::new("git")
+            .args(["--git-dir"])
+            .arg(&bare)
+            .args(["log", "--format=%s", "main"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&log.stdout).to_string()
+    };
+    assert!(
+        !remote_log().contains("pushed change"),
+        "nothing pushed yet"
+    );
+    let (code, _) = a
+        .post(
+            &format!("/api/tasks/{t}/gate/approve"),
+            json!({"action": "approve"}),
+        )
+        .await;
+    assert_eq!(code, 200);
     let d = a.wait_status(&t, &["done"]).await;
     assert!(
         d["events"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|e| e["content"] == "git push: ok"),
+            .any(|e| e["content"] == "git push (freigegeben): ok"),
         "{d}"
     );
-    let log = std::process::Command::new("git")
-        .args(["--git-dir"])
-        .arg(&bare)
-        .args(["log", "--format=%s", "main"])
-        .output()
-        .unwrap();
-    assert!(String::from_utf8_lossy(&log.stdout).contains("pushed change"));
+    assert!(d["task"]["gate"].is_null());
+    assert!(remote_log().contains("pushed change"));
 }
 
 #[sqlx::test(migrator = "queued::MIGRATOR")]

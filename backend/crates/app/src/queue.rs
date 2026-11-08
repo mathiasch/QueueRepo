@@ -4,6 +4,8 @@ use queued_api::ServerEvent;
 use serde_json::Value;
 use uuid::Uuid;
 
+use queued_common::secrets::redact;
+
 use crate::{
     agent::Credential,
     crypto,
@@ -52,17 +54,20 @@ pub struct NewTask {
     pub connector_id: Option<Uuid>,
     /// Position in the escalation chain of the project routing.
     pub escalation_level: i32,
+    /// Test task (human-created only): protected paths/tests without approval.
+    pub allow_test_changes: bool,
 }
 
 pub async fn insert_task(st: &AppState, t: NewTask) -> sqlx::Result<Task> {
     let task = sqlx::query_as::<_, Task>(
         "INSERT INTO tasks (id, user_id, project_id, parent_id, kind, title, prompt, context, provider, model, status,
                             attempt, depth, created_by_agent, position,
-                            max_runtime_secs, max_cost_usd, max_tokens, max_turns, connector_id, escalation_level)
+                            max_runtime_secs, max_cost_usd, max_tokens, max_turns, connector_id, escalation_level,
+                            allow_test_changes)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
                  CASE WHEN $15 THEN (SELECT COALESCE(MIN(position), 0) - 1 FROM tasks WHERE user_id = $2 AND status = 'queued')
                       ELSE nextval('task_position_seq') END,
-                 $16,$17,$18,$19,$20,$21)
+                 $16,$17,$18,$19,$20,$21,$22)
          RETURNING *",
     )
     .bind(Uuid::new_v4())
@@ -86,6 +91,7 @@ pub async fn insert_task(st: &AppState, t: NewTask) -> sqlx::Result<Task> {
     .bind(t.limits.max_turns)
     .bind(t.connector_id)
     .bind(t.escalation_level)
+    .bind(t.allow_test_changes && !t.created_by_agent)
     .fetch_one(&st.db)
     .await?;
     st.emit(
@@ -112,8 +118,13 @@ pub async fn emit_task(st: &AppState, id: Uuid) {
     }
 }
 
+/// Persists a task event. Every content passes the secret scanner first:
+/// tokens are stored and streamed only as `[geschwärzt: …]` (WP03).
 pub async fn event(st: &AppState, task: &Task, kind: &str, content: &str) {
-    let content: String = content.chars().take(8000).collect();
+    let content: String = queued_common::secrets::redact(content)
+        .chars()
+        .take(8000)
+        .collect();
     let res: sqlx::Result<(i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         "INSERT INTO task_events (task_id, kind, content) VALUES ($1,$2,$3) RETURNING id, ts",
     )
@@ -155,16 +166,26 @@ pub async fn finish(st: &AppState, id: Uuid, f: Finish<'_>) -> sqlx::Result<()> 
     sqlx::query(
         "UPDATE tasks SET status=$2, summary=COALESCE($3, summary), handoff=COALESCE($4, handoff), error=$5,
                 review=COALESCE($6, review), questions=$7, usage=$8, failure_class=$9, not_before=NULL,
-                finished_at=now(), updated_at=now()
+                gate=NULL, gate_pending=NULL, finished_at=now(), updated_at=now()
          WHERE id=$1",
     )
     .bind(id)
     .bind(f.status)
-    .bind(f.summary)
-    .bind(f.handoff)
-    .bind(f.error)
+    .bind(f.summary.as_deref().map(redact))
+    .bind(f.handoff.as_deref().map(redact))
+    .bind(f.error.as_deref().map(redact))
     .bind(f.review)
-    .bind(f.questions)
+    .bind(f.questions.map(|q| match q {
+        Value::Array(a) => Value::Array(
+            a.into_iter()
+                .map(|v| match v {
+                    Value::String(s) => Value::String(redact(&s)),
+                    o => o,
+                })
+                .collect(),
+        ),
+        o => o,
+    }))
     .bind(serde_json::to_value(f.usage).unwrap_or_default())
     .bind(f.failure_class.map(FailureClass::as_str))
     .execute(&st.db)
