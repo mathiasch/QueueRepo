@@ -5,6 +5,9 @@
 //! `POST /v1/exec` answers with a stream of NDJSON [`ExecFrame`]s.
 use serde::{Deserialize, Serialize};
 
+pub mod net;
+pub use net::{EgressPolicy, EgressVerdict, NetMode};
+
 pub const API_PREFIX: &str = "/v1";
 
 /// Git remote access for clone / pull / push. The token is only sent as an
@@ -131,6 +134,45 @@ pub struct ExecRequest {
     /// [`valid_queue_file_name`].
     #[serde(default)]
     pub queue_files: Vec<(String, String)>,
+    /// Network of the process (default: none at all).
+    #[serde(default)]
+    pub egress: EgressPolicy,
+    /// Dependency cache mounted read-write (setup phase only).
+    #[serde(default)]
+    pub cache: Option<CacheSpec>,
+    /// Names of `env` entries that are secrets: their values are replaced by
+    /// `***` in output lines, and the workspace (and cache) is searched for
+    /// them after the run ([`ExecFrame::Exit::leaks`]).
+    #[serde(default)]
+    pub secret_env: Vec<String>,
+}
+
+/// Dependency cache of a setup run. The runner derives the key from
+/// `key_material` and the content of `files` (workspace-relative lock files;
+/// missing files count as absent) and mounts `caches/<workspace>/<key>`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CacheSpec {
+    pub key_material: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CacheInfo {
+    /// Hex prefix of the cache key.
+    pub key: String,
+    /// The cache existed before this run.
+    pub hit: bool,
+}
+
+/// `GET /v1/info`: what the runner can enforce.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunnerInfo {
+    /// podman | docker | none
+    pub engine: String,
+    /// Containers have no network of their own; only the egress proxy.
+    /// `false` for engine `none` (rules are advisory there).
+    pub egress_enforced: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -155,6 +197,19 @@ pub enum ExecFrame {
         /// The process ignored SIGINT for the grace period and was SIGKILLed.
         #[serde(default)]
         killed: bool,
+        #[serde(default)]
+        cache: Option<CacheInfo>,
+        /// Secret values found in files after the run (`"NAME in path"`).
+        #[serde(default)]
+        leaks: Vec<String>,
+    },
+    /// Decision of the egress proxy for one connection/request.
+    Egress {
+        host: String,
+        port: u16,
+        /// CONNECT, or the HTTP method of a plain/inspected request.
+        method: String,
+        verdict: EgressVerdict,
     },
     /// The runner could not start/finish the process.
     Fail {
@@ -214,6 +269,11 @@ mod tests {
                 files: vec![("a".into(), "b".into())],
                 stalled: false,
                 killed: false,
+                cache: Some(CacheInfo {
+                    key: "ab12".into(),
+                    hit: true,
+                }),
+                leaks: vec!["T in .npmrc".into()],
             },
             ExecFrame::Exit {
                 success: false,
@@ -223,6 +283,14 @@ mod tests {
                 files: vec![],
                 stalled: true,
                 killed: true,
+                cache: None,
+                leaks: vec![],
+            },
+            ExecFrame::Egress {
+                host: "x.com".into(),
+                port: 443,
+                method: "CONNECT".into(),
+                verdict: EgressVerdict::NotAllowed,
             },
             ExecFrame::Fail { error: "x".into() },
         ];
@@ -263,6 +331,8 @@ mod tests {
                 files: vec![],
                 stalled: false,
                 killed: false,
+                cache: None,
+                leaks: vec![],
             }
         );
     }
@@ -274,6 +344,9 @@ mod tests {
                 .unwrap();
         assert_eq!(old.idle_timeout_secs, None);
         assert!(old.queue_files.is_empty());
+        // A caller that sends no policy gets no network.
+        assert_eq!(old.egress, EgressPolicy::default());
+        assert!(old.cache.is_none() && old.secret_env.is_empty());
         let mut r = old.clone();
         r.idle_timeout_secs = Some(30);
         r.queue_files = vec![("result.schema.json".into(), "{}".into())];

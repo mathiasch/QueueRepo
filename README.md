@@ -18,9 +18,11 @@ Browser / iPhone-PWA ──HTTPS──► Cloudflare Tunnel ──► queued  (U
                                                         │
                                                         └─ HTTP + Bearer-Token (127.0.0.1) ─► queued-runner  (User "queued", kein Root)
                                                                                                 ├─ Git-Workspaces  /var/lib/queued/runner
-                                                                                                └─ podman run --rm --cap-drop ALL
-                                                                                                     --security-opt no-new-privileges
-                                                                                                     queued-agent (Claude/Codex/Gemini CLI)
+                                                                                                ├─ podman run --rm --cap-drop ALL --network none
+                                                                                                │    --security-opt no-new-privileges
+                                                                                                │    queued-agent (Claude/Codex/Gemini CLI)
+                                                                                                │      └─ 127.0.0.1:3128 ─(Unix-Socket, ro gemountet)─┐
+                                                                                                └─ Egress-Proxy pro Lauf (Allowlist, Protokoll) ◄──────┘ ─► Internet
 ```
 
 | Komponente | Pfad | Verantwortung |
@@ -32,12 +34,15 @@ Browser / iPhone-PWA ──HTTPS──► Cloudflare Tunnel ──► queued  (U
 | Frontend `queued-web` | `frontend/` | Rust/Leptos (CSR, WebAssembly, Build mit Trunk), PWA mit Web Push, Safe-Area-fähig (Notch/Dynamic Island), Tab-Leiste unten auf dem iPhone, hell/dunkel, WCAG 2.2 AA |
 | Tests | `backend/**/tests`, `frontend/src/**` (`cargo test`), `e2e/` | siehe unten |
 
-**Isolation in der Praxis verifiziert:** Ein Agent-Container läuft mit der UID des Runner-Users, `CapEff: 0`, `NoNewPrivs: 1`. Secrets kommen nur per Env in den Container, nie in argv. Der Runner verweigert den Start als Root und mit schwachem Token.
+**Isolation in der Praxis verifiziert:** Ein Agent-Container läuft mit der UID des Runner-Users, `CapEff: 0`, `NoNewPrivs: 1`. Secrets kommen nur per Env in den Container, nie in argv. Der Runner verweigert den Start als Root und mit schwachem Token. Seit WP02 hat jeder Container **kein eigenes Netz** (`--network none`): Der einzige Weg nach außen ist der Egress-Proxy des Runners (siehe „Umgebung, Setup und Netzwerk“). Mit Docker 29 hier geprüft: im Container nur `lo`, direkte Verbindungen und DNS schlagen fehl, erlaubte Ziele gehen über den Proxy, abgelehnte erscheinen im Protokoll.
 
 ## Ablauf eines Auftrags
 
 ```
-queued ─► running ─► git pull (falls Remote) ─► frischer Agent (Auftrag + Handoff/Kontext + Projektziel)
+queued ─► running ─► git pull (falls Remote) ─► Setup-Skript (falls vorhanden; mit Geheimnissen, Setup-Netz, Cache)
+                       │  Fehler / Zeitlimit / Geheimnis in einer Datei ─► blocked (Konfiguration), kein Agent, kein Fix
+                       ▼
+                     frischer Agent (Auftrag + Handoff/Kontext + Projektziel; ohne Geheimnisse, Agent-Netz)
                        │ Ergebnis: structured output (Claude --json-schema, Codex --output-schema)
                        │           sonst .queue/result.json (git-ignored, Fallback, einziger Weg für Gemini)
                        ├─ needs_input ─► waiting_input ─(Antwort)─► queued
@@ -151,12 +156,42 @@ Serverseitig erzwungen: der **Datenstandort** des Projekts (`Keine Einschränkun
 
 **Modell-Test (Eval-Set):** 8 kleine Programmieraufgaben (Fehler, Funktion, Doku, Tests, Umbau, Sicherheit; Größe S/M/L) mit Setup- und Prüfskript (`backend/crates/app/evals/cases.json`). Ein Lauf legt versteckte Projekte an, ohne Review und Reparaturen, und misst Erfolgsquote, Kosten und Kosten pro gelöster Aufgabe (`/api/evals`). Mit dem Test-Anbieter sind die Ergebnisse reproduzierbar (`mock-weak`/`mock-medium`/`mock-strong` lösen S / S+M / alle).
 
+## Umgebung, Setup und Netzwerk (Projekt → Umgebung)
+
+Jedes Projekt hat eine Umgebung. Ändern darf sie nur die Eigentümerin bzw. der Eigentümer; alle Mitglieder sehen sie.
+
+| Teil | Wirkung |
+|---|---|
+| **Setup-Skript** | Läuft vor jedem Auftrag als eigener Container im Projektordner (`sh -e`, bricht beim ersten Fehler ab, Zeitlimit 10–3600 s). Typisch: `npm ci`, `pip install -r requirements.txt`. Fehlschlag ⇒ Auftrag `blocked` (Klasse Konfiguration), der Agent startet nicht, es entsteht kein Fix-Auftrag. |
+| **Umgebungsvariablen** | Nicht geheim. Gelten für Setup, Agent, Prüfbefehl und Review. Namen, die die Queue selbst setzt (Proxy, Zertifikate, `HOME`, `PATH`, `QUEUE_*`, `LD_*` …), sind gesperrt, ebenso alles, was einen KI-Zugang oder eine Agent-CLI umlenkt (`ANTHROPIC_*`, `OPENAI_*`, `CODEX_*`, `CLAUDE_*`, `GEMINI_*`, `GOOGLE_*`, `AWS_*`, `XDG_*` …): Aufträge laufen mit den Zugängen der Person, die sie anlegt – sonst könnte die Eigentümerin den Schlüssel eines Bearbeiters an einen eigenen Server umleiten. |
+| **Geheimnisse** | AES-256-GCM verschlüsselt (`MASTER_KEY`), nie wieder angezeigt, **nur im Setup** als Umgebungsvariable. Ausgaben des Setups werden geschwärzt (`***`). Nach dem Setup durchsucht der Runner Workspace und Cache nach den Werten; ein Fund blockiert den Auftrag, und die Datei wird bereinigt (nicht versioniert: gelöscht; versioniert: auf den Repo-Stand zurückgesetzt; unter `.git/`: Zeile entfernt). Mindestlänge 8 Zeichen. |
+| **Netz im Setup** | `Kein Netz` · `Erlaubte Adressen` (Vorgabe: npm, PyPI, crates.io, Go, GitHub) · `Offen`. |
+| **Netz für den Agenten** | `Nur Modell-API` (**Vorgabe**) · `Modell-API + erlaubte Adressen` · `Offen`. Die Schnittstelle des KI-Modells (z. B. `api.anthropic.com`, die Basis-URL eines Zugangs, Bedrock-/Vertex-Region) ist immer erreichbar. Der Prüfbefehl bekommt dieselbe Regel ohne Modell-API. |
+| **Nur lesen** | Pro Phase: nur GET/HEAD/OPTIONS ohne Body zu den freigegebenen Adressen. Für HTTPS bricht der Proxy TLS mit einer **pro Lauf erzeugten CA** auf (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE` u. a. zeigen darauf) und prüft upstream gegen die Mozilla-Wurzeln. Gilt nie für die Modell-API. |
+| **Cache** | Pro Projekt und Schlüssel unter `RUNNER_DATA_DIR/caches/`, im Container `/cache` (`npm_config_cache`, `PIP_CACHE_DIR`, `CARGO_HOME`, `GOMODCACHE` …). Schlüssel = Setup-Skript + Variablen + Setup-Netz + Image + Inhalt der Lock-Dateien (`package-lock.json`, `Cargo.lock`, `uv.lock`, `go.sum` … plus eigene Pfade). **Nur das Setup** sieht den Cache; der Agent kann ihn nicht vergiften. „Cache leeren“ dürfen auch Bearbeiter. |
+
+**Durchsetzung (ohne Root):** Container laufen mit `--network none`. Der Runner startet pro Lauf einen Proxy auf einem Unix-Socket und mountet dessen Verzeichnis read-only nach `/queue-egress`. Eine kleine Node-Brücke im Container (vom Runner geschrieben, nicht im Image) bietet ihn als `http://127.0.0.1:3128` an; `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` zeigen darauf. Der Proxy prüft den **Hostnamen vor jeder DNS-Abfrage**, löst dann selbst auf und verbindet nur zu geprüften Adressen. Link-Local/Metadaten (`169.254.169.254`), Loopback, private Netze, CGNAT, Multicast und die **eigenen Adressen des Hosts** sind immer gesperrt. Jede Ablehnung wird als Ereignis „Netzwerk“ im Auftrag protokolliert, erlaubte Ziele als Zusammenfassung pro Phase.
+
+**Engine `none` (Entwicklung) setzt nichts durch.** Dort läuft der Proxy auf `127.0.0.1` und nur Programme, die die Proxy-Variablen beachten, halten sich an die Regeln. UI (Banner im Reiter „Umgebung“), `/api/meta` (`sandbox.egress_enforced=false`) und jedes Protokoll („nicht durchgesetzt“) sagen das ausdrücklich.
+
+Runner-Variablen dazu (`/etc/queued/runner.env`):
+
+| Variable | Bedeutung |
+|---|---|
+| `RUNNER_EGRESS_PRIVATE_HOSTS` | Kommagetrennte Hosts, die auf interne Adressen zeigen dürfen (LAN-Registry, eigener Modell-Server wie `gpu.lan` oder `10.0.0.5`). Ohne Port = alle Ports. Link-Local/Metadaten bleiben gesperrt. **Nötig für opencode-/Codex-Zugänge mit Basis-URL im LAN.** |
+| `RUNNER_EGRESS_DENY` | Zusätzlich gesperrte Netze (CIDR), gelten auch für die Hosts oben. |
+| `RUNNER_EGRESS_EXTRA_CA` | PEM-Datei mit weiteren Wurzelzertifikaten für „Nur lesen“ (z. B. interne CA). |
+
+**Upgrade-Hinweis WP02:** `RUNNER_NETWORK` gibt es nicht mehr; ist die Variable gesetzt, startet der Runner nicht (bitte entfernen). Agenten haben ohne weitere Einstellung **kein Internet mehr außer ihrer Modell-API** – wer bisher im Agentenlauf Pakete nachinstalliert hat, verschiebt das ins Setup-Skript oder gibt die Paketquellen im Agent-Netz frei. `RUNNER_DATA_DIR` darf höchstens 80 Bytes lang sein (Pfadgrenze für Unix-Sockets).
+
 ## Tests
 
 | Ebene | Was | Ausführen |
 |---|---|---|
 | Unit (Rust) | Git-Ops inkl. Clone/Push/Pull, atomarer Revert, Path-Traversal, Exec (Streaming, Timeout, Cancel, Prozessgruppe), Container-Flags, Parser aller Provider, Limit-Erkennung, Budget-Logik, Prompts, Crypto, OIDC/PKCE/Apple-JWT | `cd backend && cargo test --workspace --lib` |
 | Integration (Rust) | App + Runner in-process + echtes Postgres (frische DB pro Test): Auth, Tenant-Isolation, Rollen, kompletter Task-Lifecycle mit Git, Fix-Loop, Rückfragen, Freigaben, Abo-Limit, Budgets, Cancel, Revert, Credentials, OnEmptyQueue, Clone + Auto-Push, Parallelität, SSE-Isolation, ZIP | `DATABASE_URL=postgres://… cargo test --workspace` |
+| Integration WP02 | Umgebung (Rollen, Validierung, Geheimnisse nie in Antworten/Events, verschlüsselt), Setup vor dem Agenten, Geheimnis nur im Setup, Setup-Fehler ⇒ blocked ohne Agent/Fix, Geheimnis in Datei ⇒ blocked + bereinigt, Cache-Treffer/Invalidierung/Leeren, Netz-Ereignisse aller Phasen (erlaubt gegen lokalen Fake-Server, abgelehnt vor DNS) | `cargo test -p queued --test environments` |
+| Unit WP02 | Egress-Proxy (CONNECT, absolute-form HTTP, Allowlist vor DNS, interne/Metadaten-/Host-Adressen, `open`/`off`, Nur-lesen für HTTP und HTTPS mit Lauf-CA gegen lokalen TLS-Server, Pipelining, Unix-Socket + echte Node-Brücke), Container-Argumente, Cache-Schlüssel, Leck-Suche/Bereinigung, SSRF-Resolver und Redirect-Policy der App | `cargo test -p queued-runner -p queued-common -p queued-api` und `cargo test -p queued --lib llm::` |
 | Integration WP13 | Zugänge (Verschlüsselung, Zugriff), Kosten je Schritt aus der Preistabelle, Live-Kostenlimit, Datenstandort, Vorlagen, Planung/Review/Analyse per Batch (Anthropic, OpenAI, Mistral) und direkt gegen Fake-Server, Eskalation, Abbruch/Neustart, Schätzung, Kostenübersicht, Admin-Preise, LiteLLM-Schlüssel, CLI-Status, Eval-Set | `cargo test -p queued --test providers` |
 | Unit (Frontend) | Formatierung, Status-/Fehlertexte, Budget-Anzeige, Limit-Eingaben, Fortschrittsphasen, Diff, Tastaturkürzel, VAPID-Decoding, Geldbeträge/Schätzung | `cd frontend && cargo test` |
 | System | echte Binaries als getrennte Prozesse: Runner-Auth, Session-Pflicht, Flow über die Prozessgrenze, Budget, Cancel | `cd e2e && npx playwright test --project=system` |
@@ -164,7 +199,7 @@ Serverseitig erzwungen: der **Datenstandort** des Projekts (`Keine Einschränkun
 | E2E Mobile | iPhone 15 Pro hoch/quer mit simulierter **Dynamic Island**/Notch/Home-Indikator: nichts verdeckt, Tab-Bar und alle Bedienelemente ≥ 44pt, Inputs ≥ 16px (kein iOS-Zoom), kein horizontales Scrollen | `npx playwright test --project=iphone --project=iphone-landscape` |
 | Accessibility | axe-core (WCAG 2.0/2.1/2.2 A+AA) auf allen Hauptansichten, hell und dunkel, Desktop und iPhone; Screenshots nach `WP00_SCREENSHOTS_DIR` | `a11y.spec.ts`, `mobile-a11y.spec.ts` (Teil der Projekte oben) |
 
-Der Mock-Provider (`ENABLE_MOCK_PROVIDER=true`) macht alle Flows deterministisch und kostet keine Tokens. Er wird über Schlüsselwörter im Prompt gesteuert: `MOCK_FAIL`, `MOCK_ASK`, `MOCK_FOLLOWUPS`, `MOCK_LIMIT`, `MOCK_SLOW`, `MOCK_TRANSIENT` (scheitert transient, bis die Re-Queue-Notiz im Prompt steht), `MOCK_TRANSIENT_ALWAYS`, `MOCK_AUTH`, `MOCK_STRUCTURED`, `MOCK_STRUCTURED_BAD`, `MOCK_TOKENS`, `MOCK_TURNS`, `MOCK_TRAP` (wartet auf SIGINT und meldet dann Verbrauch), `MOCK_STDERR429`, `MOCK_REVIEW_LIMIT`, `MOCK_QUIET` (6 s ohne Ausgabe, dann Erfolg), `MOCK_USAGE_TOTAL` (Gesamtverbrauch erst am Ende, weit über den Live-Werten), `MOCK_SOLUTION_B64:<base64>` (führt das Skript im Workspace aus – Eval-Set). Für Planung/Review/Batch gibt es in den Integrationstests einen lokalen Fake-Server für die Anthropic-, OpenAI-, Mistral- und LiteLLM-APIs (`tests/common/fake_llm.rs`); echte Anbieter werden in Tests nie aufgerufen. CI (`.github/workflows/ci.yml`) führt fmt, clippy `-D warnings` (Backend sowie Frontend für wasm32 und nativ), alle Rust-Tests, den Trunk-Build sowie Playwright aus.
+Der Mock-Provider (`ENABLE_MOCK_PROVIDER=true`) macht alle Flows deterministisch und kostet keine Tokens. Er wird über Schlüsselwörter im Prompt gesteuert: `MOCK_FAIL`, `MOCK_ASK`, `MOCK_FOLLOWUPS`, `MOCK_LIMIT`, `MOCK_SLOW`, `MOCK_TRANSIENT` (scheitert transient, bis die Re-Queue-Notiz im Prompt steht), `MOCK_TRANSIENT_ALWAYS`, `MOCK_AUTH`, `MOCK_STRUCTURED`, `MOCK_STRUCTURED_BAD`, `MOCK_TOKENS`, `MOCK_TURNS`, `MOCK_TRAP` (wartet auf SIGINT und meldet dann Verbrauch), `MOCK_STDERR429`, `MOCK_REVIEW_LIMIT`, `MOCK_QUIET` (6 s ohne Ausgabe, dann Erfolg), `MOCK_USAGE_TOTAL` (Gesamtverbrauch erst am Ende, weit über den Live-Werten), `MOCK_SOLUTION_B64:<base64>` (führt das Skript im Workspace aus – Eval-Set), `MOCK_ENV` (schreibt die Namen seiner Umgebungsvariablen nach `MOCK_ENV.txt`), `MOCK_NET:<url>` (ruft die URL über den Egress-Proxy ab). Für Planung/Review/Batch gibt es in den Integrationstests einen lokalen Fake-Server für die Anthropic-, OpenAI-, Mistral- und LiteLLM-APIs (`tests/common/fake_llm.rs`); echte Anbieter werden in Tests nie aufgerufen. CI (`.github/workflows/ci.yml`) führt fmt, clippy `-D warnings` (Backend sowie Frontend für wasm32 und nativ), alle Rust-Tests, den Trunk-Build sowie Playwright aus.
 
 ## Betrieb (Hetzner/Mac mini/Linux-Box, ohne Root zur Laufzeit)
 
@@ -212,4 +247,7 @@ cd frontend && trunk serve                      # http://localhost:5173, /api wi
 - Kosten sind Listenpreise aus Recherche-Quellen: Nur die Anthropic-Preise wurden direkt auf der Anbieterseite gelesen, OpenAI/Gemini/Mistral stammen aus Suchauszügen. Long-Context-Aufschläge lassen sich nur prüfen, wo die CLI den Verbrauch pro Anfrage meldet (Claude, opencode); sonst ist der Betrag eine Untergrenze. Abo-Läufe werden zu API-Preisen bewertet.
 - Die Batch-, Azure-, Infomaniak- und LiteLLM-Schnittstellen sowie Bedrock/Vertex/opencode im Echtbetrieb sind nur gegen lokale Fake-Server bzw. Strings im Binary geprüft, nicht gegen die echten Dienste.
 - opencode liest auch eine `opencode.json` im Repository (wie Gemini den Workspace vertraut) – Härtung folgt mit WP03.
+- **Egress (WP02):** Der Proxy prüft Hostnamen, nicht Inhalte (außer „Nur lesen“). Daten können an jede *erlaubte* Domain abfließen (z. B. github.com), Domain-Fronting über CDNs ist nicht verhindert. Bei `Offen` löst der Runner beliebige Namen auf (DNS als Kanal). Welche Hosts die Agent-CLIs brauchen und dass sie `HTTPS_PROXY` beachten, ist Wissen über die CLIs, **nicht live geprüft**; ein fehlender Host zeigt sich als „Blockiert“ im Protokoll. Images ohne `node` haben im Container kein Netz (sicher, aber 10 s Wartezeit). Container müssen als Runner-UID laufen (Agent-Image: Standard), sonst ist der Socket nicht erreichbar.
+- **Geheimnisse im Setup:** Das Setup führt Code aus dem Repository aus (z. B. `preinstall` beim `npm install`), und das Repository wird von früheren Agentenläufen verändert. Ein Agent kann so Code platzieren, der im nächsten Setup die Geheimnisse liest und an eine erlaubte Adresse schickt. Deshalb: enge Setup-Allowlist und nur Tokens mit minimalen Rechten. Die Leck-Suche findet nur wörtliche Kopien (nicht base64 o. Ä.) und liest Dateien bis 8 MiB.
+- Das Setup läuft bei jedem Auftrag (mit warmem Cache), es gibt keinen Container-Snapshot nach dem Setup.
 

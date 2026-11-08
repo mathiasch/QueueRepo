@@ -1114,9 +1114,18 @@ name = "queued-api"
 version = "0.2.0"
 dependencies = [
  "chrono",
+ "queued-common",
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "queued-common"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

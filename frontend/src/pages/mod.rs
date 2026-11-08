@@ -1,5 +1,6 @@
 pub mod composer;
 pub mod drawer;
+pub mod environment;
 pub mod inbox;
 pub mod login;
 pub mod onboarding;

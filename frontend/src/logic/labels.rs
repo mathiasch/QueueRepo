@@ -181,6 +181,8 @@ pub fn event_kind_label(kind: &str) -> &'static str {
         "retry" => "Wiederholung",
         "guard" => "Wächter",
         "contract" => "Ergebnis",
+        "setup" => "Setup",
+        "egress" => "Netzwerk",
         _ => "Info",
     }
 }
@@ -274,6 +276,8 @@ mod tests {
     #[test]
     fn event_kinds_and_notifications() {
         assert_eq!(event_kind_label("verify"), "Prüfung");
+        assert_eq!(event_kind_label("setup"), "Setup");
+        assert_eq!(event_kind_label("egress"), "Netzwerk");
         assert_eq!(event_kind_label("whatever"), "Info");
         assert!(notification_is_error("blocked"));
         assert!(!notification_is_error("question"));

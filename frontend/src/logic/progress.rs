@@ -23,7 +23,9 @@ impl Phase {
 
     pub fn help(self) -> &'static str {
         match self {
-            Phase::Prepare => "Projekt wird aktualisiert und der Agent gestartet.",
+            Phase::Prepare => {
+                "Projekt wird aktualisiert, das Setup-Skript läuft und der Agent startet."
+            }
             Phase::Work => "Der Agent liest Code, führt Befehle aus und ändert Dateien.",
             Phase::Check => "Tests laufen und ein zweiter Agent prüft die Änderungen.",
             Phase::Finish => "Änderungen werden gespeichert und ggf. hochgeladen.",
@@ -36,10 +38,11 @@ impl Phase {
 }
 
 /// Next phase after one log entry. A new run (`Start #…`) starts over at
-/// [`Phase::Work`]; otherwise the phase never goes backwards.
+/// [`Phase::Prepare`] (setup phase, WP02) until the agent's first output;
+/// otherwise the phase never goes backwards.
 pub fn advance(current: Phase, kind: &str, content: &str) -> Phase {
     let next = match kind {
-        "status" if content.starts_with("Start #") => return Phase::Work,
+        "status" if content.starts_with("Start #") => return Phase::Prepare,
         "status"
             if content.starts_with("Erledigt")
                 || content.starts_with("git push")
@@ -72,7 +75,30 @@ mod tests {
             from_events([("status", "git: pull failed")]),
             Phase::Prepare
         );
-        assert_eq!(from_events([("status", "Start #0 via mock")]), Phase::Work);
+        assert_eq!(
+            from_events([("status", "Start #0 via mock")]),
+            Phase::Prepare
+        );
+        // Setup and network notes belong to the preparation …
+        assert_eq!(
+            from_events([
+                ("status", "Start #0 via mock"),
+                ("setup", "Setup startet"),
+                ("egress", "Netzwerk (Setup): 1 blockiert"),
+                ("setup", "Setup fertig"),
+                ("egress", "Netz (Agent): nur Modell-API"),
+            ]),
+            Phase::Prepare
+        );
+        // … the agent's first output starts the work.
+        assert_eq!(
+            from_events([
+                ("status", "Start #0 via mock"),
+                ("setup", "Setup fertig"),
+                ("text", "reading")
+            ]),
+            Phase::Work
+        );
         assert_eq!(
             from_events([
                 ("status", "Start #0 via mock"),
@@ -100,7 +126,7 @@ mod tests {
                 ("verify", "$ x"),
                 ("status", "Start #1 via mock (Wiederholung 1)")
             ]),
-            Phase::Work
+            Phase::Prepare
         );
     }
 

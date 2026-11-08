@@ -152,6 +152,24 @@ impl RunnerClient {
             .sha)
     }
 
+    /// Engine and whether egress rules are enforced.
+    pub async fn info(&self) -> Result<RunnerInfo> {
+        self.get(format!("{}/info", self.base)).await
+    }
+
+    /// Drops the dependency caches of a project.
+    pub async fn clear_cache(&self, ws: Uuid) -> Result<()> {
+        let r = self
+            .http
+            .delete(self.url(ws, "/cache"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("runner unreachable")?;
+        Self::check(r).await?;
+        Ok(())
+    }
+
     /// Agent CLIs found in the sandbox (`<cli> --version`).
     pub async fn cli_status(&self) -> Result<Vec<queued_common::CliProbe>> {
         self.get(format!("{}/cli-status", self.base)).await

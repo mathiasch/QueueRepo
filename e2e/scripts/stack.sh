@@ -25,7 +25,10 @@ fi
 psql "$ADMIN_URL" -qc "CREATE DATABASE $DB" >/dev/null
 DB_URL="${ADMIN_URL%/*}/$DB"
 
+# 127.0.0.1 as an internal host the egress proxy may reach: system tests use
+# a local fake upstream instead of real external hosts (WP02).
 RUNNER_ALLOW_ROOT=1 RUNNER_ENGINE=none RUNNER_TOKEN="$TOKEN" RUNNER_DATA_DIR="$WORK/runner" \
+RUNNER_EGRESS_PRIVATE_HOSTS=127.0.0.1 \
 RUNNER_BIND="127.0.0.1:$RUNNER_PORT" RUNNER_KILL_GRACE_SECS=3 RUST_LOG=warn \
   "$ROOT/backend/target/debug/queued-runner" &
 RUNNER_PID=$!

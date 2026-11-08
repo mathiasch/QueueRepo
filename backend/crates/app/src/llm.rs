@@ -48,14 +48,25 @@ impl std::fmt::Display for CallError {
     }
 }
 
-/// HTTP client for model APIs (long timeout: a single answer can take minutes).
-pub fn client() -> reqwest::Client {
-    reqwest::Client::builder()
+/// HTTP client for model APIs (long timeout: a single answer can take
+/// minutes), with the SSRF guard applied at DNS resolution and redirects.
+pub fn client(guard: &Guard) -> reqwest::Client {
+    guarded_builder(guard)
         .user_agent("queued/0.2")
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(20))
         .build()
         .expect("http client")
+}
+
+/// Builder with [`GuardedResolver`] and [`redirect_policy`] (also used by
+/// the LiteLLM gateway client).
+pub fn guarded_builder(guard: &Guard) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .dns_resolver(std::sync::Arc::new(GuardedResolver {
+            allow_private: guard.allow_private,
+        }))
+        .redirect(redirect_policy(guard))
 }
 
 /// Connection to one provider endpoint.
@@ -79,37 +90,72 @@ pub struct Guard {
     pub deny: Vec<String>,
 }
 
-fn forbidden_ip(ip: std::net::IpAddr, allow_private: bool) -> Option<&'static str> {
-    use std::net::IpAddr;
-    let ip = match ip {
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(v6)),
-        v4 => v4,
-    };
-    match ip {
-        IpAddr::V4(v) => {
-            if v.is_unspecified() || v.is_link_local() || v.is_multicast() || v.is_broadcast() {
-                return Some("Link-Local/Metadaten- oder Sonderadresse");
+use queued_common::net::forbidden_ip;
+
+/// DNS resolver of the guarded clients: every address is checked with
+/// [`forbidden_ip`] *at connection time*, so a name that passed
+/// [`check_target`] cannot be rebound to an internal address before the
+/// request (WP13-N8). Only the checked addresses are handed to the connector.
+struct GuardedResolver {
+    allow_private: bool,
+}
+
+impl reqwest::dns::Resolve for GuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let allow = self.allow_private;
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|a| forbidden_ip(a.ip(), allow).is_none())
+                .collect();
+            if addrs.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{host}: nur interne oder gesperrte Adressen"),
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
             }
-            let o = v.octets();
-            let cgnat = o[0] == 100 && (64..128).contains(&o[1]);
-            if !allow_private && (v.is_loopback() || v.is_private() || cgnat) {
-                return Some("interne Adresse");
-            }
-        }
-        IpAddr::V6(v) => {
-            let seg = v.segments();
-            if v.is_unspecified() || v.is_multicast() || (seg[0] & 0xffc0) == 0xfe80 {
-                return Some("Link-Local- oder Sonderadresse");
-            }
-            if !allow_private && (v.is_loopback() || (seg[0] & 0xfe00) == 0xfc00) {
-                return Some("interne Adresse");
-            }
-        }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
     }
-    None
+}
+
+/// Most redirects a guarded client follows.
+const MAX_REDIRECTS: usize = 5;
+
+/// Redirect policy of the guarded clients: http(s) only, at most
+/// [`MAX_REDIRECTS`] hops, no IP literal in a forbidden range (host names
+/// go through [`GuardedResolver`] again), never the runner.
+fn redirect_policy(guard: &Guard) -> reqwest::redirect::Policy {
+    let g = guard.clone();
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            return attempt.error("zu viele Weiterleitungen");
+        }
+        let u = attempt.url();
+        if !matches!(u.scheme(), "http" | "https") {
+            return attempt.error("Weiterleitung nur zu http/https");
+        }
+        let host = u
+            .host_str()
+            .unwrap_or_default()
+            .trim_matches(['[', ']'])
+            .to_string();
+        let port = u.port_or_known_default().unwrap_or(443);
+        if g.deny
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(&format!("{host}:{port}")))
+        {
+            return attempt.error("Weiterleitung zu einem internen Dienst");
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if forbidden_ip(ip, g.allow_private).is_some() {
+                return attempt.error("Weiterleitung zu einer internen Adresse");
+            }
+        }
+        attempt.follow()
+    })
 }
 
 /// Refuses calls to link-local/metadata addresses always, to loopback and
@@ -417,6 +463,112 @@ pub fn extract_json<T: DeserializeOwned>(text: &str) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Local server: `/hop?to=<url>` answers 302 to `to`, everything else 200.
+    async fn redirector() -> String {
+        use axum::{extract::Query, response::IntoResponse, routing::get, Router};
+        async fn hop(
+            Query(q): Query<std::collections::HashMap<String, String>>,
+        ) -> axum::response::Response {
+            match q.get("to") {
+                Some(to) => (
+                    axum::http::StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, to.clone())],
+                )
+                    .into_response(),
+                None => "landed".into_response(),
+            }
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(l, Router::new().route("/hop", get(hop)))
+                .await
+                .unwrap()
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn guarded_client_refuses_internal_addresses_at_connect_time() {
+        let base = redirector().await;
+        let port = base.rsplit(':').next().unwrap();
+        // `localhost` resolves to loopback: refused by the resolver itself,
+        // even without `check_target` (a rebinding name behaves the same).
+        let strict = client(&Guard::default());
+        let e = strict
+            .get(format!("http://localhost:{port}/hop"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(format!("{e:?}").contains("interne"), "{e:?}");
+        let lax = client(&Guard {
+            allow_private: true,
+            deny: vec![],
+        });
+        let ok = lax
+            .get(format!("http://localhost:{port}/hop"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.text().await.unwrap(), "landed");
+    }
+
+    #[tokio::test]
+    async fn guarded_client_checks_redirect_targets() {
+        let base = redirector().await;
+        let hp = base.trim_start_matches("http://").to_string();
+        let lax = client(&Guard {
+            allow_private: true,
+            deny: vec!["127.0.0.1:1".into()],
+        });
+        let enc = |u: &str| url::form_urlencoded::byte_serialize(u.as_bytes()).collect::<String>();
+        // Metadata address: never followed.
+        let e = lax
+            .get(format!(
+                "{base}/hop?to={}",
+                enc("http://169.254.169.254/latest/meta-data/")
+            ))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(e.is_redirect(), "{e:?}");
+        // The runner (deny list) is never a redirect target.
+        assert!(lax
+            .get(format!(
+                "{base}/hop?to={}",
+                enc("http://127.0.0.1:1/v1/exec")
+            ))
+            .send()
+            .await
+            .unwrap_err()
+            .is_redirect());
+        // Other schemes are never followed (reqwest hands back the 302).
+        match lax
+            .get(format!("{base}/hop?to={}", enc("file:///etc/passwd")))
+            .send()
+            .await
+        {
+            Ok(r) => assert_eq!(r.status(), 302),
+            Err(e) => assert!(e.is_redirect(), "{e:?}"),
+        }
+        // An allowed redirect is followed.
+        let ok = lax
+            .get(format!(
+                "{base}/hop?to={}",
+                enc(&format!("http://{hp}/hop"))
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.text().await.unwrap(), "landed");
+        // Chains longer than MAX_REDIRECTS are cut off.
+        let mut chain = format!("http://{hp}/hop");
+        for _ in 0..=MAX_REDIRECTS {
+            chain = format!("http://{hp}/hop?to={}", enc(&chain));
+        }
+        assert!(lax.get(chain).send().await.unwrap_err().is_redirect());
+    }
 
     fn req() -> Request {
         Request {

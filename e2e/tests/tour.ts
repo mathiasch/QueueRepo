@@ -74,6 +74,13 @@ export async function tour(page: Page, info: TestInfo, device: string, full: boo
     await expect(page.getByTestId("project-routing").getByTestId("preset-balanced")).toBeVisible();
     await expectAccessible(page, `project settings (${scheme})`);
     await shot(page, out, `${device}-${scheme}-project-settings`, device === "desktop");
+    // WP02: environment editor with the network presets expanded.
+    await page.getByRole("tab", { name: "Umgebung" }).click();
+    await expect(page.getByTestId("sandbox-status")).toContainText("nicht durchgesetzt");
+    await page.getByTestId("net-agent").getByRole("radio", { name: "Erlaubte Adressen" }).check();
+    await expect(page.getByTestId("net-agent").getByText("Python (PyPI)")).toBeVisible();
+    await expectAccessible(page, `project environment (${scheme})`);
+    await shot(page, out, `${device}-${scheme}-project-environment`, device === "desktop");
     await page.getByRole("tab", { name: "Mitglieder" }).click();
     await expect(page.locator(".member")).toHaveCount(1);
     await expectAccessible(page, `project members (${scheme})`);

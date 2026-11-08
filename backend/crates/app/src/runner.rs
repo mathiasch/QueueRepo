@@ -15,7 +15,9 @@ use crate::{
         self, AgentEvent, Capabilities, ConnCfg, Credential, ErrorCategory, LimitKind, ParseState,
         RetryInfo, RunKind, RunLimits,
     },
-    batch, budget, connectors, crypto, gateway,
+    batch, budget, connectors, crypto,
+    environment::{self, EgressLog, Env},
+    gateway,
     limits::{self, EffectiveLimits, Guard},
     llm,
     models::{
@@ -665,6 +667,23 @@ async fn run_inner(
 
     let remote = project_remote(st, &project);
     let before = prepare_workspace(st, task, &project, remote.clone()).await?;
+    let env = environment::load(&st.db, project.id).await?;
+    if env.has_setup() {
+        match run_setup(st, task, &project, &env, cancel).await? {
+            SetupOutcome::Ready => {}
+            SetupOutcome::Cancelled => {
+                finish_cancelled(st, task.id, None, None, usage).await?;
+                return Ok(());
+            }
+            SetupOutcome::Failed(msg) => {
+                event(st, task, "guard", &msg).await;
+                if block_running(st, task.id, FailureClass::Config, &msg, usage).await {
+                    notify_blocked(st, task, &msg).await;
+                }
+                return Ok(());
+            }
+        }
+    }
     let prompt = build_prompt(st, task, &project, &settings).await?;
     let meter = meter_for(
         st,
@@ -690,6 +709,7 @@ async fn run_inner(
             limits: &lim,
             used_before: usage,
             meter,
+            env: &env,
         },
         cancel,
     )
@@ -785,7 +805,7 @@ async fn run_inner(
             .filter(|c| !c.trim().is_empty())
         {
             event(st, task, "verify", &format!("$ {cmd}")).await;
-            let verdict = run_verify(st, task, cmd, cancel).await?;
+            let verdict = run_verify(st, task, cmd, cancel, &env).await?;
             if cancel.is_cancelled() {
                 // A user cancel stops the verify command – not a task failure.
                 finish_cancelled(st, task.id, Some(summary), handoff, usage).await?;
@@ -834,6 +854,7 @@ async fn run_inner(
                         .as_ref()
                         .filter(|r| r.mode == StepMode::Harness),
                     exec: &acc,
+                    env: &env,
                 },
                 cancel,
                 usage,
@@ -1684,6 +1705,8 @@ struct RunSpec<'a> {
     used_before: &'a Usage,
     /// Prices the usage while it streams in.
     meter: Meter,
+    /// Project environment: variables and the agent network policy.
+    env: &'a Env,
 }
 
 async fn agent_run(
@@ -1740,12 +1763,42 @@ async fn agent_run(
         )
         .await;
     }
+    let egress = spec
+        .env
+        .agent_policy(agent::egress_hosts(spec.provider, cred));
+    let phase = if spec.kind == RunKind::Review {
+        "Review"
+    } else {
+        "Agent"
+    };
+    let enforced = environment::sandbox(st).await.egress_enforced;
+    event(
+        st,
+        task,
+        "egress",
+        &format!(
+            "Netz ({phase}): {}{}",
+            environment::describe(&egress),
+            if enforced {
+                ""
+            } else {
+                " – nicht durchgesetzt"
+            }
+        ),
+    )
+    .await;
+    // Project variables first: the invocation's own variables win.
+    let mut run_env = spec.env.vars();
+    run_env.extend(inv.env.iter().cloned());
     let req = ExecRequest {
         name: run_name(task.id, spec.label),
         workspace: task.project_id.to_string(),
         program: inv.program.clone(),
         args: inv.args.clone(),
-        env: inv.env.clone(),
+        env: run_env,
+        egress,
+        cache: None,
+        secret_env: vec![],
         home_files: inv.home_files.clone(),
         read_back: inv.writeback.iter().cloned().collect(),
         stdin: Some(spec.prompt),
@@ -1771,8 +1824,10 @@ async fn agent_run(
         let mut ps = ParseState::default();
         let mut o = RunOutcome::default();
         let mut stderr_events = 0;
+        let mut elog = EgressLog::new(phase);
         while let Some(frame) = rx.recv().await {
             match frame {
+                f @ ExecFrame::Egress { .. } => elog.on(st, task, &f).await,
                 ExecFrame::Out { line } => {
                     for ev in agent::parse_line(provider, &line, &mut ps) {
                         match ev {
@@ -1849,6 +1904,7 @@ async fn agent_run(
                 _ => {}
             }
         }
+        elog.finish(st, task, enforced).await;
         (o, meter)
     };
     let (last, (mut o, meter)) = tokio::join!(exec(st, req, &run_cancel, tx), consumer);
@@ -1864,6 +1920,7 @@ async fn agent_run(
             stalled,
             killed,
             files,
+            ..
         }) => {
             o.success = success;
             o.exit_code = code;
@@ -1920,30 +1977,193 @@ async fn agent_run(
     Ok(o)
 }
 
+enum SetupOutcome {
+    Ready,
+    Cancelled,
+    /// Message for the user; the task is blocked (class `config`).
+    Failed(String),
+}
+
+/// Most setup output lines written as events (the tail is in the error).
+const MAX_SETUP_EVENTS: usize = 200;
+
+/// Setup phase (WP02): the project's setup script in its own container,
+/// with the secrets and the setup network policy, before the agent starts.
+/// The agent phase never sees the secrets.
+async fn run_setup(
+    st: &AppState,
+    task: &Task,
+    project: &Project,
+    env: &Env,
+    cancel: &CancellationToken,
+) -> Result<SetupOutcome, RunError> {
+    let secrets = environment::secret_values(st, project.id)
+        .await
+        .map_err(RunError::Infra)?;
+    let egress = env.setup_policy();
+    let enforced = environment::sandbox(st).await.egress_enforced;
+    let cache = env.cache_spec();
+    event(
+        st,
+        task,
+        "setup",
+        &format!(
+            "Setup startet – Netz: {}{}; Geheimnisse: {}; Cache: {}",
+            environment::describe(&egress),
+            if enforced {
+                ""
+            } else {
+                " (nicht durchgesetzt)"
+            },
+            secrets.len(),
+            if cache.is_some() { "an" } else { "aus" }
+        ),
+    )
+    .await;
+    let mut run_env = env.vars();
+    run_env.extend(secrets.iter().cloned());
+    let req = ExecRequest {
+        name: run_name(task.id, "setup"),
+        workspace: project.id.to_string(),
+        program: "sh".into(),
+        // -e: the setup fails at the first failing command.
+        args: vec!["-e".into(), "-c".into(), env.setup_script.clone()],
+        env: run_env,
+        home_files: vec![],
+        read_back: vec![],
+        stdin: None,
+        timeout_secs: env.setup_timeout_secs.max(1) as u64,
+        idle_timeout_secs: None,
+        queue_files: vec![],
+        egress,
+        cache,
+        secret_env: secrets.iter().map(|(n, _)| n.clone()).collect(),
+    };
+    let values: Vec<String> = secrets.into_iter().map(|(_, v)| v).collect();
+    let (tx, mut rx) = mpsc::channel::<ExecFrame>(512);
+    let collect = async {
+        let mut tail_buf = String::new();
+        let mut lines = 0usize;
+        let mut elog = EgressLog::new("Setup");
+        while let Some(f) = rx.recv().await {
+            match f {
+                ExecFrame::Out { line } | ExecFrame::Err { line } => {
+                    // The runner already redacts; this is the second line of defence.
+                    let line = values
+                        .iter()
+                        .fold(line, |l, v| l.replace(v.as_str(), "***"));
+                    tail_buf.push_str(&line);
+                    tail_buf.push('\n');
+                    if tail_buf.len() > 8000 {
+                        tail_buf = tail(&tail_buf, 4000);
+                    }
+                    lines += 1;
+                    if lines <= MAX_SETUP_EVENTS && !line.trim().is_empty() {
+                        event(st, task, "setup", &line).await;
+                    }
+                }
+                f @ ExecFrame::Egress { .. } => elog.on(st, task, &f).await,
+                _ => {}
+            }
+        }
+        elog.finish(st, task, enforced).await;
+        tail_buf
+    };
+    let (last, output) = tokio::join!(exec(st, req, cancel, tx), collect);
+    if cancel.is_cancelled() {
+        return Ok(SetupOutcome::Cancelled);
+    }
+    let output = tail(&output, 2000);
+    match last.map_err(RunError::Infra)? {
+        ExecFrame::Exit {
+            success,
+            code,
+            timed_out,
+            cache,
+            leaks,
+            ..
+        } => {
+            if let Some(c) = cache {
+                event(
+                    st,
+                    task,
+                    "setup",
+                    &format!(
+                        "Cache {}: {}",
+                        &c.key[..c.key.len().min(12)],
+                        if c.hit {
+                            "wiederverwendet"
+                        } else {
+                            "neu angelegt"
+                        }
+                    ),
+                )
+                .await;
+            }
+            if !leaks.is_empty() {
+                return Ok(SetupOutcome::Failed(format!(
+                    "Das Setup hat Geheimnisse in Dateien geschrieben – der Agent startet nicht, damit er sie nicht lesen kann. Betroffene Dateien wurden bereinigt:\n- {}\nBitte das Setup-Skript so ändern, dass es Geheimnisse nur aus Umgebungsvariablen liest (z. B. `npm config` mit `${{NPM_TOKEN}}` statt Token in `.npmrc`).",
+                    leaks.join("\n- ")
+                )));
+            }
+            if timed_out {
+                return Ok(SetupOutcome::Failed(format!(
+                    "Setup-Skript nach {} s abgebrochen (Zeitlimit der Umgebung).\n{output}",
+                    env.setup_timeout_secs
+                )));
+            }
+            if !success {
+                return Ok(SetupOutcome::Failed(format!(
+                    "Setup-Skript fehlgeschlagen (Exit {}). Der Agent wurde nicht gestartet.\n{output}",
+                    code.map(|c| c.to_string()).unwrap_or_else(|| "?".into())
+                )));
+            }
+            event(st, task, "setup", "Setup fertig").await;
+            Ok(SetupOutcome::Ready)
+        }
+        ExecFrame::Fail { error } => {
+            Err(RunError::Infra(anyhow::anyhow!("runner (setup): {error}")))
+        }
+        _ => Err(RunError::Infra(anyhow::anyhow!(
+            "runner (setup): unexpected final frame"
+        ))),
+    }
+}
+
 /// Ok(Ok(())) = passed, Ok(Err(output tail)) = failed.
 async fn run_verify(
     st: &AppState,
     task: &Task,
     cmd: &str,
     cancel: &CancellationToken,
+    env: &Env,
 ) -> anyhow::Result<std::result::Result<(), String>> {
     let req = ExecRequest {
         name: run_name(task.id, "verify"),
         workspace: task.project_id.to_string(),
         program: "sh".into(),
         args: vec!["-c".into(), cmd.into()],
-        env: vec![],
+        env: env.vars(),
         home_files: vec![],
         read_back: vec![],
         stdin: None,
         timeout_secs: st.cfg.verify_timeout_min * 60,
         idle_timeout_secs: None,
         queue_files: vec![],
+        egress: env.verify_policy(),
+        cache: None,
+        secret_env: vec![],
     };
+    let enforced = environment::sandbox(st).await.egress_enforced;
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(512);
     let collect = async {
         let mut buf = String::new();
+        let mut elog = EgressLog::new("Prüfung");
         while let Some(f) = rx.recv().await {
+            if matches!(f, ExecFrame::Egress { .. }) {
+                elog.on(st, task, &f).await;
+                continue;
+            }
             if let ExecFrame::Out { line } | ExecFrame::Err { line } = f {
                 buf.push_str(&line);
                 buf.push('\n');
@@ -1952,6 +2172,7 @@ async fn run_verify(
                 }
             }
         }
+        elog.finish(st, task, enforced).await;
         buf
     };
     let (last, output) = tokio::join!(exec(st, req, cancel, tx), collect);
@@ -1998,6 +2219,7 @@ struct ReviewCtx<'a> {
     route: Option<&'a queued_api::StepRoute>,
     /// Access of the agent loop (default reviewer).
     exec: &'a RunAccess,
+    env: &'a Env,
 }
 
 /// Reviewer target: routing route, legacy review provider, or the access
@@ -2083,6 +2305,7 @@ async fn run_review(
             limits: lim,
             used_before: usage,
             meter,
+            env: rc.env,
         },
         cancel,
     )

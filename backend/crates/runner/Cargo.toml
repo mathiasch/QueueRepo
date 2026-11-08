@@ -25,6 +25,15 @@ tracing-subscriber.workspace = true
 base64.workspace = true
 futures.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Egress proxy (WP02): request parsing, TLS for read-only inspection.
+httparse = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+webpki-roots = "1"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
+sha2 = "0.10"
+memchr = "2"
 
 [dev-dependencies]
 tempfile.workspace = true

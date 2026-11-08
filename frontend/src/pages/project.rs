@@ -1,4 +1,4 @@
-//! Project details: files, git history, tasks, settings, members.
+//! Project details: files, git history, tasks, settings, environment, members.
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::{
@@ -32,15 +32,17 @@ enum Tab {
     Git,
     Tasks,
     Settings,
+    Environment,
     Members,
 }
 
 impl Tab {
-    const ALL: [Tab; 5] = [
+    const ALL: [Tab; 6] = [
         Tab::Files,
         Tab::Git,
         Tab::Tasks,
         Tab::Settings,
+        Tab::Environment,
         Tab::Members,
     ];
     fn key(self) -> &'static str {
@@ -49,6 +51,7 @@ impl Tab {
             Tab::Git => "git",
             Tab::Tasks => "tasks",
             Tab::Settings => "settings",
+            Tab::Environment => "environment",
             Tab::Members => "members",
         }
     }
@@ -58,6 +61,7 @@ impl Tab {
             Tab::Git => "Verlauf",
             Tab::Tasks => "Aufträge",
             Tab::Settings => "Einstellungen",
+            Tab::Environment => "Umgebung",
             Tab::Members => "Mitglieder",
         }
     }
@@ -67,6 +71,7 @@ impl Tab {
             Tab::Git => Ic::Commit,
             Tab::Tasks => Ic::Queue,
             Tab::Settings => Ic::Settings,
+            Tab::Environment => Ic::Shield,
             Tab::Members => Ic::Users,
         }
     }
@@ -197,6 +202,7 @@ pub fn ProjectPage() -> impl IntoView {
                                 <ProjectRouting p=p.clone() on_saved=Callback::new(move |_| reload())/>
                                 <ProjectSettings p=p on_saved=Callback::new(move |_| reload())/>
                             }.into_any(),
+                            Tab::Environment => view! { <super::environment::ProjectEnvironment p=p/> }.into_any(),
                             Tab::Members => view! { <Members id=pid is_owner=p.role == ProjectRole::Owner me=store.me.get_untracked().id/> }.into_any(),
                         }
                     }}

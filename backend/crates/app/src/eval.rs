@@ -112,6 +112,10 @@ async fn run_script(
         timeout_secs: 60,
         idle_timeout_secs: None,
         queue_files: vec![],
+        // Eval scripts need no network.
+        egress: Default::default(),
+        cache: None,
+        secret_env: vec![],
     };
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });

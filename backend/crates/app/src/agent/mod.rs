@@ -293,6 +293,68 @@ pub fn credential_kinds(provider: &str) -> &'static [&'static str] {
     }
 }
 
+/// `host[:port]` of a URL as an allowlist rule (port only if non-default).
+fn url_host(url: &str) -> Option<String> {
+    let u = url::Url::parse(url).ok()?;
+    let host = u.host_str()?.to_string();
+    Some(match u.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host,
+    })
+}
+
+/// Hosts the CLI of a run must reach itself: the model API and, for
+/// subscriptions, the token refresh endpoints. They are allowed in every
+/// agent network mode (otherwise the agent could not work) and never
+/// inspected. Prior knowledge of the CLIs and providers, **not verified
+/// live** – a missing host shows up as a refused connection in the log.
+pub fn egress_hosts(provider: &str, cred: &Credential) -> Vec<String> {
+    let v = |hs: &[&str]| hs.iter().map(|h| h.to_string()).collect::<Vec<_>>();
+    if let Some(c) = &cred.conn {
+        let base = crate::connectors::wire(&c.kind, &c.config).and_then(|(_, b)| url_host(&b));
+        let mut hosts = match c.kind.as_str() {
+            "claude_subscription" => v(&["api.anthropic.com"]),
+            "codex_subscription" => v(&["chatgpt.com", "auth.openai.com", "api.openai.com"]),
+            "gemini_subscription" => v(&[
+                "cloudcode-pa.googleapis.com",
+                "oauth2.googleapis.com",
+                "generativelanguage.googleapis.com",
+            ]),
+            "gemini_api" => v(&["generativelanguage.googleapis.com"]),
+            "bedrock" => vec![format!(
+                "bedrock-runtime.{}.amazonaws.com",
+                c.get("region").unwrap_or("eu-central-1")
+            )],
+            "vertex" => {
+                let r = c.get("region").unwrap_or("eu");
+                let mut h = v(&["oauth2.googleapis.com", "aiplatform.googleapis.com"]);
+                match r {
+                    "global" => {}
+                    "eu" | "us" => h.push(format!("aiplatform.{r}.rep.googleapis.com")),
+                    region => h.push(format!("{region}-aiplatform.googleapis.com")),
+                }
+                h
+            }
+            _ => vec![],
+        };
+        hosts.extend(base);
+        hosts.dedup();
+        return hosts;
+    }
+    match (provider, cred.kind.as_str()) {
+        ("claude", _) => v(&["api.anthropic.com"]),
+        ("codex", "auth_json") => v(&["chatgpt.com", "auth.openai.com", "api.openai.com"]),
+        ("codex", _) => v(&["api.openai.com"]),
+        ("gemini", "oauth_creds") => v(&[
+            "cloudcode-pa.googleapis.com",
+            "oauth2.googleapis.com",
+            "generativelanguage.googleapis.com",
+        ]),
+        ("gemini", _) => v(&["generativelanguage.googleapis.com"]),
+        _ => vec![],
+    }
+}
+
 pub fn invocation(
     provider: &str,
     model: Option<&str>,
@@ -416,6 +478,66 @@ pub fn parse_line(provider: &str, line: &str, st: &mut ParseState) -> Vec<AgentE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egress_hosts_per_access() {
+        let legacy = |p: &str, k: &str| egress_hosts(p, &Credential::legacy(k, "x"));
+        assert_eq!(legacy("claude", "oauth_token"), vec!["api.anthropic.com"]);
+        assert_eq!(legacy("codex", "api_key"), vec!["api.openai.com"]);
+        assert!(legacy("codex", "auth_json").contains(&"chatgpt.com".to_string()));
+        assert!(legacy("gemini", "oauth_creds").contains(&"oauth2.googleapis.com".to_string()));
+        assert!(legacy("mock", "none").is_empty());
+        let conn = |kind: &str, config: Value| Credential {
+            kind: format!("connector:{kind}"),
+            secret: "x".into(),
+            conn: Some(ConnCfg {
+                id: None,
+                kind: kind.into(),
+                label: "l".into(),
+                config,
+                flex: false,
+            }),
+        };
+        assert_eq!(
+            egress_hosts(
+                "claude",
+                &conn(
+                    "anthropic_gateway",
+                    serde_json::json!({"base_url": "https://gw.example.ch:8443/x"})
+                )
+            ),
+            vec!["gw.example.ch:8443"]
+        );
+        assert_eq!(
+            egress_hosts(
+                "claude",
+                &conn("bedrock", serde_json::json!({"region": "eu-west-3"}))
+            ),
+            vec!["bedrock-runtime.eu-west-3.amazonaws.com"]
+        );
+        assert_eq!(
+            egress_hosts("opencode", &conn("mistral", serde_json::json!({}))),
+            vec!["api.eu.mistral.ai"]
+        );
+        assert_eq!(
+            egress_hosts(
+                "opencode",
+                &conn(
+                    "openai_compatible",
+                    serde_json::json!({"base_url": "http://gpu:8000/v1"})
+                )
+            ),
+            vec!["gpu:8000"]
+        );
+        assert!(egress_hosts(
+            "claude",
+            &conn("vertex", serde_json::json!({"region": "europe-west4"}))
+        )
+        .contains(&"europe-west4-aiplatform.googleapis.com".to_string()));
+        for h in egress_hosts("codex", &conn("codex_subscription", serde_json::json!({}))) {
+            assert!(queued_common::net::HostRule::parse(&h).is_ok(), "{h}");
+        }
+    }
 
     #[test]
     fn non_json_lines_become_text_and_long_lines_are_truncated() {

@@ -13,6 +13,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 mod costs;
+pub mod env;
 mod providers;
 pub use costs::*;
 pub use providers::*;

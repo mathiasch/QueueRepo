@@ -407,6 +407,9 @@ async fn recover_cancels_orphaned_runner_runs(pool: PgPool) {
         timeout_secs: 60,
         idle_timeout_secs: None,
         queue_files: vec![],
+        egress: Default::default(),
+        cache: None,
+        secret_env: vec![],
     };
     let runner = h.st.runner.clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);

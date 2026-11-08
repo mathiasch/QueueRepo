@@ -248,7 +248,7 @@ pub async fn check(
         connectors::Wire::Anthropic => format!("{base}/v1/models"),
         connectors::Wire::OpenAiChat => format!("{base}/models"),
     };
-    let http = llm::client();
+    let http = llm::client(&st.cfg.llm_guard());
     let res = llm::send_json::<Value>(
         &ep,
         ep.req(&http, reqwest::Method::GET, &url)

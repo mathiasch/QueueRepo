@@ -10,6 +10,7 @@ pub mod budget;
 pub mod config;
 pub mod connectors;
 pub mod crypto;
+pub mod environment;
 pub mod error;
 pub mod estimate;
 pub mod eval;

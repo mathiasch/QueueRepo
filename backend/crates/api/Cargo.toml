@@ -9,6 +9,7 @@ description = "HTTP API types shared by the queue app (backend) and the web fron
 sqlx = ["dep:sqlx"]
 
 [dependencies]
+queued-common = { path = "../common" }
 serde.workspace = true
 serde_json.workspace = true
 uuid = { version = "1", features = ["serde"] }

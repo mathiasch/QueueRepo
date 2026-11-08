@@ -3,7 +3,7 @@
 //!   docker – Docker, container process runs as the runner's uid:gid
 //!   none   – plain child process (development only)
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -22,7 +22,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::RunnerConfig;
+use crate::{egress, setup, RunnerConfig};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
@@ -43,11 +43,24 @@ impl std::str::FromStr for Engine {
     }
 }
 
+/// Per-run additions to the sandbox, prepared by [`run`].
+#[derive(Debug, Default)]
+pub struct Sandbox {
+    /// Containers: host directory with the egress socket, bridge and CA,
+    /// mounted read-only at [`egress::CONTAINER_DIR`] (`None` = no network).
+    pub egress_dir: Option<PathBuf>,
+    /// Containers: dependency cache mounted at [`setup::CONTAINER_CACHE`].
+    pub cache_dir: Option<PathBuf>,
+    /// Added after the request's own env (proxy, CA and cache variables).
+    pub env: Vec<(String, String)>,
+}
+
 pub fn build_command(
     cfg: &RunnerConfig,
     req: &ExecRequest,
     workspace: &Path,
     home: &Path,
+    sb: &Sandbox,
 ) -> Command {
     let mut cmd;
     match cfg.engine {
@@ -96,14 +109,24 @@ pub fn build_command(
                     cmd.args(["--user", u]);
                 }
             }
-            if let Some(n) = &cfg.network {
-                cmd.args(["--network", n]);
+            // No network of its own: the only way out is the egress socket.
+            cmd.args(["--network", "none"]);
+            if let Some(d) = &sb.egress_dir {
+                cmd.arg("-v")
+                    .arg(format!("{}:{}:ro", d.display(), egress::CONTAINER_DIR));
             }
-            for (k, v) in &req.env {
+            if let Some(c) = &sb.cache_dir {
+                cmd.arg("-v").arg(vol(c, setup::CONTAINER_CACHE));
+            }
+            for (k, v) in req.env.iter().chain(&sb.env) {
                 cmd.arg("-e").arg(k);
                 cmd.env(k, v);
             }
-            cmd.arg(&cfg.image).arg(&req.program).args(&req.args);
+            cmd.arg(&cfg.image);
+            if sb.egress_dir.is_some() {
+                cmd.args(["sh", "-c", egress::CONTAINER_WRAPPER, "queue-egress"]);
+            }
+            cmd.arg(&req.program).args(&req.args);
         }
         Engine::None => {
             cmd = Command::new(&req.program);
@@ -112,7 +135,8 @@ pub fn build_command(
                 .env("HOME", home)
                 .env("IS_SANDBOX", "1")
                 .env("CI", "1")
-                .envs(req.env.iter().cloned());
+                .envs(req.env.iter().cloned())
+                .envs(sb.env.iter().cloned());
             // Own process group, so timeouts/cancels kill grandchildren too.
             #[cfg(unix)]
             cmd.process_group(0);
@@ -157,8 +181,11 @@ pub async fn probe(cfg: &RunnerConfig) -> Result<Vec<CliProbe>> {
             timeout_secs: 20,
             idle_timeout_secs: None,
             queue_files: vec![],
+            egress: Default::default(),
+            cache: None,
+            secret_env: vec![],
         };
-        let mut cmd = build_command(cfg, &req, &ws, &home);
+        let mut cmd = build_command(cfg, &req, &ws, &home, &Sandbox::default());
         let version = match tokio::time::timeout(Duration::from_secs(20), cmd.output()).await {
             Ok(Ok(o)) if o.status.success() => {
                 let text = String::from_utf8_lossy(if o.stdout.is_empty() {
@@ -256,8 +283,10 @@ pub async fn run(
     tx: mpsc::Sender<ExecFrame>,
 ) {
     let run_dir = cfg.data_dir.join("runs").join(&req.name);
-    let res = run_inner(cfg, &req, &run_dir, &cancel, &tx).await;
+    let egress_dir = egress_dir(cfg, &req.name);
+    let res = run_inner(cfg, &req, &run_dir, &egress_dir, &cancel, &tx).await;
     let _ = tokio::fs::remove_dir_all(&run_dir).await;
+    let _ = tokio::fs::remove_dir_all(&egress_dir).await;
     let stopped = matches!(
         res,
         Ok(ExecFrame::Exit {
@@ -277,6 +306,72 @@ pub async fn run(
         error: format!("{e:#}"),
     });
     let _ = tx.send(frame).await;
+}
+
+/// Short per-run directory for the egress socket: Unix socket paths are
+/// limited to 108 bytes, run names to 64 (checked at startup: the data dir
+/// path is at most [`crate::MAX_DATA_DIR_LEN`] bytes).
+pub fn egress_dir(cfg: &RunnerConfig, name: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let h: String = Sha256::digest(name.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    cfg.data_dir.join("e").join(h)
+}
+
+/// Starts the run's egress proxy (if the run has network or the engine
+/// cannot enforce anything) and fills the sandbox accordingly.
+async fn start_egress(
+    cfg: &RunnerConfig,
+    req: &ExecRequest,
+    dir: &Path,
+    tx: &mpsc::Sender<ExecFrame>,
+    sb: &mut Sandbox,
+) -> Result<Option<egress::Proxy>> {
+    let container = cfg.engine != Engine::None;
+    // Engine none: always a proxy (deny-all for `off`), so programs that
+    // honour the proxy variables see the same rules as in a container.
+    if container && !req.egress.needs_proxy() {
+        return Ok(None);
+    }
+    let _ = tokio::fs::remove_dir_all(dir).await;
+    tokio::fs::create_dir_all(dir).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    let listen = if container {
+        egress::Listen::Unix(dir.join(egress::SOCKET_NAME))
+    } else {
+        egress::Listen::Tcp
+    };
+    let proxy = egress::start(listen, &req.egress, cfg.egress.clone(), tx.clone()).await?;
+    egress::write_dir(dir, proxy.ca_pem.as_deref()).await?;
+    let (url, prefix) = match proxy.tcp_addr {
+        Some(a) => (format!("http://{a}"), dir.display().to_string()),
+        None => (
+            format!("http://127.0.0.1:{}", egress::BRIDGE_PORT),
+            egress::CONTAINER_DIR.to_string(),
+        ),
+    };
+    sb.env.extend(egress::proxy_env(&url));
+    if proxy.ca_pem.is_some() {
+        let bundle = dir
+            .join("ca-bundle.pem")
+            .exists()
+            .then(|| format!("{prefix}/ca-bundle.pem"));
+        sb.env.extend(egress::ca_env(
+            &format!("{prefix}/ca.pem"),
+            bundle.as_deref(),
+        ));
+    }
+    if container {
+        sb.egress_dir = Some(dir.to_path_buf());
+    }
+    Ok(Some(proxy))
 }
 
 async fn write_queue_files(workspace: &Path, files: &[(String, String)]) -> Result<()> {
@@ -305,6 +400,7 @@ async fn run_inner(
     cfg: &RunnerConfig,
     req: &ExecRequest,
     run_dir: &Path,
+    egress_dir: &Path,
     cancel: &CancellationToken,
     tx: &mpsc::Sender<ExecFrame>,
 ) -> Result<ExecFrame> {
@@ -327,8 +423,36 @@ async fn run_inner(
         }
     }
     write_queue_files(&workspace, &req.queue_files).await?;
+    for n in &req.secret_env {
+        anyhow::ensure!(
+            req.env.iter().any(|(k, _)| k == n),
+            "secret {n} is not part of env"
+        );
+    }
+    let secrets: Vec<(String, String)> = req
+        .env
+        .iter()
+        .filter(|(k, _)| req.secret_env.contains(k))
+        .cloned()
+        .collect();
 
-    let mut child = build_command(cfg, req, &workspace, &home)
+    let mut sb = Sandbox::default();
+    let cache = match &req.cache {
+        Some(spec) => Some(setup::prepare(cfg, &req.workspace, &workspace, spec).await?),
+        None => None,
+    };
+    if let Some(c) = &cache {
+        if cfg.engine == Engine::None {
+            sb.env
+                .extend(setup::cache_env(&c.dir.display().to_string()));
+        } else {
+            sb.env.extend(setup::cache_env(setup::CONTAINER_CACHE));
+            sb.cache_dir = Some(c.dir.clone());
+        }
+    }
+    let proxy = start_egress(cfg, req, egress_dir, tx, &mut sb).await?;
+
+    let mut child = build_command(cfg, req, &workspace, &home, &sb)
         .spawn()
         .with_context(|| format!("failed to start {}", req.program))?;
     let pid = child.id();
@@ -343,13 +467,18 @@ async fn run_inner(
     // Milliseconds since `started` at which the last output line arrived.
     let started = Instant::now();
     let last_output = Arc::new(AtomicU64::new(0));
+    let secret_values: Arc<Vec<String>> =
+        Arc::new(secrets.iter().map(|(_, v)| v.clone()).collect());
     let reader = |stream: Box<dyn tokio::io::AsyncRead + Send + Unpin>, is_err: bool| {
         let tx = tx.clone();
         let last = last_output.clone();
+        let secret_values = secret_values.clone();
         tokio::spawn(async move {
             let mut l = BufReader::new(stream).lines();
             while let Ok(Some(line)) = l.next_line().await {
                 last.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                // Secret values never leave the runner in output lines.
+                let line = setup::redact(line, &secret_values);
                 let f = if is_err {
                     ExecFrame::Err { line }
                 } else {
@@ -413,6 +542,37 @@ async fn run_inner(
         }
     }
 
+    drop(proxy);
+    let success = reason.is_none() && status.map(|s| s.success()).unwrap_or(false);
+    if let Some(c) = &cache {
+        setup::finish(c, success).await;
+    }
+    let mut leaks = vec![];
+    if !secrets.is_empty() {
+        let mut roots = vec![("workspace".to_string(), workspace.clone())];
+        if let Some(c) = cache.as_ref().filter(|_| success) {
+            roots.push(("cache".to_string(), c.dir.clone()));
+        }
+        let scan_secrets = secrets.clone();
+        let found = tokio::task::spawn_blocking(move || setup::scan(&roots, &scan_secrets)).await?;
+        if !found.complete {
+            let _ = tx
+                .send(ExecFrame::Err {
+                    line: "queue: secret search stopped at its limits (not every file was checked)"
+                        .into(),
+                })
+                .await;
+        }
+        if !found.leaks.is_empty() {
+            if let Some(c) = &cache {
+                if found.leaks.iter().any(|l| l.contains(" in cache/")) {
+                    let _ = tokio::fs::remove_dir_all(&c.dir).await;
+                }
+            }
+            leaks = setup::scrub(&workspace, &found.leaks, &secrets).await;
+        }
+    }
+
     let mut files = vec![];
     for rel in &req.read_back {
         if safe_rel(rel) {
@@ -423,13 +583,15 @@ async fn run_inner(
     }
     Ok(ExecFrame::Exit {
         // A stopped run never counts as a natural success, whatever its exit code.
-        success: reason.is_none() && status.map(|s| s.success()).unwrap_or(false),
+        success,
         code: status.and_then(|s| s.code()),
         timed_out: reason == Some(StopReason::Timeout),
         cancelled: reason == Some(StopReason::Cancel),
         stalled: reason == Some(StopReason::Stall),
         killed,
         files,
+        cache: cache.map(|c| c.info),
+        leaks,
     })
 }
 
@@ -465,6 +627,9 @@ mod tests {
             timeout_secs: 10,
             idle_timeout_secs: None,
             queue_files: vec![],
+            egress: Default::default(),
+            cache: None,
+            secret_env: vec![],
         }
     }
 
@@ -748,6 +913,7 @@ mod tests {
                 &req("claude", &["-p"]),
                 Path::new("/w"),
                 Path::new("/h"),
+                &Sandbox::default(),
             );
             let args: Vec<String> = cmd
                 .as_std()
@@ -768,6 +934,190 @@ mod tests {
                 engine == Engine::Docker
             );
         }
+    }
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn containers_have_no_network_and_reach_out_only_through_the_egress_socket() {
+        let t = tempfile::tempdir().unwrap();
+        let c = cfg(t.path(), Engine::Podman);
+        let r = req("claude", &["-p"]);
+        // Without network: no mount, no wrapper, still --network none.
+        let plain = args_of(&build_command(
+            &c,
+            &r,
+            Path::new("/w"),
+            Path::new("/h"),
+            &Sandbox::default(),
+        ));
+        let j = plain.join(" ");
+        assert!(j.contains("--network none"), "{j}");
+        assert!(!j.contains("queue-egress") && !j.contains("/cache"), "{j}");
+        let sb = Sandbox {
+            egress_dir: Some("/d/e/abc".into()),
+            cache_dir: Some("/d/caches/p/k".into()),
+            env: vec![("HTTPS_PROXY".into(), "http://127.0.0.1:3128".into())],
+        };
+        let a = args_of(&build_command(
+            &c,
+            &r,
+            Path::new("/w"),
+            Path::new("/h"),
+            &sb,
+        ));
+        let j = a.join(" ");
+        assert!(j.contains("--network none"));
+        assert!(
+            a.windows(2)
+                .any(|w| w[0] == "-v" && w[1] == "/d/e/abc:/queue-egress:ro"),
+            "{j}"
+        );
+        assert!(
+            a.windows(2)
+                .any(|w| w[0] == "-v" && w[1] == "/d/caches/p/k:/cache"),
+            "{j}"
+        );
+        assert!(a.windows(2).any(|w| w[0] == "-e" && w[1] == "HTTPS_PROXY"));
+        // Wrapper runs after the image, then the real program and its args.
+        let img = a.iter().position(|x| x == &c.image).unwrap();
+        assert_eq!(&a[img + 1..img + 3], &["sh".to_string(), "-c".to_string()]);
+        assert_eq!(a[img + 3], egress::CONTAINER_WRAPPER);
+        assert_eq!(
+            &a[img + 4..],
+            &["queue-egress".to_string(), "claude".into(), "-p".into()]
+        );
+        assert!(!j.contains("s3"), "secret value never in argv");
+        assert!(j.contains("--cap-drop ALL") && j.contains("no-new-privileges"));
+    }
+
+    #[tokio::test]
+    async fn engine_none_runs_behind_the_proxy_and_reports_decisions() {
+        let t = tempfile::tempdir().unwrap();
+        let c = cfg(t.path(), Engine::None);
+        let mut r = req(
+            "sh",
+            &["-c", "curl -s -o /dev/null -w 'connect=%{http_connect}\\n' https://blocked.invalid/ ; echo \"proxy=${HTTPS_PROXY%:*}\""],
+        );
+        r.egress = queued_common::EgressPolicy {
+            mode: queued_common::NetMode::Allowlist,
+            allow: vec!["pypi.org".into()],
+            ..Default::default()
+        };
+        let f = collect(&c, r, CancellationToken::new()).await;
+        assert!(
+            f.contains(&ExecFrame::Egress {
+                host: "blocked.invalid".into(),
+                port: 443,
+                method: "CONNECT".into(),
+                verdict: queued_common::EgressVerdict::NotAllowed,
+            }),
+            "{f:?}"
+        );
+        assert!(
+            f.contains(&ExecFrame::Out {
+                line: "connect=403".into()
+            }),
+            "{f:?}"
+        );
+        assert!(
+            f.contains(&ExecFrame::Out {
+                line: "proxy=http://127.0.0.1".into()
+            }),
+            "{f:?}"
+        );
+        assert!(
+            !c.data_dir
+                .join("e")
+                .read_dir()
+                .is_ok_and(|mut d| d.next().is_some()),
+            "egress dir removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn secrets_are_redacted_and_leaks_reported() {
+        let t = tempfile::tempdir().unwrap();
+        let c = cfg(t.path(), Engine::None);
+        let mut r = req(
+            "sh",
+            &[
+                "-c",
+                "echo token=$NPM_TOKEN; echo \"//r/:_authToken=$NPM_TOKEN\" > .npmrc",
+            ],
+        );
+        r.env = vec![
+            ("NPM_TOKEN".into(), "npm-secret-4711".into()),
+            ("PLAIN".into(), "x".into()),
+        ];
+        r.secret_env = vec!["NPM_TOKEN".into()];
+        let f = collect(&c, r, CancellationToken::new()).await;
+        assert!(
+            f.contains(&ExecFrame::Out {
+                line: "token=***".into()
+            }),
+            "{f:?}"
+        );
+        let all = format!("{f:?}");
+        assert!(!all.contains("npm-secret-4711"), "{all}");
+        match f.last().unwrap() {
+            ExecFrame::Exit { leaks, success, .. } => {
+                assert!(success);
+                assert_eq!(
+                    leaks,
+                    &vec!["NPM_TOKEN in workspace/.npmrc: entfernt".to_string()]
+                );
+            }
+            o => panic!("{o:?}"),
+        }
+        assert!(
+            !c.workspaces().join("w1/.npmrc").exists(),
+            "leaked file removed"
+        );
+        // A secret name that is not part of env is a caller error.
+        let mut r = req("true", &[]);
+        r.secret_env = vec!["MISSING".into()];
+        let f = collect(&c, r, CancellationToken::new()).await;
+        assert!(matches!(f.last().unwrap(), ExecFrame::Fail { .. }));
+    }
+
+    #[tokio::test]
+    async fn setup_cache_is_mounted_via_env_and_reported() {
+        let t = tempfile::tempdir().unwrap();
+        let c = cfg(t.path(), Engine::None);
+        let run = |marker: &'static str| {
+            let mut r = req("sh", &["-c", &format!("ls \"$npm_config_cache\" 2>/dev/null; mkdir -p \"$npm_config_cache\" && touch \"$npm_config_cache/{marker}\"")]);
+            r.cache = Some(queued_common::CacheSpec {
+                key_material: "npm ci".into(),
+                files: vec!["package-lock.json".into()],
+            });
+            r
+        };
+        let f = collect(&c, run("first"), CancellationToken::new()).await;
+        let info = |f: &[ExecFrame]| match f.last().unwrap() {
+            ExecFrame::Exit { cache, .. } => cache.clone().unwrap(),
+            o => panic!("{o:?}"),
+        };
+        assert!(!info(&f).hit);
+        let f2 = collect(&c, run("second"), CancellationToken::new()).await;
+        assert!(info(&f2).hit && info(&f2).key == info(&f).key);
+        assert!(
+            f2.contains(&ExecFrame::Out {
+                line: "first".into()
+            }),
+            "cache content survives: {f2:?}"
+        );
+        std::fs::write(c.workspaces().join("w1/package-lock.json"), "{}").unwrap();
+        let f3 = collect(&c, run("third"), CancellationToken::new()).await;
+        assert!(
+            !info(&f3).hit && info(&f3).key != info(&f).key,
+            "lockfile change = new cache"
+        );
     }
 
     #[tokio::test]

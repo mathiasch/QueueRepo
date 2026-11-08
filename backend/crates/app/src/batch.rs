@@ -263,7 +263,7 @@ async fn process(st: &AppState, j: Job) -> anyhow::Result<()> {
         )
         .await;
     };
-    let http = llm::client();
+    let http = llm::client(&st.cfg.llm_guard());
     let req = request_of(&j.request);
     match (j.mode.as_str(), j.status.as_str()) {
         ("sync", _) => {
@@ -517,7 +517,9 @@ pub async fn cancel_for_task(st: &AppState, task_id: Uuid) -> anyhow::Result<()>
         let st = st.clone();
         tokio::spawn(async move {
             if let Ok(Some((_, ep))) = endpoint(&st, &j).await {
-                if let Err(e) = cancel_remote(&llm::client(), &ep, &j.api, &ext).await {
+                if let Err(e) =
+                    cancel_remote(&llm::client(&st.cfg.llm_guard()), &ep, &j.api, &ext).await
+                {
                     tracing::warn!("batch cancel {ext}: {e}");
                 }
             }

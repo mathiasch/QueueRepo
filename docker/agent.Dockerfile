@@ -1,4 +1,7 @@
 # Sandbox image for agent runs: one throwaway container per run.
+# Runs as root inside (= the runner's uid under rootless Podman) and must keep
+# `node` on PATH: containers have no network (--network none), the runner's
+# egress bridge (/queue-egress/bridge.js) is started with this node (WP02).
 # Contains the official agent CLIs + common build tooling. Extend as needed
 # (e.g. add Rust, Go, Java) – the verify command runs in this image too.
 FROM node:22-bookworm-slim

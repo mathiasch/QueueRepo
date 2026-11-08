@@ -9,7 +9,9 @@
 //! without any output after the first usage line, then success),
 //! MOCK_USAGE_TOTAL (final usage report far above the live deltas, like
 //! codex/gemini that report usage only at the end), MOCK_SOLUTION_B64:<b64>
-//! (runs the decoded shell script in the workspace – eval set, see `eval.rs`).
+//! (runs the decoded shell script in the workspace – eval set, see `eval.rs`),
+//! MOCK_ENV (writes the names of its environment variables to MOCK_ENV.txt),
+//! MOCK_NET:<url> (fetches the URL through the run's egress proxy, WP02).
 use serde_json::Value;
 
 use super::{
@@ -50,6 +52,14 @@ case "$P" in
        echo '{"type":"error","category":"overloaded","text":"API Error: 529 overloaded"}'; exit 1;; esac;;
   *MOCK_AUTH*) echo '{"type":"error","category":"authentication_failed","text":"Invalid API key"}'; exit 1;;
   *MOCK_TURNS*) if [ -n "$QUEUE_MAX_TURNS" ]; then echo '{"type":"limit","kind":"turns"}'; exit 1; fi;;
+esac
+case "$P" in
+  *MOCK_ENV*) env | cut -d= -f1 | sort > MOCK_ENV.txt;;
+esac
+case "$P" in
+  *MOCK_NET:*) U=$(printf '%s\n' "$P" | sed -n 's/.*MOCK_NET:\([^ ]*\).*/\1/p' | head -n 1)
+    C=$(curl -s -o /dev/null -w '%{http_code}/%{http_connect}' "$U" 2>/dev/null || true)
+    echo '{"type":"text","text":"net '"$C"'"}';;
 esac
 case "$P" in
   *MOCK_SOLUTION_B64:*) printf '%s\n' "$P" | sed -n 's/.*MOCK_SOLUTION_B64:\([A-Za-z0-9+/=]*\).*/\1/p' | head -n 1 | base64 -d | sh

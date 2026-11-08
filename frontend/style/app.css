@@ -703,3 +703,23 @@ fieldset.form-section legend { font-weight: 600; margin-bottom: var(--sp-2); pad
 @media (pointer: coarse) { .seg-radio span { min-height: 44px; } }
 details > summary { cursor: pointer; }
 @media (pointer: coarse) { details > summary { min-height: 44px; display: flex; align-items: center; gap: var(--sp-2); } }
+
+/* Environment editor (WP02) */
+.env-banner { align-items: flex-start; }
+.env-banner p { margin: 2px 0 0; }
+.env-vars { display: flex; flex-direction: column; gap: var(--sp-2); }
+.env-var-row { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr) auto; gap: var(--sp-2); align-items: center; }
+@media (max-width: 560px) {
+  .env-var-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .env-var-row input:nth-of-type(2) { grid-column: 1 / 2; }
+}
+.net-card { gap: var(--sp-3); }
+.preset-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0 var(--sp-4); }
+.preset-grid .check-text small { overflow-wrap: anywhere; }
+.secret-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-1); }
+.secret-row { display: flex; align-items: center; gap: var(--sp-2); min-height: var(--touch); flex-wrap: wrap; border-bottom: 1px solid var(--border); }
+.secret-row .mono { overflow-wrap: anywhere; }
+.secret-submit { justify-content: flex-start; }
+.secret-submit .btn { margin-top: 26px; align-self: flex-start; }
+@media (max-width: 560px) { .secret-submit .btn { margin-top: 0; } }
+#env-errors ul, [data-testid="env-errors"] ul { margin: 0; padding-left: var(--sp-4); }

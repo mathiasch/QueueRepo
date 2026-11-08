@@ -22,8 +22,8 @@ pub fn per_task(cred: &Credential) -> Option<(String, String)> {
     Some((base, cred.secret.clone()))
 }
 
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
+fn client(guard: &crate::llm::Guard) -> reqwest::Client {
+    crate::llm::guarded_builder(guard)
         .timeout(Duration::from_secs(30))
         .build()
         .expect("http client")
@@ -48,7 +48,7 @@ pub async fn issue(
     if let Some(b) = max_budget {
         body["max_budget"] = json!((b * 10_000.0).floor() / 10_000.0);
     }
-    let resp = client()
+    let resp = client(guard)
         .post(format!("{base}/key/generate"))
         .bearer_auth(master)
         .json(&body)
@@ -74,7 +74,7 @@ pub async fn revoke(base: &str, master: &str, key: &str, guard: &crate::llm::Gua
     if crate::llm::check_target(base, guard).await.is_err() {
         return;
     }
-    let r = client()
+    let r = client(guard)
         .post(format!("{base}/key/delete"))
         .bearer_auth(master)
         .json(&json!({"keys": [key]}))

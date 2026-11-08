@@ -30,6 +30,8 @@ pub struct AppState {
     pub vapid: Arc<Vapid>,
     /// Effective price catalog, cached per override version (see `pricing::current`).
     pub prices: Arc<std::sync::RwLock<Option<PriceCache>>>,
+    /// What the runner enforces (`GET /v1/info`), cached (see `environment::sandbox`).
+    pub sandbox: Arc<std::sync::RwLock<Option<(std::time::Instant, queued_api::env::SandboxInfo)>>>,
 }
 
 pub type PriceCache = (Option<i32>, Arc<queued_api::PriceCatalog>);
@@ -52,6 +54,7 @@ impl AppState {
             running: Arc::new(Mutex::new(HashMap::new())),
             vapid: Arc::new(vapid),
             prices: Arc::new(std::sync::RwLock::new(None)),
+            sandbox: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 

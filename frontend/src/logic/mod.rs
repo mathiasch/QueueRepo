@@ -4,6 +4,7 @@ pub mod b64;
 pub mod budget;
 pub mod costs;
 pub mod diff;
+pub mod env;
 pub mod errors;
 pub mod format;
 pub mod labels;

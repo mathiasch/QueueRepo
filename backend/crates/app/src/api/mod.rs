@@ -1,4 +1,5 @@
 mod credentials;
+mod environment;
 mod evals;
 pub mod limits;
 mod projects;
@@ -94,6 +95,18 @@ pub fn router(st: AppState) -> Router {
         .route(
             "/projects/{id}/members",
             get(projects::members).post(projects::add_member),
+        )
+        .route(
+            "/projects/{id}/environment",
+            get(environment::get).put(environment::put),
+        )
+        .route(
+            "/projects/{id}/environment/cache/clear",
+            post(environment::clear_cache),
+        )
+        .route(
+            "/projects/{id}/secrets/{name}",
+            put(environment::put_secret).delete(environment::delete_secret),
         )
         .route(
             "/projects/{id}/members/{user_id}",

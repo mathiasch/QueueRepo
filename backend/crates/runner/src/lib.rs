@@ -1,7 +1,9 @@
 //! queued-runner: the only component that touches files and processes.
 //! Runs as an unprivileged user; agents run in rootless containers.
+pub mod egress;
 pub mod exec;
 pub mod git;
+pub mod setup;
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
@@ -29,7 +31,6 @@ pub struct RunnerConfig {
     pub token: String,
     pub engine: Engine,
     pub image: String,
-    pub network: Option<String>,
     pub memory: String,
     pub cpus: String,
     /// `--user` for the docker engine (defaults to the runner's uid:gid).
@@ -39,7 +40,13 @@ pub struct RunnerConfig {
     /// Seconds a process gets after SIGINT (cancel/timeout/stall) to finish
     /// its turn and flush output before it is SIGKILLed.
     pub kill_grace_secs: u64,
+    /// Operator settings of the egress proxy (`RUNNER_EGRESS_*`).
+    pub egress: Arc<egress::EgressConfig>,
 }
+
+/// Longest data dir path: `<data_dir>/e/<16 hex>/p.sock` must stay below the
+/// 108-byte limit of Unix socket paths.
+pub const MAX_DATA_DIR_LEN: usize = 80;
 
 impl RunnerConfig {
     pub fn workspaces(&self) -> PathBuf {
@@ -52,12 +59,28 @@ impl RunnerConfig {
             token: "test-token".into(),
             engine: Engine::None,
             image: "queued-agent:latest".into(),
-            network: None,
             memory: "1g".into(),
             cpus: "1".into(),
             docker_user: None,
             volume_opts: String::new(),
             kill_grace_secs: 2,
+            egress: Arc::new(egress::EgressConfig {
+                // Tests use local fake upstream servers.
+                private_hosts: vec![queued_common::net::HostRule::parse("127.0.0.1").expect("rule")],
+                ..Default::default()
+            }),
+        }
+    }
+
+    pub fn info(&self) -> RunnerInfo {
+        RunnerInfo {
+            engine: match self.engine {
+                Engine::Podman => "podman",
+                Engine::Docker => "docker",
+                Engine::None => "none",
+            }
+            .into(),
+            egress_enforced: self.engine != Engine::None,
         }
     }
 }
@@ -135,6 +158,10 @@ async fn auth(State(st): State<RunnerState>, req: Request, next: Next) -> Respon
 pub fn router(st: RunnerState) -> Router {
     let api = Router::new()
         .route("/workspaces/{id}", post(init).delete(delete_ws))
+        .route(
+            "/workspaces/{id}/cache",
+            axum::routing::delete(delete_cache),
+        )
         .route("/workspaces/{id}/begin", post(begin))
         .route("/workspaces/{id}/commit", post(commit))
         .route("/workspaces/{id}/diff", post(diff))
@@ -152,6 +179,7 @@ pub fn router(st: RunnerState) -> Router {
         .route("/exec", post(exec_start))
         .route("/exec/{name}/cancel", post(exec_cancel))
         .route("/cli-status", get(cli_status))
+        .route("/info", get(info))
         .layer(middleware::from_fn_with_state(st.clone(), auth));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -180,7 +208,34 @@ async fn delete_ws(
     let l = st.lock(&id).await;
     let _g = l.lock().await;
     repo.delete().await?;
+    remove_caches(&st, &id).await?;
     Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn remove_caches(st: &RunnerState, id: &str) -> R<()> {
+    let dir = setup::caches_root(&st.cfg, id);
+    match tokio::fs::remove_dir_all(&dir).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::Error::from(e).into()),
+    }
+}
+
+/// Drops the dependency caches of a project (next setup starts cold).
+async fn delete_cache(
+    State(st): State<RunnerState>,
+    Path(id): Path<String>,
+) -> R<Json<serde_json::Value>> {
+    st.repo(&id)?;
+    let l = st.lock(&id).await;
+    let _g = l.lock().await;
+    remove_caches(&st, &id).await?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+/// Engine and whether egress rules are enforced.
+async fn info(State(st): State<RunnerState>) -> Json<RunnerInfo> {
+    Json(st.cfg.info())
 }
 
 fn existing(st: &RunnerState, id: &str) -> R<Repo> {
@@ -470,6 +525,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn info_and_cache_removal() {
+        let (t, a) = serve().await;
+        let c = reqwest::Client::new();
+        let info: RunnerInfo = c
+            .get(format!("{a}/v1/info"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            info,
+            RunnerInfo {
+                engine: "none".into(),
+                egress_enforced: false
+            }
+        );
+        assert_eq!(
+            c.get(format!("{a}/v1/info")).send().await.unwrap().status(),
+            401
+        );
+        c.post(format!("{a}/v1/workspaces/w1"))
+            .bearer_auth("test-token")
+            .json(&InitWorkspace::default())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let cache = t.path().join("caches/w1/abc");
+        std::fs::create_dir_all(&cache).unwrap();
+        let del = |path: &str| {
+            c.delete(format!("{a}/v1/workspaces/{path}"))
+                .bearer_auth("test-token")
+                .send()
+        };
+        assert_eq!(del("w1/cache").await.unwrap().status(), 200);
+        assert!(!cache.exists());
+        // Idempotent, and deleting the workspace drops its caches too.
+        assert_eq!(del("w1/cache").await.unwrap().status(), 200);
+        std::fs::create_dir_all(&cache).unwrap();
+        assert_eq!(del("w1").await.unwrap().status(), 200);
+        assert!(!t.path().join("caches/w1").exists());
+        assert_eq!(del("..%2Fx/cache").await.unwrap().status(), 400);
+    }
+
+    #[tokio::test]
     async fn exec_streams_ndjson_over_http() {
         let (_t, a) = serve().await;
         let c = reqwest::Client::new();
@@ -496,6 +600,9 @@ mod tests {
             timeout_secs: 10,
             idle_timeout_secs: None,
             queue_files: vec![("result.schema.json".into(), "{\"type\":\"object\"}".into())],
+            egress: Default::default(),
+            cache: None,
+            secret_env: vec![],
         };
         let body = c
             .post(format!("{a}/v1/exec"))
