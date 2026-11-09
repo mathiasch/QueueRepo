@@ -46,5 +46,6 @@ Grundlage: `WP03-plan.md`. Branch `mvp`, nicht committet. Testbericht: `WP03-tes
 | Discard prunt immer | Prune verschoben, wenn im Workspace ein Prozess läuft | `prune --expire=now` könnte noch nicht referenzierte Objekte eines laufenden Agenten löschen (Selbst-Review) |
 | Kein Größen-Bypass | `allow_large` bei Freigabe eines `too_large`-Funds | Sonst hätte die Freigabe einer zu großen Änderung nie committen können (Endlosschleife, Selbst-Review) |
 | Setup-Dateien-Fund am Commit | nur Baseline vor dem Setup | deckt alle Wege ab, keine Doppelprüfung |
+| Agent-Konfiguration nur per Baseline vor dem Lauf | zusätzlich `watch` im Gate vor dem Commit (jede Änderung, auch neue Dateien) und Baseline-Update nach Freigabe | sonst hätte der Review-Lauf desselben Auftrags vom Agenten angelegte Hooks/MCP geladen (Selbst-Review B6) |
 | — | `setup.rs::git_ok` gehärtet | ungehärtetes Git nach dem Setup gefunden |
 | — | Event-Redaktion zentral in `event()`/`finish()`/`notify()` | eine Stelle statt vieler Aufrufer |
