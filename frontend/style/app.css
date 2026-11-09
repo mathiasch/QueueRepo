@@ -736,3 +736,8 @@ details > summary { cursor: pointer; }
 .check-list li > svg { flex: none; margin-top: 2px; }
 .cli-support { list-style: none; margin: var(--sp-2) 0 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
 .cli-support li { display: flex; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }
+
+/* WP04: branch per task, merge queue */
+.mono-wrap { font-family: var(--mono); font-size: var(--fs-xs); overflow-wrap: anywhere; }
+.plain { list-style: none; padding: 0; margin: var(--sp-2) 0; display: flex; flex-direction: column; gap: 2px; }
+ol.list { list-style: none; padding: 0; margin: 0; }

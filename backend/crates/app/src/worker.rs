@@ -1,6 +1,7 @@
-//! Scheduler: per-user queues, configurable parallelism (default 1), one
-//! running task per project (shared workspace), provider pauses on limits,
-//! and OnEmptyQueue maintenance runs.
+//! Scheduler: per-user queues, configurable parallelism per user and per
+//! project (default 1 each; every task has its own working tree, WP04),
+//! the per-project merge queue, provider pauses on limits, and OnEmptyQueue
+//! maintenance runs.
 use std::time::Duration;
 
 use anyhow::Result;
@@ -26,9 +27,11 @@ pub async fn recover(st: &AppState) -> Result<()> {
     // The runner may outlive the app: stop orphaned runs of these tasks, or
     // they keep changing the workspace and every retry is refused with 409
     // until they end (best effort, the runner may be down as well).
-    let orphans: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM tasks WHERE status='running'")
-        .fetch_all(&st.db)
-        .await?;
+    let orphans: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM tasks WHERE status='running' OR (status='merging' AND merge_state='merging')",
+    )
+    .fetch_all(&st.db)
+    .await?;
     let cancels = orphans.iter().flat_map(|id| {
         ["agent", "review", "verify"].map(|l| {
             let name = runner::run_name(*id, l);
@@ -78,6 +81,18 @@ pub async fn recover(st: &AppState) -> Result<()> {
     .execute(&st.db)
     .await?
     .rows_affected();
+    // Interrupted merges go back into the merge queue (nothing was merged
+    // unless the fast-forward happened; a repeated merge of a merged task
+    // is detected by its merge state).
+    let merges = sqlx::query(
+        "UPDATE tasks SET merge_state='queued', updated_at=now() WHERE status='merging' AND merge_state='merging'",
+    )
+    .execute(&st.db)
+    .await?
+    .rows_affected();
+    if merges > 0 {
+        tracing::info!("re-queued {merges} interrupted merge(s)");
+    }
     if n > 0 || !blocked.is_empty() {
         tracing::info!(
             "re-queued {n} interrupted task(s), blocked {}",
@@ -97,6 +112,9 @@ pub async fn run(st: AppState) {
             last_prune = std::time::Instant::now();
             if let Err(e) = budget::prune(&st.db).await {
                 tracing::warn!("usage prune failed: {e:#}");
+            }
+            if let Err(e) = runner::merge::sweep(&st).await {
+                tracing::warn!("working tree sweep failed: {e:#}");
             }
         }
         tokio::select! {
@@ -124,7 +142,7 @@ async fn tick(st: &AppState) -> Result<()> {
             Blocked::default()
         };
         while slots > 0 {
-            match claim_next(st, s.user_id, &blocked).await? {
+            match claim_next(&st.db, s.user_id, &blocked).await? {
                 Some(task) => {
                     spawn(st, task).await;
                     slots -= 1;
@@ -137,12 +155,18 @@ async fn tick(st: &AppState) -> Result<()> {
             maybe_onempty(st, &s).await?;
         }
     }
+    while let Some(task) = claim_merge(&st.db).await? {
+        let token = CancellationToken::new();
+        st.running.lock().await.insert(task.id, token.clone());
+        queue::emit_task(st, task.id).await;
+        tokio::spawn(runner::merge::run_merge(st.clone(), task, token));
+    }
     Ok(())
 }
 
 /// What the scheduler must not start right now.
 #[derive(Default)]
-struct Blocked {
+pub struct Blocked {
     /// Legacy credentials paused (limit/auth) or out of budget.
     legacy: Vec<String>,
     /// Harnesses whose token/cost budget is exhausted (applies to connectors too).
@@ -152,7 +176,7 @@ struct Blocked {
 }
 
 impl Blocked {
-    async fn load(st: &AppState, user: Uuid) -> Result<Self> {
+    pub async fn load(st: &AppState, user: Uuid) -> Result<Self> {
         let mut b = Blocked::default();
         for p in st.cfg.providers() {
             let s = budget::status(&st.db, user, p).await?;
@@ -174,30 +198,140 @@ impl Blocked {
     }
 }
 
-/// Claims the next runnable task. Legacy tasks: provider paused (limit,
-/// auth) or out of budget; connector tasks: connector paused or the
-/// harness out of budget. Tasks in backoff (`not_before` in the future) are skipped.
-async fn claim_next(st: &AppState, user_id: Uuid, blocked: &Blocked) -> Result<Option<Task>> {
-    Ok(sqlx::query_as::<_, Task>(
-        "UPDATE tasks SET status='running', started_at=now(), updated_at=now(), error=NULL, not_before=NULL
-         WHERE id = (
-            SELECT t.id FROM tasks t
-            WHERE t.user_id = $1 AND t.status = 'queued'
-              AND (t.not_before IS NULL OR t.not_before <= now())
-              AND NOT EXISTS (SELECT 1 FROM tasks r WHERE r.project_id = t.project_id AND r.status = 'running')
-              AND CASE WHEN t.connector_id IS NULL THEN NOT (t.provider = ANY($2))
-                       ELSE NOT (t.provider = ANY($3)) AND NOT (('connector:' || t.connector_id::text) = ANY($4)) END
-            ORDER BY t.position
-            LIMIT 1
-            FOR UPDATE SKIP LOCKED)
-         RETURNING *",
-    )
-    .bind(user_id)
-    .bind(&blocked.legacy)
-    .bind(&blocked.budget)
-    .bind(&blocked.connectors)
-    .fetch_optional(&st.db)
-    .await?)
+/// Runnable queued tasks of the user (provider/connector not paused, not in
+/// backoff); `$1` user, `$2..$4` [`Blocked`].
+const RUNNABLE: &str = "t.user_id = $1 AND t.status = 'queued'
+      AND (t.not_before IS NULL OR t.not_before <= now())
+      AND CASE WHEN t.connector_id IS NULL THEN NOT (t.provider = ANY($2))
+               ELSE NOT (t.provider = ANY($3)) AND NOT (('connector:' || t.connector_id::text) = ANY($4)) END";
+
+/// Claims the next runnable task of the user. A project has as many tasks
+/// in flight as its parallelism allows – running, or finished and waiting
+/// in its merge queue (with the default 1 a task starts on the target
+/// branch its predecessor was merged into, as before WP04: no conflicts in
+/// serial projects). Race-free even with concurrent claimers (several app
+/// instances): per candidate project, in one transaction,
+/// 1. the project row is locked (`FOR UPDATE SKIP LOCKED`; locked = another
+///    claimer is deciding for this project right now → skip it),
+/// 2. a **new statement** (READ COMMITTED: fresh snapshot, taken after the
+///    lock, so it sees every claim committed before) counts the running
+///    tasks and claims the task (`FOR UPDATE SKIP LOCKED`) only below the
+///    limit.
+///
+/// The lock order project → task matches `DELETE FROM projects` (cascade).
+pub async fn claim_next(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    blocked: &Blocked,
+) -> Result<Option<Task>> {
+    let mut skip: Vec<Uuid> = vec![];
+    loop {
+        let mut tx = db.begin().await?;
+        let candidate: Option<Uuid> = sqlx::query_scalar(&format!(
+            "SELECT t.project_id FROM tasks t JOIN projects p ON p.id = t.project_id
+             WHERE {RUNNABLE} AND NOT (t.project_id = ANY($5))
+               AND (SELECT count(*) FROM tasks r WHERE r.project_id = t.project_id AND r.status IN ('running','merging')) < p.parallelism
+             ORDER BY t.position LIMIT 1"
+        ))
+        .bind(user_id)
+        .bind(&blocked.legacy)
+        .bind(&blocked.budget)
+        .bind(&blocked.connectors)
+        .bind(&skip)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(project) = candidate else {
+            return Ok(None);
+        };
+        let locked: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM projects WHERE id = $1 FOR UPDATE SKIP LOCKED")
+                .bind(project)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if locked.is_none() {
+            skip.push(project);
+            continue;
+        }
+        let task = sqlx::query_as::<_, Task>(&format!(
+            "UPDATE tasks SET status='running', started_at=now(), updated_at=now(), error=NULL, not_before=NULL
+             WHERE id = (
+                SELECT t.id FROM tasks t WHERE {RUNNABLE} AND t.project_id = $5
+                ORDER BY t.position LIMIT 1
+                FOR UPDATE SKIP LOCKED)
+               AND (SELECT count(*) FROM tasks r WHERE r.project_id = $5 AND r.status IN ('running','merging'))
+                   < (SELECT parallelism FROM projects WHERE id = $5)
+             RETURNING *"
+        ))
+        .bind(user_id)
+        .bind(&blocked.legacy)
+        .bind(&blocked.budget)
+        .bind(&blocked.connectors)
+        .bind(project)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match task {
+            Some(t) => {
+                tx.commit().await?;
+                return Ok(Some(t));
+            }
+            None => skip.push(project),
+        }
+    }
+}
+
+/// Claims the next merge of the merge queues: per project at most one
+/// merge at a time, oldest first (same locking scheme as [`claim_next`]).
+pub async fn claim_merge(db: &sqlx::PgPool) -> Result<Option<Task>> {
+    let mut skip: Vec<Uuid> = vec![];
+    loop {
+        let mut tx = db.begin().await?;
+        let candidate: Option<Uuid> = sqlx::query_scalar(
+            "SELECT t.project_id FROM tasks t
+             WHERE t.status = 'merging' AND t.merge_state = 'queued'
+               AND (t.not_before IS NULL OR t.not_before <= now())
+               AND NOT (t.project_id = ANY($1))
+               AND NOT EXISTS (SELECT 1 FROM tasks m WHERE m.project_id = t.project_id
+                               AND m.status = 'merging' AND m.merge_state = 'merging')
+             ORDER BY t.merge_queued_at LIMIT 1",
+        )
+        .bind(&skip)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(project) = candidate else {
+            return Ok(None);
+        };
+        let locked: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM projects WHERE id = $1 FOR UPDATE SKIP LOCKED")
+                .bind(project)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if locked.is_none() {
+            skip.push(project);
+            continue;
+        }
+        let task = sqlx::query_as::<_, Task>(
+            "UPDATE tasks SET merge_state='merging', updated_at=now()
+             WHERE id = (
+                SELECT t.id FROM tasks t
+                WHERE t.project_id = $1 AND t.status = 'merging' AND t.merge_state = 'queued'
+                  AND (t.not_before IS NULL OR t.not_before <= now())
+                ORDER BY t.merge_queued_at LIMIT 1
+                FOR UPDATE SKIP LOCKED)
+               AND NOT EXISTS (SELECT 1 FROM tasks m WHERE m.project_id = $1
+                               AND m.status = 'merging' AND m.merge_state = 'merging')
+             RETURNING *",
+        )
+        .bind(project)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match task {
+            Some(t) => {
+                tx.commit().await?;
+                return Ok(Some(t));
+            }
+            None => skip.push(project),
+        }
+    }
 }
 
 async fn spawn(st: &AppState, task: Task) {
@@ -221,7 +355,7 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
     }
     let busy: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM tasks WHERE user_id=$1
-                        AND status IN ('queued','running','waiting_batch','waiting_input','pending_approval','held'))",
+                        AND status IN ('queued','running','waiting_batch','waiting_input','pending_approval','held','merging'))",
     )
     .bind(s.user_id)
     .fetch_one(&st.db)
@@ -309,6 +443,7 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
             connector_id,
             escalation_level: 0,
             allow_test_changes: false,
+            carry_from: None,
         },
     )
     .await?;

@@ -510,13 +510,13 @@ async fn runtime_limit_blocks_without_fix(pool: PgPool) {
     assert_eq!(b["task"]["failure_class"], "limit_runtime");
     assert_eq!(b["task"]["error"], "Limit überschritten: Laufzeit 2 s");
     assert_eq!(fixes(&a.tasks().await), 0);
+    // WP04: the partial commit is on the task branch, never on the target.
     let commits = a.get(&format!("/api/projects/{p}/commits")).await.1;
+    assert!(!commits.to_string().contains("unterbrochen"), "{commits}");
+    let branch = b["task"]["branch"].as_str().unwrap();
     assert!(
-        commits[0]["subject"]
-            .as_str()
-            .unwrap()
-            .contains("(unterbrochen: limit_runtime)"),
-        "{commits}"
+        branch_subject(&h, &p, branch).contains("(unterbrochen: limit_runtime)"),
+        "{branch}"
     );
     assert!(!b["task"]["snapshot_after"].is_null());
 }
@@ -629,15 +629,18 @@ async fn post_hoc_token_overrun_blocks_without_review_or_fix(pool: PgPool) {
         "result not evaluated: {ev:?}"
     );
     assert_eq!(fixes(&a.tasks().await), 0);
+    // WP04: the partial commit is on the task branch, never on the target.
     let commits = a.get(&format!("/api/projects/{p}/commits")).await.1;
+    assert!(!commits.to_string().contains("unterbrochen"), "{commits}");
+    let branch = task["branch"].as_str().unwrap();
     assert!(
-        commits[0]["subject"]
-            .as_str()
-            .unwrap()
-            .contains("(unterbrochen: limit_tokens)"),
-        "{commits}"
+        branch_subject(&h, &p, branch).contains("(unterbrochen: limit_tokens)"),
+        "{branch}"
     );
-    assert_eq!(task["snapshot_after"], commits[0]["sha"], "{commits}");
+    assert_eq!(
+        task["snapshot_after"].as_str().unwrap(),
+        branch_sha(&h, &p, branch)
+    );
     // Without a limit the same run is done (the overrun alone decides).
     let free = a.task(&p, "MOCK_USAGE_TOTAL free").await;
     a.wait_status(&free, &["done"]).await;
@@ -852,4 +855,26 @@ async fn limit_fields_validation_reset_retry_and_meta(pool: PgPool) {
         m["provider_capabilities"]["gemini"]["structured_output"],
         false
     );
+}
+
+/// Subject of the newest commit of a task branch in the main repository.
+fn branch_subject(h: &Harness, project: &str, branch: &str) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(h.workspace(project))
+        .args(["log", "-1", "--format=%s", &format!("refs/heads/{branch}")])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn branch_sha(h: &Harness, project: &str, branch: &str) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(h.workspace(project))
+        .args(["rev-parse", &format!("refs/heads/{branch}")])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
 }

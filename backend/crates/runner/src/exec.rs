@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use queued_common::{CliProbe, ExecFrame, ExecRequest};
+use queued_common::{is_task_workspace, valid_name, CliProbe, ExecFrame, ExecRequest};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
@@ -462,8 +462,21 @@ async fn run_inner(
         .collect();
 
     let mut sb = Sandbox::default();
+    // WP04: the caches belong to the project (`scope`), shared by its task
+    // workspaces; setups of one scope run one at a time (two would write
+    // the same cache, and `finish` drops the other keys of the scope).
+    let scope = req
+        .cache
+        .as_ref()
+        .and_then(|c| c.scope.clone())
+        .filter(|s| valid_name(s) && !is_task_workspace(s))
+        .unwrap_or_else(|| req.workspace.clone());
+    let _cache_lock = match &req.cache {
+        Some(_) => Some(setup::scope_lock(&scope).await),
+        None => None,
+    };
     let cache = match &req.cache {
-        Some(spec) => Some(setup::prepare(cfg, &req.workspace, &workspace, spec).await?),
+        Some(spec) => Some(setup::prepare(cfg, &scope, &workspace, spec).await?),
         None => None,
     };
     if let Some(c) = &cache {
@@ -1153,6 +1166,76 @@ mod tests {
         assert!(matches!(f.last().unwrap(), ExecFrame::Fail { .. }));
     }
 
+    /// WP04: task workspaces of one project share the project's cache
+    /// (`scope`), and their setups never run at the same time.
+    #[tokio::test]
+    async fn setups_of_one_cache_scope_share_the_cache_and_run_one_at_a_time() {
+        let t = tempfile::tempdir().unwrap();
+        let c = cfg(t.path(), Engine::None);
+        for ws in [
+            "ta0000000000000000000000000000000",
+            "tb0000000000000000000000000000000",
+        ] {
+            tokio::fs::create_dir_all(c.workspaces().join(ws))
+                .await
+                .unwrap();
+        }
+        let run = |ws: &str, n: &str| {
+            let mut r = req(
+                "sh",
+                &["-c", &format!("mkdir -p \"$npm_config_cache\"; echo start-{n} >> \"$npm_config_cache/log\"; sleep 0.4; echo end-{n} >> \"$npm_config_cache/log\"")],
+            );
+            r.name = format!("run-{n}");
+            r.workspace = ws.into();
+            r.cache = Some(queued_common::CacheSpec {
+                key_material: "npm ci".into(),
+                files: vec![],
+                scope: Some("p-shared".into()),
+            });
+            r
+        };
+        let (a, b) = tokio::join!(
+            collect(
+                &c,
+                run("ta0000000000000000000000000000000", "a"),
+                CancellationToken::new()
+            ),
+            collect(
+                &c,
+                run("tb0000000000000000000000000000000", "b"),
+                CancellationToken::new()
+            )
+        );
+        for f in [&a, &b] {
+            assert!(
+                matches!(f.last().unwrap(), ExecFrame::Exit { success: true, .. }),
+                "{f:?}"
+            );
+        }
+        let root = setup::caches_root(&c, "p-shared");
+        let key = std::fs::read_dir(&root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let log = std::fs::read_to_string(key.join("npm/log")).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 4, "{log}");
+        assert!(
+            lines[0].replace("start", "end") == lines[1]
+                && lines[2].replace("start", "end") == lines[3],
+            "setups overlapped: {log}"
+        );
+        assert!(!setup::caches_root(&c, "ta0000000000000000000000000000000").exists());
+        // An invalid or task scope falls back to the run's own workspace.
+        let mut r = run("ta0000000000000000000000000000000", "c");
+        r.cache.as_mut().unwrap().scope = Some("tb0000000000000000000000000000000".into());
+        let f = collect(&c, r, CancellationToken::new()).await;
+        assert!(matches!(f.last().unwrap(), ExecFrame::Exit { .. }));
+        assert!(setup::caches_root(&c, "ta0000000000000000000000000000000").exists());
+    }
+
     #[tokio::test]
     async fn setup_cache_is_mounted_via_env_and_reported() {
         let t = tempfile::tempdir().unwrap();
@@ -1162,6 +1245,7 @@ mod tests {
             r.cache = Some(queued_common::CacheSpec {
                 key_material: "npm ci".into(),
                 files: vec!["package-lock.json".into()],
+                scope: None,
             });
             r
         };

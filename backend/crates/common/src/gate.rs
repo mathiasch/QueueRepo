@@ -147,6 +147,11 @@ pub struct BaselineCheck {
     pub name: String,
     /// Globs of the watched files.
     pub paths: Vec<String>,
+    /// Task workspace whose HEAD is checked (WP04). Baselines live only in
+    /// the project's main repository, which no agent ever sees; `None` =
+    /// the main repository's HEAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

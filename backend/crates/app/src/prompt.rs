@@ -315,6 +315,7 @@ mod tests {
             test_guard: true,
             setup_guard: true,
             secret_allowlist: vec![],
+            parallelism: 1,
         }
     }
 
@@ -360,6 +361,11 @@ mod tests {
             cost: None,
             gate: None,
             allow_test_changes: false,
+            branch: None,
+            merge_base: None,
+            merge_state: None,
+            merge_queued_at: None,
+            carry_from: None,
         }
     }
 

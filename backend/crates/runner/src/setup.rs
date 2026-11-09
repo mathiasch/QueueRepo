@@ -14,6 +14,21 @@ pub const CONTAINER_CACHE: &str = "/cache";
 const MAX_KEY_FILE: u64 = 64 * 1024 * 1024;
 const MAX_KEY_FILES: usize = 64;
 
+/// Serializes the setup runs of one cache scope (held for the whole run).
+pub async fn scope_lock(scope: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let m = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("scope locks")
+        .entry(scope.to_string())
+        .or_default()
+        .clone();
+    m.lock_owned().await
+}
+
 pub fn caches_root(cfg: &RunnerConfig, workspace: &str) -> PathBuf {
     cfg.data_dir.join("caches").join(workspace)
 }
@@ -74,6 +89,7 @@ pub async fn prepare(
     let spec = CacheSpec {
         key_material: format!("{}\0{}", cfg.image, spec.key_material),
         files: spec.files.clone(),
+        scope: None,
     };
     let key = cache_key(workspace, &spec).await?;
     let dir = caches_root(cfg, workspace_id).join(&key);
@@ -291,6 +307,7 @@ mod tests {
         let spec = CacheSpec {
             key_material: "npm ci".into(),
             files: vec!["package-lock.json".into()],
+            scope: None,
         };
         let absent = cache_key(t.path(), &spec).await.unwrap();
         std::fs::write(t.path().join("package-lock.json"), "{\"v\":1}").unwrap();
@@ -325,6 +342,7 @@ mod tests {
             let s = CacheSpec {
                 key_material: String::new(),
                 files: vec![bad.into()],
+                scope: None,
             };
             assert!(cache_key(t.path(), &s).await.is_err(), "{bad}");
         }
@@ -339,6 +357,7 @@ mod tests {
         let spec = |m: &str| CacheSpec {
             key_material: m.into(),
             files: vec![],
+            scope: None,
         };
         let a = prepare(&cfg, "p1", &ws, &spec("a")).await.unwrap();
         assert!(!a.info.hit && a.dir.is_dir());

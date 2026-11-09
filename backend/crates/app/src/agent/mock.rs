@@ -17,6 +17,11 @@
 //! MOCK_SELF_COMMIT (commits a fake token itself), MOCK_EDIT_TEST (changes
 //! the existing `tests/test_core.py`), MOCK_SKIP_TEST (adds a skipped test),
 //! MOCK_REVIEW_DOWN (the review run always fails transiently).
+//! WP04: MOCK_FILE:<name> (the run line goes to `<name>` instead of
+//! `MOCK_LOG.md`; every run line is unique, so two tasks writing the same
+//! file conflict in the merge queue and different files do not),
+//! MOCK_RESOLVE (removes git conflict markers, keeping both sides – a fix
+//! task inherits the keyword from the original prompt).
 use serde_json::Value;
 
 use super::{
@@ -27,8 +32,10 @@ use crate::models::Usage;
 
 const MOCK_SCRIPT: &str = r#"P=$(cat); mkdir -p .queue
 echo '{"type":"text","text":"mock agent: reading task"}'
-echo '{"type":"tool","text":"edit MOCK_LOG.md"}'
-echo "run $(date -u +%FT%TZ)" >> MOCK_LOG.md
+L=MOCK_LOG.md
+case "$P" in *MOCK_FILE:*) L=$(printf '%s\n' "$P" | sed -n 's/.*MOCK_FILE:\([A-Za-z0-9_.-]*\).*/\1/p' | head -n 1);; esac
+echo '{"type":"tool","text":"edit '"$L"'"}'
+echo "run $(date -u +%FT%TZ) $(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$L"
 echo '{"type":"usage","input_tokens":1200,"output_tokens":150,"cache_read_tokens":800}'
 case "$P" in
   *"strict code reviewer"*)
@@ -58,6 +65,10 @@ case "$P" in
        echo '{"type":"error","category":"overloaded","text":"API Error: 529 overloaded"}'; exit 1;; esac;;
   *MOCK_AUTH*) echo '{"type":"error","category":"authentication_failed","text":"Invalid API key"}'; exit 1;;
   *MOCK_TURNS*) if [ -n "$QUEUE_MAX_TURNS" ]; then echo '{"type":"limit","kind":"turns"}'; exit 1; fi;;
+esac
+case "$P" in
+  *MOCK_RESOLVE*) for f in $(grep -rl --exclude-dir=.git --exclude-dir=.queue '^<<<<<<< ' . 2>/dev/null); do
+      sed -i '/^<<<<<<< /d;/^=======$/d;/^>>>>>>> /d' "$f"; echo '{"type":"tool","text":"resolved '"$f"'"}'; done;;
 esac
 case "$P" in
   *MOCK_ENV*) env | cut -d= -f1 | sort > MOCK_ENV.txt;;

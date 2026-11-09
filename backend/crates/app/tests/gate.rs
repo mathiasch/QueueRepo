@@ -104,14 +104,15 @@ async fn secret_in_diff_holds_the_commit_until_approved(pool: PgPool) {
     assert_eq!(git(&ws, &["rev-parse", "HEAD"]).1, head0);
     assert!(!ws.join("config/credentials.py").exists());
     // The real value (only in the runner's held ref) never leaves the server.
+    // WP04: the held ref lives in the task's own working tree, which no other
+    // task's agent sees – not in the project's main repository (WP03-N6).
     let id = t.replace('-', "");
-    let (ok, content) = git(
-        &ws,
-        &[
-            "show",
-            &format!("refs/queue/held/{id}:config/credentials.py"),
-        ],
+    let held_ref = format!("refs/queue/held/{id}:config/credentials.py");
+    assert!(
+        !git(&ws, &["show", &held_ref]).0,
+        "held changes in the main repository"
     );
+    let (ok, content) = git(&h.workspace(&format!("t{id}")), &["show", &held_ref]);
     assert!(ok);
     let token = content.split('"').nth(1).unwrap().to_string();
     assert!(token.starts_with("ghp_") && token.len() == 40, "{content}");

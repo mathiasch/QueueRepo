@@ -1,6 +1,7 @@
 //! Pure presentation logic without DOM access – tested natively with
 //! `cargo test` (replaces the former Vitest suite).
 pub mod b64;
+pub mod branch;
 pub mod budget;
 pub mod costs;
 pub mod diff;

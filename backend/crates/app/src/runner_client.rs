@@ -9,6 +9,11 @@ use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// Runner workspace id of a task's own working tree (WP04).
+pub fn task_ws(task: Uuid) -> String {
+    task_workspace_id(&task.simple().to_string())
+}
+
 #[derive(Clone)]
 pub struct RunnerClient {
     base: String,
@@ -47,7 +52,7 @@ impl RunnerClient {
         }
     }
 
-    fn url(&self, ws: Uuid, path: &str) -> String {
+    fn url(&self, ws: impl std::fmt::Display, path: &str) -> String {
         format!("{}/workspaces/{ws}{path}", self.base)
     }
 
@@ -87,11 +92,11 @@ impl RunnerClient {
         Ok(Self::check(r).await?.json().await?)
     }
 
-    pub async fn init(&self, ws: Uuid, req: &InitWorkspace) -> Result<String> {
+    pub async fn init(&self, ws: impl std::fmt::Display, req: &InitWorkspace) -> Result<String> {
         Ok(self.post::<_, Sha>(self.url(ws, ""), req).await?.sha)
     }
 
-    pub async fn delete(&self, ws: Uuid) -> Result<()> {
+    pub async fn delete(&self, ws: impl std::fmt::Display) -> Result<()> {
         let r = self
             .http
             .delete(self.url(ws, ""))
@@ -104,7 +109,7 @@ impl RunnerClient {
 
     pub async fn begin(
         &self,
-        ws: Uuid,
+        ws: impl std::fmt::Display,
         remote: Option<GitRemote>,
         allow: &[String],
     ) -> Result<BeginResult> {
@@ -121,7 +126,7 @@ impl RunnerClient {
     /// Commits unless the changes contain a secret outside `allow`.
     pub async fn commit(
         &self,
-        ws: Uuid,
+        ws: impl std::fmt::Display,
         message: &str,
         author_name: &str,
         author_email: &str,
@@ -140,14 +145,14 @@ impl RunnerClient {
     /// Gate check of the working tree (WP03).
     pub async fn inspect(
         &self,
-        ws: Uuid,
+        ws: impl std::fmt::Display,
         req: &gate::InspectRequest,
     ) -> Result<gate::InspectResult> {
         self.post(self.url(ws, "/inspect"), req).await
     }
 
     /// Parks the working tree under `refs/queue/held/<task>`.
-    pub async fn hold(&self, ws: Uuid, task: Uuid, base: &str) -> Result<()> {
+    pub async fn hold(&self, ws: impl std::fmt::Display, task: Uuid, base: &str) -> Result<()> {
         let _: serde_json::Value = self
             .post(
                 self.url(ws, "/hold"),
@@ -160,16 +165,20 @@ impl RunnerClient {
         Ok(())
     }
 
-    pub async fn release(&self, ws: Uuid, req: &gate::ReleaseRequest) -> Result<CommitOutcome> {
+    pub async fn release(
+        &self,
+        ws: impl std::fmt::Display,
+        req: &gate::ReleaseRequest,
+    ) -> Result<CommitOutcome> {
         self.post(self.url(ws, "/release"), req).await
     }
 
-    pub async fn held_diff(&self, ws: Uuid, task: Uuid) -> Result<DiffResult> {
+    pub async fn held_diff(&self, ws: impl std::fmt::Display, task: Uuid) -> Result<DiffResult> {
         self.get(self.url(ws, &format!("/held/{}", task.simple())))
             .await
     }
 
-    pub async fn discard_held(&self, ws: Uuid, task: Uuid) -> Result<()> {
+    pub async fn discard_held(&self, ws: impl std::fmt::Display, task: Uuid) -> Result<()> {
         let r = self
             .http
             .delete(self.url(ws, &format!("/held/{}", task.simple())))
@@ -183,13 +192,18 @@ impl RunnerClient {
 
     pub async fn baseline_check(
         &self,
-        ws: Uuid,
+        ws: impl std::fmt::Display,
         req: &gate::BaselineCheck,
     ) -> Result<gate::BaselineResult> {
         self.post(self.url(ws, "/baseline/check"), req).await
     }
 
-    pub async fn baseline_approve(&self, ws: Uuid, name: &str, sha: &str) -> Result<()> {
+    pub async fn baseline_approve(
+        &self,
+        ws: impl std::fmt::Display,
+        name: &str,
+        sha: &str,
+    ) -> Result<()> {
         let _: serde_json::Value = self
             .post(
                 self.url(ws, "/baseline/approve"),
@@ -204,7 +218,7 @@ impl RunnerClient {
 
     pub async fn diff(
         &self,
-        ws: Uuid,
+        ws: impl std::fmt::Display,
         from: &str,
         to: &str,
         max_bytes: usize,
@@ -216,7 +230,7 @@ impl RunnerClient {
         .await
     }
 
-    pub async fn revert(&self, ws: Uuid, from: &str, to: &str) -> Result<String> {
+    pub async fn revert(&self, ws: impl std::fmt::Display, from: &str, to: &str) -> Result<String> {
         Ok(self
             .post::<_, Sha>(
                 self.url(ws, "/revert"),
@@ -229,13 +243,83 @@ impl RunnerClient {
             .sha)
     }
 
+    /// Creates or continues the task's own working tree (WP04).
+    pub async fn prepare_task(
+        &self,
+        main: Uuid,
+        task: Uuid,
+        req: &TaskWorkspaceRequest,
+    ) -> Result<TaskWorkspaceResult> {
+        self.post(self.url(main, &format!("/tasks/{}", task_ws(task))), req)
+            .await
+    }
+
+    /// Copies the task commit `sha` to its branch in the main repository.
+    pub async fn sync_task(&self, main: Uuid, task: Uuid, branch: &str, sha: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .post(
+                self.url(main, &format!("/tasks/{}/sync", task_ws(task))),
+                &SyncRequest {
+                    branch: branch.into(),
+                    sha: sha.into(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Merge queue: squash onto the target branch and re-check.
+    pub async fn merge_task(
+        &self,
+        main: Uuid,
+        task: Uuid,
+        req: &MergeRequest,
+    ) -> Result<MergeResult> {
+        self.post(
+            self.url(main, &format!("/tasks/{}/merge", task_ws(task))),
+            req,
+        )
+        .await
+    }
+
+    /// Merge queue: fast-forward of the target branch.
+    pub async fn merge_finish(
+        &self,
+        main: Uuid,
+        task: Uuid,
+        req: &MergeFinish,
+    ) -> Result<MergeFinishResult> {
+        self.post(
+            self.url(main, &format!("/tasks/{}/merge/finish", task_ws(task))),
+            req,
+        )
+        .await
+    }
+
+    /// Removes the task's working tree (and with `branch` its branch).
+    pub async fn remove_task(&self, main: Uuid, task: Uuid, branch: Option<&str>) -> Result<()> {
+        let mut url = self.url(main, &format!("/tasks/{}", task_ws(task)));
+        if let Some(b) = branch {
+            url.push_str(&format!("?branch={b}"));
+        }
+        let r = self
+            .http
+            .delete(url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("runner unreachable")?;
+        Self::check(r).await?;
+        Ok(())
+    }
+
     /// Engine and whether egress rules are enforced.
     pub async fn info(&self) -> Result<RunnerInfo> {
         self.get(format!("{}/info", self.base)).await
     }
 
     /// Drops the dependency caches of a project.
-    pub async fn clear_cache(&self, ws: Uuid) -> Result<()> {
+    pub async fn clear_cache(&self, ws: impl std::fmt::Display) -> Result<()> {
         let r = self
             .http
             .delete(self.url(ws, "/cache"))
@@ -252,16 +336,16 @@ impl RunnerClient {
         self.get(format!("{}/cli-status", self.base)).await
     }
 
-    pub async fn files(&self, ws: Uuid) -> Result<Vec<String>> {
+    pub async fn files(&self, ws: impl std::fmt::Display) -> Result<Vec<String>> {
         self.get(self.url(ws, "/files")).await
     }
 
-    pub async fn file(&self, ws: Uuid, path: &str) -> Result<FileContent> {
+    pub async fn file(&self, ws: impl std::fmt::Display, path: &str) -> Result<FileContent> {
         let q: String = url::form_urlencoded::byte_serialize(path.as_bytes()).collect();
         self.get(self.url(ws, &format!("/file?path={q}"))).await
     }
 
-    pub async fn zip(&self, ws: Uuid) -> Result<Vec<u8>> {
+    pub async fn zip(&self, ws: impl std::fmt::Display) -> Result<Vec<u8>> {
         let r = self
             .http
             .get(self.url(ws, "/zip"))
@@ -273,7 +357,7 @@ impl RunnerClient {
 
     pub async fn import(
         &self,
-        ws: Uuid,
+        ws: impl std::fmt::Display,
         data: Vec<u8>,
         author_name: &str,
         author_email: &str,
@@ -289,15 +373,19 @@ impl RunnerClient {
         Ok(Self::check(r).await?.json().await?)
     }
 
-    pub async fn push(&self, ws: Uuid, req: &PushRequest) -> Result<PushResult> {
+    pub async fn push(&self, ws: impl std::fmt::Display, req: &PushRequest) -> Result<PushResult> {
         self.post(self.url(ws, "/push"), req).await
     }
 
-    pub async fn log(&self, ws: Uuid, limit: usize) -> Result<Vec<Commit>> {
+    pub async fn log(&self, ws: impl std::fmt::Display, limit: usize) -> Result<Vec<Commit>> {
         self.get(self.url(ws, &format!("/log?limit={limit}"))).await
     }
 
-    pub async fn queue_file(&self, ws: Uuid, name: &str) -> Result<Option<String>> {
+    pub async fn queue_file(
+        &self,
+        ws: impl std::fmt::Display,
+        name: &str,
+    ) -> Result<Option<String>> {
         Ok(self
             .get::<QueueFile>(self.url(ws, &format!("/queue/{name}")))
             .await?

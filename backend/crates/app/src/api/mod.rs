@@ -122,6 +122,7 @@ pub fn router(st: AppState) -> Router {
         )
         .route("/projects/{id}/tasks", get(projects::tasks))
         .route("/projects/{id}/commits", get(projects::commits))
+        .route("/projects/{id}/merge-queue", get(projects::merge_queue))
         .route("/projects/{id}/push", post(projects::push))
         .route("/tasks", get(tasks::list).post(tasks::create))
         .route("/tasks/approve-all", post(tasks::approve_all))

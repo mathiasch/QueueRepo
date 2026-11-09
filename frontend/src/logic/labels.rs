@@ -34,6 +34,7 @@ pub fn status_label(s: TaskStatus) -> &'static str {
         TaskStatus::WaitingBatch => "Wartet auf Anbieter",
         TaskStatus::WaitingInput => "Wartet auf dich",
         TaskStatus::Held => "Freigabe nötig",
+        TaskStatus::Merging => "Wird übernommen",
         TaskStatus::Done => "Fertig",
         TaskStatus::Failed => "Fehlgeschlagen",
         TaskStatus::Blocked => "Blockiert",
@@ -56,6 +57,9 @@ pub fn status_help(s: TaskStatus) -> &'static str {
         TaskStatus::Held => {
             "Eine Schutzprüfung hat etwas gefunden (z. B. ein mögliches Passwort oder geänderte Tests). Es geht erst weiter, wenn du entscheidest."
         }
+        TaskStatus::Merging => {
+            "Fertig und geprüft. Queue übernimmt die Änderungen gerade der Reihe nach in den Hauptstand des Projekts."
+        }
         TaskStatus::Done => "Erledigt, geprüft und im Projekt gespeichert.",
         TaskStatus::Failed => {
             "Das Ergebnis war nicht in Ordnung. Ein Reparatur-Auftrag versucht es erneut."
@@ -70,7 +74,7 @@ pub fn status_help(s: TaskStatus) -> &'static str {
 pub fn status_tone(s: TaskStatus) -> Tone {
     match s {
         TaskStatus::PendingApproval | TaskStatus::WaitingInput | TaskStatus::Held => Tone::Warning,
-        TaskStatus::Queued | TaskStatus::WaitingBatch => Tone::Info,
+        TaskStatus::Queued | TaskStatus::WaitingBatch | TaskStatus::Merging => Tone::Info,
         TaskStatus::Running => Tone::Run,
         TaskStatus::Done => Tone::Success,
         TaskStatus::Failed | TaskStatus::Blocked => Tone::Danger,
@@ -192,6 +196,7 @@ pub fn event_kind_label(kind: &str) -> &'static str {
         "setup" => "Setup",
         "egress" => "Netzwerk",
         "gate" => "Schutz",
+        "merge" => "Übernahme",
         _ => "Info",
     }
 }
@@ -241,7 +246,9 @@ pub mod help {
     pub const BUDGET: &str = "Rollierende Fenster pro Anbieter. Ist ein Budget erreicht, startet die Queue für diesen Anbieter nichts Neues, bis genug Verbrauch aus dem Fenster gefallen ist.";
     pub const AUTO_APPROVE: &str = "Schlägt ein Agent mehr neue Aufträge vor als hier eingestellt, musst du sie erst freigeben.";
     pub const FIX: &str = "Wie oft die Queue nach einem fehlgeschlagenen Auftrag automatisch einen Reparatur-Auftrag startet, bevor sie stoppt und dich benachrichtigt.";
-    pub const PARALLEL: &str = "Wie viele Agenten gleichzeitig arbeiten dürfen (projektübergreifend). Pro Projekt läuft immer nur einer.";
+    pub const PARALLEL: &str = "Wie viele Agenten gleichzeitig für dich arbeiten dürfen (über alle Projekte). Wie viele davon im selben Projekt arbeiten, legt jedes Projekt selbst fest (Standard 1).";
+    pub const BRANCH: &str = "Jeder Auftrag arbeitet auf einem eigenen Branch in einem eigenen Arbeitsverzeichnis. Erst wenn er fertig und geprüft ist, übernimmt Queue die Änderungen als einen Commit in den Hauptstand – der Reihe nach, mit erneuter Prüfung, wenn sich der Hauptstand inzwischen geändert hat.";
+    pub const MERGE_QUEUE: &str = "Fertige Aufträge werden nacheinander in den Hauptstand übernommen. Hat sich der Hauptstand inzwischen geändert, prüft Queue den Auftrag auf dem neuen Stand noch einmal.";
     pub const PROTECTION: &str = "Schutzprüfungen laufen, bevor Änderungen gespeichert oder hochgeladen werden. Findet Queue etwas Verdächtiges, hält es den Auftrag an und fragt dich.";
     pub const TRUST_REPO: &str = "Agenten-Programme können Einstellungen aus dem Repository laden, z. B. Hooks oder MCP-Server. Diese starten eigene Programme oder leiten Zugänge um. Schalte das nur für Repositories ein, deren Inhalt du kontrollierst.";
     pub const PROTECTED_PATHS: &str = "Bestehende Dateien, die hier passen, darf ein Agent nur mit deiner Freigabe ändern oder löschen. Neue Dateien sind erlaubt. Schreibweise: `tests/` = Ordner, `*.spec.ts` = Dateiname in jedem Ordner, `**` = beliebig viele Ordner.";
@@ -301,7 +308,11 @@ mod tests {
             "a gate waits for a decision, it is no error"
         );
         assert_eq!(event_kind_label("gate"), "Schutz");
+        assert_eq!(event_kind_label("merge"), "Übernahme");
         assert_eq!(status_label(TaskStatus::Held), "Freigabe nötig");
+        assert_eq!(status_label(TaskStatus::Merging), "Wird übernommen");
+        assert_eq!(status_tone(TaskStatus::Merging), Tone::Info);
+        assert!(status_help(TaskStatus::Merging).contains("Hauptstand"));
         assert_eq!(status_tone(TaskStatus::Held), Tone::Warning);
         assert_eq!(task_kind_label("fix"), "Reparatur");
         let ids: Vec<&str> = ONEMPTY_ACTIONS.iter().map(|a| a.0).collect();

@@ -190,6 +190,10 @@ pub struct CacheSpec {
     pub key_material: String,
     #[serde(default)]
     pub files: Vec<String>,
+    /// Workspace whose caches are used (WP04: the project's main workspace,
+    /// shared by all task workspaces; `None` = the run's own workspace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -262,6 +266,156 @@ pub fn valid_name(s: &str) -> bool {
         && s.len() <= 64
         && s.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Workspace id of a task's own working tree (WP04): `t` + the 32 hex
+/// digits of the task id. Never a project workspace (those are UUIDs).
+pub fn task_workspace_id(task_hex: &str) -> String {
+    format!("t{task_hex}")
+}
+
+/// `t<32 lowercase hex>`.
+pub fn is_task_workspace(id: &str) -> bool {
+    id.len() == 33
+        && id.starts_with('t')
+        && id[1..]
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))
+}
+
+/// Branch of a task: `queue/` + the first 12 hex digits of its id (or all
+/// 32 when the short name is taken in the project).
+pub fn task_branch(task_hex: &str, long: bool) -> String {
+    let n = if long { 32 } else { 12 };
+    format!("queue/{}", &task_hex[..n.min(task_hex.len())])
+}
+
+/// `queue/<12..32 lowercase hex>`.
+pub fn valid_task_branch(b: &str) -> bool {
+    b.strip_prefix("queue/").is_some_and(|h| {
+        (12..=32).contains(&h.len())
+            && h.chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))
+    })
+}
+
+/// Changes of another task that a new task workspace starts with (fix
+/// tasks continue the work of the task they fix): `base..tip` is applied
+/// 3-way on top of the current target branch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Carry {
+    pub base: String,
+    pub tip: String,
+    /// Commit message line of the carried commit.
+    pub label: String,
+}
+
+/// `POST /v1/workspaces/{main}/tasks/{task_ws}`: creates (or continues) the
+/// task's own working tree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskWorkspaceRequest {
+    pub branch: String,
+    /// Known merge base of the branch (continuation of an earlier run).
+    #[serde(default)]
+    pub merge_base: Option<String>,
+    #[serde(default)]
+    pub carry: Option<Carry>,
+    /// Approved secret fingerprints (leftovers are committed as WIP only
+    /// without other secrets, else quarantined – like `begin`).
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TaskWorkspaceResult {
+    pub head: String,
+    /// Target-branch commit the task branch is based on.
+    pub merge_base: String,
+    /// The working tree was created now (not continued).
+    pub created: bool,
+    /// Earlier work of the task continues (existing working tree, or the
+    /// task branch of the main repository).
+    #[serde(default)]
+    pub resumed: bool,
+    /// Commit with the carried changes (`None` = nothing carried).
+    #[serde(default)]
+    pub carried: Option<String>,
+    /// Files with conflict markers in the carried commit.
+    #[serde(default)]
+    pub conflicts: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// `POST …/tasks/{task_ws}/sync`: copies exactly `sha` from the task's
+/// working tree to `refs/heads/<branch>` in the main repository.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SyncRequest {
+    pub branch: String,
+    pub sha: String,
+}
+
+/// `POST …/tasks/{task_ws}/merge`: squashes `base..tip` onto the target
+/// branch (3-way, no working tree) and re-checks the result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MergeRequest {
+    pub branch: String,
+    pub base: String,
+    pub tip: String,
+    pub message: String,
+    pub author_name: String,
+    pub author_email: String,
+    #[serde(default)]
+    pub protected: Vec<String>,
+    #[serde(default)]
+    pub test_guard: bool,
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Check the merged commit out in the task's working tree when the
+    /// target moved (verify runs there).
+    #[serde(default)]
+    pub checkout: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MergeResult {
+    /// Merged commit (parent = `target`); `None` on conflicts.
+    #[serde(default)]
+    pub commit: Option<String>,
+    /// Target-branch commit the merge is based on.
+    pub target: String,
+    /// The target branch moved since `base` (verify again).
+    pub moved: bool,
+    /// Files the 3-way merge could not combine.
+    #[serde(default)]
+    pub conflicts: Vec<String>,
+    /// Files whose added lines still contain conflict markers.
+    #[serde(default)]
+    pub markers: Vec<String>,
+    /// Gate findings of the merged change that the task's own change did
+    /// not have (fail-closed re-check; normally empty).
+    #[serde(default)]
+    pub new_findings: Vec<GateFinding>,
+    /// The target branch already contains the change (nothing to merge).
+    #[serde(default)]
+    pub empty: bool,
+}
+
+/// `POST …/tasks/{task_ws}/merge/finish`: fast-forward of the target branch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MergeFinish {
+    pub branch: String,
+    pub commit: String,
+    pub target: String,
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MergeFinishResult {
+    /// `false`: the target branch moved meanwhile (merge again).
+    pub merged: bool,
+    pub head: String,
 }
 
 /// Name of a file the app may place in the workspace's `.queue/` directory:
@@ -414,6 +568,39 @@ mod tests {
             assert!(!valid_queue_file_name(bad), "{bad}");
         }
         assert!(valid_queue_file_name(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn task_workspaces_and_branches() {
+        let hex = "0123456789abcdef0123456789abcdef";
+        let ws = task_workspace_id(hex);
+        assert!(is_task_workspace(&ws) && valid_name(&ws));
+        for bad in [
+            "t0123",
+            "0123456789abcdef0123456789abcdef0",
+            "tg123456789abcdef0123456789abcdef",
+            "T0123456789abcdef0123456789abcdef",
+            "1f0e0a6c-1111-4c3a-8f0e-0123456789ab",
+        ] {
+            assert!(!is_task_workspace(bad), "{bad}");
+        }
+        assert_eq!(task_branch(hex, false), "queue/0123456789ab");
+        assert_eq!(task_branch(hex, true), format!("queue/{hex}"));
+        assert!(valid_task_branch(&task_branch(hex, false)));
+        assert!(valid_task_branch(&task_branch(hex, true)));
+        for bad in [
+            "main",
+            "queue/",
+            "queue/0123",
+            "queue/0123456789AB",
+            "queue/0123456789ab/x",
+            "queue/../main0000000",
+            "xqueue/0123456789ab",
+        ] {
+            assert!(!valid_task_branch(bad), "{bad}");
+        }
+        let c = CacheSpec::default();
+        assert!(!serde_json::to_string(&c).unwrap().contains("scope"));
     }
 
     #[test]

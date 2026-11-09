@@ -56,7 +56,8 @@ async fn wait_class(a: &Client, t: &str, class: &str) -> Value {
 }
 
 /// Deviation 11 of WP01-impl: the diff of a task that was interrupted and
-/// continued covers the commits of all its runs.
+/// continued covers the work of all its runs. WP04: the partial commit stays
+/// on the task branch; the merge brings both runs as one commit.
 #[sqlx::test(migrator = "queued::MIGRATOR")]
 async fn interrupted_task_diff_covers_all_its_runs(pool: PgPool) {
     let h = start(pool).await;
@@ -65,25 +66,31 @@ async fn interrupted_task_diff_covers_all_its_runs(pool: PgPool) {
     let t = a.task(&p, "MOCK_TRANSIENT alone").await;
     let d = a.wait_status(&t, &["done"]).await;
     let task = &d["task"];
+    assert_eq!(task["merge_state"], "merged", "{task}");
     let log = git_log(
         &h,
         &p,
-        task["snapshot_before"].as_str().unwrap(),
+        task["merge_base"].as_str().unwrap(),
         task["snapshot_after"].as_str().unwrap(),
-    );
-    assert!(
-        log.contains("(unterbrochen: provider_transient)"),
-        "partial commit of the interrupted run is part of the task diff: {log}"
     );
     assert_eq!(
         log.matches(&format!("Queue-Task: {t}")).count(),
+        1,
+        "one squashed commit on the target branch: {log}"
+    );
+    let diff = a.get(&format!("/api/tasks/{t}/diff")).await.1;
+    let text = diff["diff"].as_str().unwrap();
+    assert_eq!(
+        text.lines().filter(|l| l.starts_with("+run ")).count(),
         2,
-        "both runs' commits: {log}"
+        "the interrupted and the continued run are both in the diff: {text}"
     );
 }
 
 /// Regression: while task A waits in backoff, task B of the same project
-/// runs. A's continued diff/revert must not swallow B's commits.
+/// runs. A's continued diff/revert must not swallow B's commits. WP04: A's
+/// partial work is on its own branch, B overtakes and is merged first; A is
+/// merged on top (different files, no conflict).
 #[sqlx::test(migrator = "queued::MIGRATOR")]
 async fn interrupted_task_diff_never_includes_other_tasks(pool: PgPool) {
     let h = start_with(pool, |c| {
@@ -93,8 +100,8 @@ async fn interrupted_task_diff_never_includes_other_tasks(pool: PgPool) {
     .await;
     let a = h.user("a@x.ch").await;
     let p = no_review_project(&a).await;
-    let ta = a.task(&p, "MOCK_TRANSIENT task A").await;
-    let tb = a.task(&p, "plain task B").await;
+    let ta = a.task(&p, "MOCK_TRANSIENT MOCK_FILE:a.md task A").await;
+    let tb = a.task(&p, "plain MOCK_FILE:b.md task B").await;
     let b = a.wait_status(&tb, &["done"]).await;
     let da = a.wait_status(&ta, &["done"]).await;
     // B really ran in between (otherwise the test proves nothing).
@@ -106,31 +113,24 @@ async fn interrupted_task_diff_never_includes_other_tasks(pool: PgPool) {
     let log = git_log(
         &h,
         &p,
-        task["snapshot_before"].as_str().unwrap(),
+        task["merge_base"].as_str().unwrap(),
         task["snapshot_after"].as_str().unwrap(),
     );
     assert!(
         !log.contains(&format!("Queue-Task: {tb}")),
         "A's diff contains B's commit: {log}"
     );
+    let diff = a.get(&format!("/api/tasks/{ta}/diff")).await.1;
+    assert!(
+        diff["diff"].as_str().unwrap().contains("a.md")
+            && !diff["diff"].as_str().unwrap().contains("b.md"),
+        "{diff}"
+    );
     // Reverting A must not touch B's changes.
     let (code, r) = a.post(&format!("/api/tasks/{ta}/revert"), json!({})).await;
-    assert!(code == 200 || code == 409, "{code} {r}");
-    let log_all = git_log(
-        &h,
-        &p,
-        b["task"]["snapshot_before"].as_str().unwrap(),
-        "HEAD",
-    );
-    if code == 200 {
-        assert!(
-            !log_all.contains(&format!(
-                "This reverts commit {}",
-                b["task"]["snapshot_after"].as_str().unwrap()
-            )),
-            "{log_all}"
-        );
-    }
+    assert_eq!(code, 200, "{r}");
+    assert!(!h.workspace(&p).join("a.md").exists());
+    assert!(h.workspace(&p).join("b.md").exists());
 }
 
 /// Resume endpoint: only the caller's own provider state is touched.

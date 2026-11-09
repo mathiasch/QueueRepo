@@ -105,7 +105,7 @@ pub(crate) async fn hold(
         "UPDATE tasks SET status='held', gate=$2, gate_pending=$3, usage=$4,
                 summary=COALESCE(NULLIF($5, ''), summary), handoff=COALESCE($6, handoff),
                 not_before=NULL, error=NULL, updated_at=now()
-         WHERE id=$1 AND status IN ('running','waiting_batch')",
+         WHERE id=$1 AND status IN ('running','waiting_batch','merging')",
     )
     .bind(task.id)
     .bind(serde_json::to_value(&gate).unwrap_or_default())
@@ -172,7 +172,8 @@ pub(crate) async fn check_changes(
         // load: every change needs an approval, also a new file.
         watch: agent_config_paths(project, &task.provider),
     };
-    let res = st.runner.inspect(project.id, &req).await?;
+    let ws = crate::runner_client::task_ws(task.id);
+    let res = st.runner.inspect(&ws, &req).await?;
     let mut findings = res.findings;
     findings.extend(log_findings.iter().cloned());
     if findings.is_empty() {
@@ -189,7 +190,7 @@ pub(crate) async fn check_changes(
     }
     // Park everything the run changed (also commits the agent made itself)
     // outside the branch; nothing reaches verify, review or a push.
-    st.runner.hold(project.id, task.id, &pending.before).await?;
+    st.runner.hold(&ws, task.id, &pending.before).await?;
     hold(
         st,
         task,
@@ -217,7 +218,11 @@ pub(crate) async fn commit(
         return Ok(Some(out.sha));
     }
     f.st.runner
-        .hold(f.project.id, f.task.id, &pending.before)
+        .hold(
+            crate::runner_client::task_ws(f.task.id),
+            f.task.id,
+            &pending.before,
+        )
         .await?;
     hold(
         f.st,
@@ -278,6 +283,7 @@ pub(crate) async fn check_agent_config(
             &cgate::BaselineCheck {
                 name: "agent-config".into(),
                 paths,
+                task: Some(crate::runner_client::task_ws(task.id)),
             },
         )
         .await?;
@@ -372,6 +378,7 @@ pub(crate) async fn check_setup(
             &cgate::BaselineCheck {
                 name: "setup".into(),
                 paths: setup_paths(env),
+                task: Some(crate::runner_client::task_ws(task.id)),
             },
         )
         .await?;
@@ -562,6 +569,11 @@ pub(crate) async fn finish_flow(
     let after = p.after.clone().unwrap_or_default();
     match &p.failure {
         None => {
+            // WP04: the task's branch goes through the merge queue first;
+            // the push (below) happens after the merge.
+            if super::merge::enqueue(st, task, &p, usage).await? {
+                return Ok(());
+            }
             // `push`: None = automatic (gated), Some(true) = approved, Some(false) = declined.
             if project.auto_push && before != after && push != Some(false) {
                 if let Some(r) = project_remote(st, project) {
@@ -783,26 +795,13 @@ pub(crate) async fn resume(f: &Flow<'_>, g: TaskGate, usage: &mut Usage) -> Resu
     .await;
     match resume {
         GateResume::Commit => {
-            st.runner
-                .init(
-                    project.id,
-                    &queued_common::InitWorkspace {
-                        remote: f.remote.clone(),
-                        branch: Some(project.git_branch.clone()),
-                    },
-                )
-                .await?;
-            let begin = st
-                .runner
-                .begin(project.id, f.remote.clone(), &project.secret_allowlist)
-                .await?;
-            for w in &begin.warnings {
-                event(st, task, "status", &format!("git: {w}")).await;
-            }
+            // The held changes live in the task's own working tree (moved
+            // there from the shared workspace for holds from before WP04).
+            let before = prepare_workspace(st, task, project, f.remote.clone()).await?;
             let out = st
                 .runner
                 .release(
-                    project.id,
+                    crate::runner_client::task_ws(task.id),
                     &cgate::ReleaseRequest {
                         task: task.id.simple().to_string(),
                         message: f.commits.message(""),
@@ -823,7 +822,7 @@ pub(crate) async fn resume(f: &Flow<'_>, g: TaskGate, usage: &mut Usage) -> Resu
                 return Ok(());
             }
             if !out.blocked.is_empty() {
-                p.before = begin.head.clone();
+                p.before = before.clone();
                 return hold(
                     st,
                     task,
@@ -836,16 +835,12 @@ pub(crate) async fn resume(f: &Flow<'_>, g: TaskGate, usage: &mut Usage) -> Resu
                 )
                 .await;
             }
-            // The held changes become one commit on top of the current HEAD:
-            // diff and revert cover exactly that commit.
-            p.before = begin.head;
+            // The held changes become one commit on top of the task's base
+            // in its own working tree, copied to its branch.
+            super::merge::sync(st, project.id, task.id, &out.sha).await?;
+            p.before = before;
             p.after = Some(out.sha.clone());
-            sqlx::query("UPDATE tasks SET snapshot_before=$2, snapshot_after=$3 WHERE id=$1")
-                .bind(task.id)
-                .bind(&p.before)
-                .bind(&out.sha)
-                .execute(&st.db)
-                .await?;
+            set_snapshot_after(st, task.id, &out.sha).await?;
             // Approved agent configuration is the new trusted state (no
             // second question before the next run).
             if p.approved
@@ -858,7 +853,11 @@ pub(crate) async fn resume(f: &Flow<'_>, g: TaskGate, usage: &mut Usage) -> Resu
             }
             after_commit(f, p, None, Step::Verify, usage).await
         }
-        GateResume::Review => after_commit(f, p, None, Step::Review, usage).await,
+        GateResume::Review => {
+            // The review agent runs in the task's working tree.
+            prepare_workspace(st, task, project, f.remote.clone()).await?;
+            after_commit(f, p, None, Step::Review, usage).await
+        }
         GateResume::SkipReview => after_commit(f, p, None, Step::Push, usage).await,
         GateResume::Push => finish_flow(st, task, project, f.settings, p, Some(true), usage).await,
         GateResume::NoPush => {

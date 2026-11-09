@@ -369,6 +369,8 @@ fn GitLog(p: ProjectView, can_edit: bool) -> impl IntoView {
     };
     view! {
         <div class="stack" style="padding-top: var(--sp-4)">
+            <super::branch::MergeQueueCard project=id/>
+            <h2 style="font-size: var(--fs-lg)">"Hauptstand"</h2>
             <div class="row wrap between">
                 <p class="small muted row"><Icon icon=Ic::Branch class="sm"/>
                     <span class="mono">{p.git_remote_url.clone().unwrap_or_else(|| "Lokales Repository".into())}" · "{p.git_branch.clone()}</span>
@@ -589,6 +591,8 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
     let branch = RwSignal::new(p.git_branch.clone());
     let token = RwSignal::new(None::<String>);
     let auto_push = RwSignal::new(p.auto_push);
+    let is_owner = p.role == ProjectRole::Owner;
+    let parallelism = RwSignal::new(p.parallelism);
     let limits = RwSignal::new(LimitForm::from_project(&p));
     let errors = RwSignal::new(Vec::<(LimitField, String)>::new());
     let busy = RwSignal::new(false);
@@ -631,6 +635,8 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
             git_branch: Some(branch.get_untracked()),
             git_token: token.get_untracked(),
             auto_push: Some(auto_push.get_untracked()),
+            // Owner only (the server refuses it from editors).
+            parallelism: is_owner.then(|| parallelism.get_untracked()),
             ..Default::default()
         };
         lim.apply_to_project(&mut body);
@@ -738,6 +744,7 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
         }
     };
     let goal_ids = FieldIds::new("ps-goal");
+    let par_ids = FieldIds::new("ps-par");
     let token_ids = FieldIds::new("ps-token");
     let rp_ids = FieldIds::new("ps-rprov");
     view! {
@@ -751,6 +758,29 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
                 </div>
                 <Field ids=goal_ids.clone() label="Projektziel" help="Wird jedem Agenten mitgegeben und steuert die automatischen Vorschläge bei leerer Warteschlange.">
                     <textarea id=goal_ids.id.clone() class="textarea" rows="3" disabled=!can_edit bind:value=goal></textarea>
+                </Field>
+            </section>
+            <section class="form-section">
+                <header>
+                    <h2 class="row">"Gleichzeitig arbeiten" <HelpTip topic="Gleichzeitig arbeiten" text=queued_api::branch::PARALLELISM_HELP align="align-start"/></h2>
+                    <p>"Wie viele Aufträge dieses Projekts gleichzeitig laufen dürfen – jeder auf seinem eigenen Branch."</p>
+                </header>
+                <Field ids=par_ids.clone() label="Gleichzeitige Aufträge" hint=if is_owner { "1 = nacheinander wie bisher. Fertige Aufträge werden der Reihe nach übernommen." } else { "Nur die Eigentümerin oder der Eigentümer des Projekts kann das ändern." }>
+                    <select
+                        id=par_ids.id.clone()
+                        class="select"
+                        name="parallelism"
+                        disabled=!can_edit || !is_owner
+                        aria-describedby=par_ids.described_by()
+                        prop:value=move || parallelism.get().to_string()
+                        on:change=move |ev| parallelism.set(event_target_value(&ev).parse().unwrap_or(1))
+                    >
+                        {(1..=queued_api::branch::MAX_PARALLELISM).map(|n| view! {
+                            <option value=n.to_string() selected=move || parallelism.get() == n>
+                                {if n == 1 { "1 – nacheinander".to_string() } else { format!("{n} gleichzeitig") }}
+                            </option>
+                        }).collect_view()}
+                    </select>
                 </Field>
             </section>
             <section class="form-section">

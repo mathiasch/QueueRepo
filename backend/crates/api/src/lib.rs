@@ -12,6 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+pub mod branch;
 mod costs;
 pub mod env;
 pub mod gate;
@@ -110,6 +111,10 @@ pub enum TaskStatus {
     WaitingInput,
     /// A gate holds the task until a human decides (WP03, see `Task::gate`).
     Held,
+    /// Finished and checked; waits in the project's merge queue or is being
+    /// merged into the target branch (WP04, see `Task::merge_state`).
+    /// Occupies no agent slot.
+    Merging,
     Done,
     Failed,
     Blocked,
@@ -117,13 +122,14 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
-    pub const ALL: [TaskStatus; 10] = [
+    pub const ALL: [TaskStatus; 11] = [
         Self::PendingApproval,
         Self::Queued,
         Self::Running,
         Self::WaitingBatch,
         Self::WaitingInput,
         Self::Held,
+        Self::Merging,
         Self::Done,
         Self::Failed,
         Self::Blocked,
@@ -138,6 +144,7 @@ impl TaskStatus {
             Self::WaitingBatch => "waiting_batch",
             Self::WaitingInput => "waiting_input",
             Self::Held => "held",
+            Self::Merging => "merging",
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Blocked => "blocked",
@@ -182,6 +189,7 @@ impl TaskStatus {
                 | Self::WaitingBatch
                 | Self::WaitingInput
                 | Self::Held
+                | Self::Merging
         )
     }
 
@@ -354,6 +362,22 @@ pub struct Task {
     /// tests need no approval (agent-created tasks never get this).
     #[serde(default)]
     pub allow_test_changes: bool,
+    /// Own branch `queue/<id>` (WP04); `None` = task from before WP04.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Target-branch commit the branch is based on (diff base); after the
+    /// merge the parent of the merged commit.
+    #[serde(default)]
+    pub merge_base: Option<String>,
+    /// [`branch::MergeState`], see [`Task::merge_state_kind`].
+    #[serde(default)]
+    pub merge_state: Option<String>,
+    /// Entered the merge queue (order of the queue).
+    #[serde(default)]
+    pub merge_queued_at: Option<DateTime<Utc>>,
+    /// Fix task that continues the changes of this task.
+    #[serde(default)]
+    pub carry_from: Option<Uuid>,
 }
 
 impl Task {
@@ -366,6 +390,29 @@ impl Task {
     /// Unknown values (never written by the backend) count as `queued`.
     pub fn status_kind(&self) -> TaskStatus {
         TaskStatus::parse(&self.status).unwrap_or(TaskStatus::Queued)
+    }
+
+    pub fn merge_state_kind(&self) -> Option<branch::MergeState> {
+        self.merge_state
+            .as_deref()
+            .and_then(branch::MergeState::parse)
+    }
+
+    /// Base of the task's diff and revert: the merge base for branch tasks,
+    /// the first snapshot for tasks from before WP04.
+    pub fn diff_base(&self) -> Option<&str> {
+        self.merge_base
+            .as_deref()
+            .or(self.snapshot_before.as_deref())
+    }
+
+    /// Its changes are on the target branch (revert possible): merged
+    /// branch tasks and finished tasks from before WP04.
+    pub fn on_target(&self) -> bool {
+        match &self.branch {
+            Some(_) => self.merge_state_kind() == Some(branch::MergeState::Merged),
+            None => true,
+        }
     }
 
     pub fn failure(&self) -> Option<FailureClass> {
@@ -397,9 +444,10 @@ impl Task {
             .and_then(|u| serde_json::from_value(u.clone()).ok())
     }
 
-    /// Commits before/after exist and differ: diff and revert are possible.
+    /// Diff base and last commit exist and differ: there is a diff (revert
+    /// additionally needs [`Task::on_target`]).
     pub fn has_changes(&self) -> bool {
-        matches!((&self.snapshot_before, &self.snapshot_after), (Some(a), Some(b)) if a != b)
+        matches!((self.diff_base(), &self.snapshot_after), (Some(a), Some(b)) if a != b)
     }
 }
 
@@ -603,6 +651,9 @@ pub struct ProjectView {
     /// Hard data-location rule, enforced by the server.
     #[serde(default)]
     pub data_residency: Residency,
+    /// Tasks of this project that may run at the same time (WP04).
+    #[serde(default = "branch::default_parallelism")]
+    pub parallelism: i32,
 }
 
 /// Response of `POST /api/projects`: the new project and its first commit.
@@ -686,6 +737,9 @@ pub struct UpdateProject {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_turns: Option<Option<i64>>,
+    /// Tasks of the project at the same time (1–8, owner only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -919,7 +973,37 @@ mod tests {
     #[test]
     fn task_roundtrip_and_accessors() {
         let t: Task = serde_json::from_value(task_json()).unwrap();
-        assert_eq!(serde_json::to_value(&t).unwrap(), task_json());
+        let mut full = task_json();
+        for k in [
+            "branch",
+            "merge_base",
+            "merge_state",
+            "merge_queued_at",
+            "carry_from",
+        ] {
+            full[k] = Value::Null;
+        }
+        assert_eq!(
+            serde_json::to_value(&t).unwrap(),
+            full,
+            "rows from before WP04 still parse"
+        );
+        assert_eq!(serde_json::from_value::<Task>(full).unwrap(), t);
+        // Before WP04: diff from the first snapshot, always on the target.
+        assert_eq!(t.diff_base(), Some("a"));
+        assert!(t.on_target() && t.merge_state_kind().is_none());
+        // Branch task: diff from the merge base; revertable once merged.
+        let mut b = t.clone();
+        b.branch = Some("queue/0123456789ab".into());
+        b.merge_base = Some("m".into());
+        b.merge_state = Some("queued".into());
+        assert_eq!(b.diff_base(), Some("m"));
+        assert!(!b.on_target() && b.has_changes());
+        b.merge_state = Some("merged".into());
+        assert!(b.on_target());
+        assert_eq!(b.merge_state_kind(), Some(branch::MergeState::Merged));
+        b.merge_base = Some("b".into());
+        assert!(!b.has_changes());
         assert_eq!(t.status_kind(), TaskStatus::WaitingInput);
         assert_eq!(t.failure(), Some(FailureClass::LimitTokens));
         assert_eq!(t.questions_list(), vec!["Postgres or SQLite?"]);
@@ -946,6 +1030,8 @@ mod tests {
         assert!(TaskStatus::Blocked.is_final() && !TaskStatus::Running.is_final());
         assert!(TaskStatus::PendingApproval.needs_user());
         assert!(TaskStatus::WaitingInput.can_cancel() && !TaskStatus::Done.can_cancel());
+        assert!(TaskStatus::Merging.can_cancel() && !TaskStatus::Merging.is_final());
+        assert!(!TaskStatus::Merging.needs_user() && !TaskStatus::Merging.is_editable());
         assert!(TaskStatus::Cancelled.can_retry() && !TaskStatus::Queued.can_retry());
     }
 

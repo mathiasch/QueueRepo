@@ -34,6 +34,8 @@ use queued_common::{gate::GateFinding, secrets};
 
 #[path = "runner_gate.rs"]
 mod gate;
+#[path = "runner_merge.rs"]
+pub(crate) mod merge;
 
 /// Agent-generated tasks deeper than this always need approval (loop guard).
 const MAX_AUTO_DEPTH: i32 = 3;
@@ -105,6 +107,23 @@ pub async fn run_task(st: AppState, task: Task, cancel: CancellationToken) {
             .await;
         }
     }
+    // WP04: a finished task's working tree goes at once (disk); its branch
+    // stays while a fix may continue it (see `merge::sweep`).
+    if let Ok(Some(s)) = sqlx::query_scalar::<_, String>("SELECT status FROM tasks WHERE id=$1")
+        .bind(id)
+        .fetch_optional(&st.db)
+        .await
+    {
+        if matches!(s.as_str(), "done" | "failed" | "blocked" | "cancelled") {
+            merge::cleanup_task(
+                &st,
+                task.project_id,
+                id,
+                matches!(s.as_str(), "done" | "cancelled"),
+            )
+            .await;
+        }
+    }
     st.running.lock().await.remove(&id);
     st.wake.notify_one();
 }
@@ -120,7 +139,7 @@ async fn block_running(
     let n = sqlx::query(
         "UPDATE tasks SET status='blocked', failure_class=$2, error=$3, usage=$4, not_before=NULL,
                 gate=NULL, gate_pending=NULL, finished_at=now(), updated_at=now()
-         WHERE id=$1 AND status='running'",
+         WHERE id=$1 AND status IN ('running','merging')",
     )
     .bind(id)
     .bind(class.as_str())
@@ -567,25 +586,6 @@ pub fn run_name(task: Uuid, label: &str) -> String {
     format!("q-{}-{label}", &task.simple().to_string()[..12])
 }
 
-/// Classes after which the next run continues the same work (keeps the
-/// task's first `snapshot_before`, so diff/revert cover all runs) – but only
-/// if HEAD is still the interrupted run's partial commit (`snapshot_after`).
-/// Otherwise another task of the project ran in between (it may overtake a
-/// task in backoff), the remote was pulled or leftovers were committed as WIP,
-/// and keeping the old base would make diff/revert swallow foreign commits.
-fn continues_interrupted(task: &Task, head: &str) -> bool {
-    task.snapshot_before.is_some()
-        && task.snapshot_after.as_deref() == Some(head)
-        && task
-            .failure_class
-            .as_deref()
-            .and_then(FailureClass::parse)
-            .is_some_and(|c| {
-                c.is_transient()
-                    || matches!(c, FailureClass::RateLimit | FailureClass::ProviderAuth)
-            })
-}
-
 async fn run_inner(
     st: &AppState,
     task: &Task,
@@ -761,7 +761,10 @@ async fn run_inner(
 
     let user_cancel = cancel.is_cancelled();
     let contract = if early(&out, user_cancel, &acc.provider, &lim, usage).is_none() {
-        let file = st.runner.queue_file(project.id, "result.json").await?;
+        let file = st
+            .runner
+            .queue_file(crate::runner_client::task_ws(task.id), "result.json")
+            .await?;
         let (c, note) = load_contract(out.structured.as_ref(), file.as_deref());
         event(st, task, "contract", &note).await;
         c
@@ -837,7 +840,8 @@ async fn run_inner(
     gate::after_commit(&flow, pending, Some(&acc), gate::Step::Verify, usage).await
 }
 
-/// `init` + `begin` (pull, WIP commit of leftovers) and the task's diff base.
+/// `init` + `begin` of the main repository (pull, leftovers), then the
+/// task's own working tree (WP04). Returns the task's gate base.
 async fn prepare_workspace(
     st: &AppState,
     task: &Task,
@@ -860,17 +864,7 @@ async fn prepare_workspace(
     for w in &begin.warnings {
         event(st, task, "status", &format!("git: {w}")).await;
     }
-    let before = if continues_interrupted(task, &begin.head) {
-        task.snapshot_before.clone().unwrap_or(begin.head)
-    } else {
-        begin.head
-    };
-    sqlx::query("UPDATE tasks SET snapshot_before=$2 WHERE id=$1")
-        .bind(task.id)
-        .bind(&before)
-        .execute(&st.db)
-        .await?;
-    Ok(before)
+    merge::prepare(st, task, project).await
 }
 
 async fn build_prompt(
@@ -1274,23 +1268,29 @@ impl Committer<'_> {
         )
     }
 
-    /// Commit through the runner's secret scanner (WP03).
+    /// Commit through the runner's secret scanner (WP03) in the task's own
+    /// working tree; a commit is copied to the task branch of the main
+    /// repository at once (WP04).
     async fn commit(&self, suffix: &str) -> anyhow::Result<queued_common::CommitOutcome> {
-        self.st
+        let out = self
+            .st
             .runner
             .commit(
-                self.project_id,
+                crate::runner_client::task_ws(self.task.id),
                 &self.message(suffix),
                 self.author_name,
                 self.author_email,
                 self.allow,
             )
-            .await
+            .await?;
+        if out.blocked.is_empty() {
+            merge::sync(self.st, self.project_id, self.task.id, &out.sha).await?;
+        }
+        Ok(out)
     }
 
     /// Partial commit of a run that is re-queued; remembered as
-    /// `snapshot_after`, so the next run can tell whether it continues
-    /// directly on top of it (see [`continues_interrupted`]).
+    /// `snapshot_after` (it stays on the task branch, never on the target).
     async fn interrupted_commit(&self, suffix: String) {
         if let Some(sha) = self.partial(suffix).await {
             if let Err(e) = set_snapshot_after(self.st, self.task.id, &sha).await {
@@ -1582,11 +1582,31 @@ async fn exec(
     cancel: &CancellationToken,
     tx: mpsc::Sender<ExecFrame>,
 ) -> anyhow::Result<ExecFrame> {
+    if cancel.is_cancelled() {
+        // Cancelled before the start (e.g. while the working tree was being
+        // prepared): never start the process.
+        return Ok(ExecFrame::Exit {
+            success: false,
+            code: None,
+            timed_out: false,
+            cancelled: true,
+            files: vec![],
+            stalled: false,
+            killed: false,
+            cache: None,
+            leaks: vec![],
+        });
+    }
     let watcher = {
         let (c, client, name) = (cancel.clone(), st.runner.clone(), req.name.clone());
         tokio::spawn(async move {
             c.cancelled().await;
-            let _ = client.cancel(&name).await;
+            // Repeated: a cancel that arrives while the start request is in
+            // flight would find no run yet (the watcher ends with the run).
+            loop {
+                let _ = client.cancel(&name).await;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
         })
     };
     let res = st.runner.exec(&req, tx).await;
@@ -1723,7 +1743,7 @@ async fn agent_run(
     run_env.extend(inv.env.iter().cloned());
     let req = ExecRequest {
         name: run_name(task.id, spec.label),
-        workspace: task.project_id.to_string(),
+        workspace: crate::runner_client::task_ws(task.id),
         program: inv.program.clone(),
         args: inv.args.clone(),
         env: run_env,
@@ -1955,7 +1975,11 @@ async fn run_setup(
         .map_err(RunError::Infra)?;
     let egress = env.setup_policy();
     let enforced = environment::sandbox(st).await.egress_enforced;
-    let cache = env.cache_spec();
+    // WP04: the cache belongs to the project, not to the task's working tree.
+    let cache = env.cache_spec().map(|c| queued_common::CacheSpec {
+        scope: Some(project.id.to_string()),
+        ..c
+    });
     event(
         st,
         task,
@@ -1977,7 +2001,7 @@ async fn run_setup(
     run_env.extend(secrets.iter().cloned());
     let req = ExecRequest {
         name: run_name(task.id, "setup"),
-        workspace: project.id.to_string(),
+        workspace: crate::runner_client::task_ws(task.id),
         program: "sh".into(),
         // -e: the setup fails at the first failing command.
         args: vec!["-e".into(), "-c".into(), env.setup_script.clone()],
@@ -2094,7 +2118,7 @@ async fn run_verify(
 ) -> anyhow::Result<std::result::Result<(), String>> {
     let req = ExecRequest {
         name: run_name(task.id, "verify"),
-        workspace: task.project_id.to_string(),
+        workspace: crate::runner_client::task_ws(task.id),
         program: "sh".into(),
         args: vec!["-c".into(), cmd.into()],
         env: env.vars(),
@@ -2372,7 +2396,10 @@ async fn run_review(
             },
         });
     }
-    let file = st.runner.queue_file(project.id, "review.json").await?;
+    let file = st
+        .runner
+        .queue_file(crate::runner_client::task_ws(task.id), "review.json")
+        .await?;
     let review = load_review(out.structured.as_ref(), file.as_deref());
     // Limits/auth problems of the review access pause it for the next tasks,
     // whether or not a review result exists (same rule as for agent runs).
@@ -2890,6 +2917,7 @@ async fn create_followups(
                 connector_id,
                 escalation_level: 0,
                 allow_test_changes: false,
+                carry_from: None,
             },
         )
         .await?;
@@ -2970,6 +2998,16 @@ async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Resu
             None => break,
         }
     }
+    // WP04: the fix continues the failed task's unmerged changes (its
+    // working tree starts with them on top of the current target branch).
+    let fresh = queue::load_task(st, failed.id)
+        .await?
+        .unwrap_or_else(|| failed.clone());
+    let carry_from = (fresh.branch.is_some()
+        && !fresh.on_target()
+        && fresh.snapshot_after.is_some()
+        && fresh.diff_base() != fresh.snapshot_after.as_deref())
+    .then_some(failed.id);
     let fix = queue::insert_task(
         st,
         NewTask {
@@ -2992,6 +3030,7 @@ async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Resu
             connector_id: failed.connector_id,
             escalation_level: level,
             allow_test_changes: false,
+            carry_from,
         },
     )
     .await?;

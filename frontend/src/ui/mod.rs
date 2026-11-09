@@ -26,6 +26,7 @@ pub fn status_icon(s: TaskStatus) -> Ic {
         TaskStatus::WaitingBatch => Ic::Clock,
         TaskStatus::WaitingInput => Ic::Message,
         TaskStatus::Held => Ic::Shield,
+        TaskStatus::Merging => Ic::Branch,
         TaskStatus::Done => Ic::CheckCircle,
         TaskStatus::Failed => Ic::XCircle,
         TaskStatus::Blocked => Ic::Octagon,

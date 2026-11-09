@@ -118,6 +118,7 @@ pub async fn create(
             connector_id: exec.connector_id,
             escalation_level: 0,
             allow_test_changes: c.allow_test_changes,
+            carry_from: None,
         },
     )
     .await?;
@@ -278,7 +279,7 @@ pub async fn cancel(
         // Held changes are discarded with the task (they never reach the branch).
         if t.gate_parsed().is_some_and(|g| g.has_diff) {
             st.runner
-                .discard_held(t.project_id, t.id)
+                .discard_held(super::gate::held_ws(&t), t.id)
                 .await
                 .map_err(runner_err)?;
         }
@@ -295,6 +296,29 @@ pub async fn cancel(
             return Err(AppError::conflict("task is not in a suitable state"));
         }
         queue::emit_task(&st, id).await;
+        crate::runner::merge::cleanup_task(&st, t.project_id, id, true).await;
+        return Ok(Json(json!({"ok": true})));
+    }
+    if t.status == status::MERGING {
+        // Being merged right now: the merge job stops at its next step.
+        if let Some(tok) = st.running.lock().await.get(&id) {
+            tok.cancel();
+            return Ok(Json(json!({"ok": true})));
+        }
+        let n = sqlx::query(
+            "UPDATE tasks SET status='cancelled', failure_class='cancelled', error='abgebrochen',
+                    gate_pending=NULL, finished_at=now(), updated_at=now()
+             WHERE id=$1 AND status='merging' AND merge_state='queued'",
+        )
+        .bind(id)
+        .execute(&st.db)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::conflict("task is not in a suitable state"));
+        }
+        queue::emit_task(&st, id).await;
+        crate::runner::merge::cleanup_task(&st, t.project_id, id, true).await;
         return Ok(Json(json!({"ok": true})));
     }
     set_status(
@@ -308,6 +332,9 @@ pub async fn cancel(
         status::CANCELLED,
     )
     .await?;
+    // A cancelled task's working tree and branch are gone (it may be
+    // retried; it then starts afresh).
+    crate::runner::merge::cleanup_task(&st, t.project_id, id, true).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -468,17 +495,25 @@ pub async fn diff(
     if t.user_id != u.id {
         require(&st, t.project_id, u.id, Role::Viewer).await?;
     }
-    let (Some(a), Some(b)) = (&t.snapshot_before, &t.snapshot_after) else {
+    // Against the merge base (WP04): everything the task brings into the
+    // target branch, before and after the merge.
+    let (Some(a), Some(b)) = (t.diff_base(), t.snapshot_after.as_deref()) else {
         return Ok(Json(DiffView {
             diff: String::new(),
             changed: None,
         }));
     };
-    let d = st
-        .runner
-        .diff(t.project_id, a, b, 2_000_000)
-        .await
-        .map_err(runner_err)?;
+    let d = match st.runner.diff(t.project_id, a, b, 2_000_000).await {
+        Ok(d) => d,
+        // The branch of a long-finished task may be gone.
+        Err(e) if crate::runner_client::runner_status(&e) == Some(422) => {
+            return Ok(Json(DiffView {
+                diff: String::new(),
+                changed: None,
+            }))
+        }
+        Err(e) => return Err(runner_err(e)),
+    };
     Ok(Json(DiffView {
         // Approved secrets are in the repository, but never in API answers.
         diff: queued_common::secrets::redact(&d.diff),
@@ -495,17 +530,25 @@ pub async fn revert(
         .await?
         .ok_or_else(AppError::not_found)?;
     require(&st, t.project_id, u.id, Role::Editor).await?;
-    let (Some(a), Some(b)) = (&t.snapshot_before, &t.snapshot_after) else {
+    let (Some(a), Some(b)) = (t.diff_base(), t.snapshot_after.as_deref()) else {
         return Err(AppError::bad_request("task has no commits"));
     };
-    let running: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM tasks WHERE project_id=$1 AND status='running')",
-    )
-    .bind(t.project_id)
-    .fetch_one(&st.db)
-    .await?;
-    if running {
-        return Err(AppError::conflict("a task is running in this project"));
+    if !t.on_target() {
+        return Err(AppError::conflict(
+            "Rückgängig geht erst, wenn der Auftrag in den Hauptstand übernommen ist",
+        ));
+    }
+    if t.branch.is_none() {
+        // Tasks from before WP04 committed into the shared working tree.
+        let running: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM tasks WHERE project_id=$1 AND status='running' AND branch IS NULL)",
+        )
+        .bind(t.project_id)
+        .fetch_one(&st.db)
+        .await?;
+        if running {
+            return Err(AppError::conflict("a task is running in this project"));
+        }
     }
     let sha = st.runner.revert(t.project_id, a, b).await.map_err(|e| {
         tracing::info!("revert of {id} failed: {e:#}");

@@ -126,7 +126,7 @@ pub const HARDEN: [&str; 26] = [
 /// Diff options for scanning: every file as text (a `binary` attribute in
 /// `.gitattributes` must not hide a secret), no external diff drivers or
 /// textconv programs, no rename detection, zero context.
-const SCAN_DIFF: [&str; 8] = [
+pub(crate) const SCAN_DIFF: [&str; 8] = [
     "--no-color",
     "--no-ext-diff",
     "--no-textconv",
@@ -141,7 +141,7 @@ const SCAN_DIFF: [&str; 8] = [
 /// finding (fail-closed).
 pub const MAX_SCAN_BYTES: usize = 16 * 1024 * 1024;
 
-async fn run_git(
+pub(crate) async fn run_git(
     cwd: &Path,
     pre: &[String],
     args: &[&str],
@@ -150,7 +150,7 @@ async fn run_git(
     run_git_env(cwd, pre, args, remote, &[]).await
 }
 
-async fn run_git_env(
+pub(crate) async fn run_git_env(
     cwd: &Path,
     pre: &[String],
     args: &[&str],
@@ -180,18 +180,44 @@ async fn run_git_env(
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Like [`run_git_env`], but a non-zero exit is not an error: returns the
+/// exit code with stdout and stderr (e.g. `merge-tree` reports conflicts
+/// with exit code 1).
+pub(crate) async fn run_git_code(
+    cwd: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<(i32, String, String)> {
+    let out = Command::new("git")
+        .args(HARDEN)
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "true")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .envs(envs.iter().copied())
+        .output()
+        .await
+        .context("git not available")?;
+    Ok((
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
 impl Repo {
     pub fn new(root: &Path, id: &str) -> Self {
         Self { dir: root.join(id) }
     }
 
-    async fn git(&self, args: &[&str]) -> Result<String> {
+    pub(crate) async fn git(&self, args: &[&str]) -> Result<String> {
         self.harden().await?;
         run_git(&self.dir, &[], args, None).await
     }
 
     /// Like [`Repo::git`] with extra environment (temporary index).
-    async fn git_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
+    pub(crate) async fn git_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
         self.harden().await?;
         run_git_env(&self.dir, &[], args, None, envs).await
     }
@@ -375,7 +401,7 @@ impl Repo {
         self.head().await
     }
 
-    async fn ensure_exclude(&self) -> Result<()> {
+    pub(crate) async fn ensure_exclude(&self) -> Result<()> {
         let p = self.dir.join(".git/info/exclude");
         let cur = tokio::fs::read_to_string(&p).await.unwrap_or_default();
         if !cur.lines().any(|l| l.trim() == ".queue/") {
@@ -387,7 +413,7 @@ impl Repo {
         Ok(())
     }
 
-    async fn is_dirty(&self) -> Result<bool> {
+    pub(crate) async fn is_dirty(&self) -> Result<bool> {
         Ok(!self
             .git(&["status", "--porcelain"])
             .await?
@@ -631,6 +657,14 @@ impl Repo {
 
     pub async fn read_file(&self, rel: &str, max: u64) -> Result<String> {
         let path = self.safe_path(rel)?;
+        // The tree may contain symlinks (written by an agent, or merged from
+        // a task branch): never follow one out of the workspace or into `.git`.
+        let real = tokio::fs::canonicalize(&path).await?;
+        let root = tokio::fs::canonicalize(&self.dir).await?;
+        if !real.starts_with(&root) || real.starts_with(root.join(".git")) {
+            bail!("invalid path");
+        }
+        let path = real;
         let meta = tokio::fs::metadata(&path).await?;
         if meta.len() > max {
             bail!("file too large ({} bytes)", meta.len());
@@ -776,7 +810,7 @@ impl Repo {
     }
 
     /// Runs a diff/log command and scans its added lines for secrets.
-    async fn scan_output(
+    pub(crate) async fn scan_output(
         &self,
         args: &[&str],
         key: &[u8],
@@ -999,7 +1033,7 @@ impl Repo {
     }
 
     /// Removes unreachable objects at once (discarded held secrets).
-    async fn prune(&self) -> Result<()> {
+    pub(crate) async fn prune(&self) -> Result<()> {
         let _ = self
             .git(&["reflog", "expire", "--expire-unreachable=now", "--all"])
             .await;
@@ -1027,10 +1061,25 @@ impl Repo {
 
     /// Files under `paths` changed since the approved baseline
     /// (first use: the baseline is set to HEAD).
-    pub async fn baseline_check(&self, req: &gate::BaselineCheck) -> Result<gate::BaselineResult> {
+    /// `head`: commit to compare (WP04: a task's HEAD copied into this main
+    /// repository); `None` = HEAD.
+    pub async fn baseline_check(
+        &self,
+        req: &gate::BaselineCheck,
+        head: Option<&str>,
+    ) -> Result<gate::BaselineResult> {
         anyhow::ensure!(gate::valid_baseline(&req.name), "invalid baseline");
         let r = format!("refs/queue/baseline/{}", req.name);
-        let head = self.head().await?;
+        let head = match head {
+            Some(h) => {
+                check_rev(h)?;
+                self.git(&["rev-parse", "--verify", "-q", &format!("{h}^{{commit}}")])
+                    .await?
+                    .trim()
+                    .to_string()
+            }
+            None => self.head().await?,
+        };
         let base = match self.git(&["rev-parse", "--verify", "-q", &r]).await {
             Ok(b) => b.trim().to_string(),
             Err(_) => {
@@ -1143,7 +1192,7 @@ pub struct PushOutcome {
     pub held: Vec<GateFinding>,
 }
 
-fn too_large(bytes: usize) -> GateFinding {
+pub(crate) fn too_large(bytes: usize) -> GateFinding {
     GateFinding {
         kind: FindingKind::TooLarge,
         path: String::new(),
@@ -1306,7 +1355,7 @@ fn parse_ls_remote(out: &str, head_ref: &str) -> (Option<String>, Option<String>
 }
 
 /// Branch names from the app (no options, no ref tricks).
-fn check_branch(b: &str) -> Result<()> {
+pub(crate) fn check_branch(b: &str) -> Result<()> {
     if b.is_empty()
         || b.len() > 200
         || b.starts_with('-')
@@ -1321,7 +1370,7 @@ fn check_branch(b: &str) -> Result<()> {
 }
 
 /// Only hex SHAs are accepted as revisions (no option injection).
-fn check_rev(r: &str) -> Result<()> {
+pub(crate) fn check_rev(r: &str) -> Result<()> {
     if r.len() < 7 || r.len() > 64 || !r.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("invalid revision");
     }
@@ -1349,7 +1398,17 @@ fn extract_zip(dir: &Path, data: &[u8]) -> Result<usize> {
         if rel.as_os_str().is_empty() || rel.starts_with("__MACOSX") || rel.starts_with(".git") {
             continue;
         }
+        // Never write through a symlink that is already in the tree (a link
+        // to a directory outside would put the file there).
+        if through_symlink(dir, &rel) {
+            continue;
+        }
         let out = dir.join(&rel);
+        if let Ok(m) = std::fs::symlink_metadata(&out) {
+            if m.file_type().is_symlink() {
+                std::fs::remove_file(&out)?;
+            }
+        }
         if f.is_dir() {
             std::fs::create_dir_all(&out)?;
         } else {
@@ -1363,6 +1422,19 @@ fn extract_zip(dir: &Path, data: &[u8]) -> Result<usize> {
         }
     }
     Ok(count)
+}
+
+/// A proper ancestor of `rel` inside `dir` is a symlink.
+fn through_symlink(dir: &Path, rel: &Path) -> bool {
+    let mut p = dir.to_path_buf();
+    let comps: Vec<_> = rel.components().collect();
+    for c in comps.iter().take(comps.len().saturating_sub(1)) {
+        p.push(c);
+        if std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Strip a single common top-level folder (typical for GitHub/macOS zips).
@@ -1455,6 +1527,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.queue_file("result.json").await.unwrap(), None);
+    }
+
+    /// Symlinks in the tree (agent-made or merged from a task branch) never
+    /// let the files API read outside the workspace, nor the ZIP import
+    /// write outside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_api_and_zip_import_never_follow_symlinks() {
+        let (t, r) = repo().await;
+        let outside = t.path().join("host.txt");
+        std::fs::write(&outside, "host secret").unwrap();
+        std::os::unix::fs::symlink(&outside, r.dir.join("link.txt")).unwrap();
+        assert!(r.read_file("link.txt", 1024).await.is_err());
+        std::os::unix::fs::symlink(r.dir.join(".git/config"), r.dir.join("cfg")).unwrap();
+        assert!(r.read_file("cfg", 1024).await.is_err());
+        std::fs::write(r.dir.join("ok.txt"), "fine").unwrap();
+        std::os::unix::fs::symlink("ok.txt", r.dir.join("inner.txt")).unwrap();
+        assert_eq!(r.read_file("inner.txt", 1024).await.unwrap(), "fine");
+        // ZIP import through a symlinked directory and onto a symlinked file.
+        let elsewhere = t.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, r.dir.join("dir")).unwrap();
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut buf);
+            let o: zip::write::SimpleFileOptions = Default::default();
+            z.start_file("dir/evil.txt", o).unwrap();
+            z.write_all(b"evil").unwrap();
+            z.start_file("link.txt", o).unwrap();
+            z.write_all(b"replaced").unwrap();
+            z.start_file("x.txt", o).unwrap();
+            z.write_all(b"x").unwrap();
+            z.finish().unwrap();
+        }
+        r.import_zip(buf.into_inner(), "A", "a@x").await.unwrap();
+        assert!(!elsewhere.join("evil.txt").exists());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "host secret");
+        assert_eq!(
+            std::fs::read_to_string(r.dir.join("link.txt")).unwrap(),
+            "replaced"
+        );
+        assert_eq!(std::fs::read_to_string(r.dir.join("x.txt")).unwrap(), "x");
     }
 
     #[tokio::test]
@@ -2041,14 +2155,15 @@ mod tests {
         let check = gate::BaselineCheck {
             name: "setup".into(),
             paths: vec!["package.json".into(), "scripts/".into()],
+            task: None,
         };
-        let first = r.baseline_check(&check).await.unwrap();
+        let first = r.baseline_check(&check, None).await.unwrap();
         assert!(first.changed.is_empty(), "trust on first use");
         std::fs::create_dir_all(r.dir.join("scripts")).unwrap();
         std::fs::write(r.dir.join("scripts/setup.sh"), "curl evil\n").unwrap();
         std::fs::write(r.dir.join("README.md"), "x\n").unwrap();
         let sha = r.commit("agent", "A", "a@x").await.unwrap();
-        let res = r.baseline_check(&check).await.unwrap();
+        let res = r.baseline_check(&check, None).await.unwrap();
         assert_eq!(res.changed, vec!["scripts/setup.sh"]);
         assert_eq!(res.head, sha);
         r.baseline_approve(&gate::BaselineApprove {
@@ -2057,7 +2172,12 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(r.baseline_check(&check).await.unwrap().changed.is_empty());
+        assert!(r
+            .baseline_check(&check, None)
+            .await
+            .unwrap()
+            .changed
+            .is_empty());
         assert!(r
             .baseline_approve(&gate::BaselineApprove {
                 name: "x".into(),

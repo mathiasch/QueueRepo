@@ -4,6 +4,7 @@ pub mod egress;
 pub mod exec;
 pub mod git;
 pub mod setup;
+pub mod tasks;
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
@@ -196,6 +197,16 @@ pub fn router(st: RunnerState) -> Router {
         )
         .route("/workspaces/{id}/baseline/check", post(baseline_check))
         .route("/workspaces/{id}/baseline/approve", post(baseline_approve))
+        .route(
+            "/workspaces/{id}/tasks/{task}",
+            post(task_prepare).delete(task_remove),
+        )
+        .route("/workspaces/{id}/tasks/{task}/sync", post(task_sync))
+        .route("/workspaces/{id}/tasks/{task}/merge", post(task_merge))
+        .route(
+            "/workspaces/{id}/tasks/{task}/merge/finish",
+            post(task_merge_finish),
+        )
         .route("/workspaces/{id}/log", get(log))
         .route("/workspaces/{id}/queue/{name}", get(queue_file))
         .route("/exec", post(exec_start))
@@ -370,7 +381,127 @@ async fn baseline_check(
     let repo = existing(&st, &id)?;
     let l = st.lock(&id).await;
     let _g = l.lock().await;
-    Ok(Json(repo.baseline_check(&req).await?))
+    let head = match &req.task {
+        // WP04: the baseline lives in the main repository; the task's HEAD
+        // is copied there first.
+        Some(t) => {
+            let task = task_repo(&st, &id, t)?;
+            let tl = st.lock(t).await;
+            let _tg = tl.lock().await;
+            Some(repo.fetch_task_head(&task, t).await?)
+        }
+        None => None,
+    };
+    Ok(Json(repo.baseline_check(&req, head.as_deref()).await?))
+}
+
+/// Main repository `id` (a project workspace) and task workspace `task`.
+fn task_repo(st: &RunnerState, id: &str, task: &str) -> R<Repo> {
+    if is_task_workspace(id) || !is_task_workspace(task) {
+        return Err(ApiErr(
+            StatusCode::BAD_REQUEST,
+            "invalid task workspace".into(),
+        ));
+    }
+    st.repo(task)
+}
+
+async fn task_prepare(
+    State(st): State<RunnerState>,
+    Path((id, t)): Path<(String, String)>,
+    Json(req): Json<TaskWorkspaceRequest>,
+) -> R<Json<TaskWorkspaceResult>> {
+    let task = task_repo(&st, &id, &t)?;
+    let main = existing(&st, &id)?;
+    let l = st.lock(&id).await;
+    let _g = l.lock().await;
+    let tl = st.lock(&t).await;
+    let _tg = tl.lock().await;
+    Ok(Json(
+        main.prepare_task(&task, &t, &req, st.scan_key()).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct BranchQ {
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+async fn task_remove(
+    State(st): State<RunnerState>,
+    Path((id, t)): Path<(String, String)>,
+    Query(q): Query<BranchQ>,
+) -> R<Json<serde_json::Value>> {
+    let task = task_repo(&st, &id, &t)?;
+    let main = st.repo(&id)?;
+    let l = st.lock(&id).await;
+    let _g = l.lock().await;
+    let tl = st.lock(&t).await;
+    let _tg = tl.lock().await;
+    if st.workspace_busy(&t).await {
+        return Err(ApiErr(
+            StatusCode::CONFLICT,
+            "a process runs in this task workspace".into(),
+        ));
+    }
+    main.remove_task(&task, &t, q.branch.as_deref()).await?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn task_sync(
+    State(st): State<RunnerState>,
+    Path((id, t)): Path<(String, String)>,
+    Json(req): Json<SyncRequest>,
+) -> R<Json<serde_json::Value>> {
+    let task = task_repo(&st, &id, &t)?;
+    let main = existing(&st, &id)?;
+    let l = st.lock(&id).await;
+    let _g = l.lock().await;
+    let tl = st.lock(&t).await;
+    let _tg = tl.lock().await;
+    if st.workspace_busy(&t).await {
+        return Err(ApiErr(
+            StatusCode::CONFLICT,
+            "a process runs in this task workspace".into(),
+        ));
+    }
+    main.sync_task(&task, &t, &req.branch, &req.sha).await?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn task_merge(
+    State(st): State<RunnerState>,
+    Path((id, t)): Path<(String, String)>,
+    Json(req): Json<MergeRequest>,
+) -> R<Json<MergeResult>> {
+    let task = task_repo(&st, &id, &t)?;
+    let main = existing(&st, &id)?;
+    let l = st.lock(&id).await;
+    let _g = l.lock().await;
+    let tl = st.lock(&t).await;
+    let _tg = tl.lock().await;
+    if req.checkout && st.workspace_busy(&t).await {
+        return Err(ApiErr(
+            StatusCode::CONFLICT,
+            "a process runs in this task workspace".into(),
+        ));
+    }
+    Ok(Json(
+        main.merge_prepare(&task, &t, &req, st.scan_key()).await?,
+    ))
+}
+
+async fn task_merge_finish(
+    State(st): State<RunnerState>,
+    Path((id, t)): Path<(String, String)>,
+    Json(req): Json<MergeFinish>,
+) -> R<Json<MergeFinishResult>> {
+    task_repo(&st, &id, &t)?;
+    let main = existing(&st, &id)?;
+    let l = st.lock(&id).await;
+    let _g = l.lock().await;
+    Ok(Json(main.merge_finish(&t, &req, st.scan_key()).await?))
 }
 
 async fn baseline_approve(
@@ -558,7 +689,15 @@ async fn exec_start(State(st): State<RunnerState>, Json(req): Json<ExecRequest>)
     tokio::spawn(async move {
         let cfg = st2.cfg.clone();
         let runner = tokio::spawn(async move { exec::run(&cfg, req, c2, tx).await });
+        let mut ended = false;
         while let Some(frame) = rx.recv().await {
+            if matches!(frame, ExecFrame::Exit { .. } | ExecFrame::Fail { .. }) {
+                ended = true;
+                // The process is gone: the workspace is free before the
+                // client sees the end (it may remove the working tree next).
+                st2.running.lock().await.remove(&name);
+                st2.active.lock().await.remove(&name);
+            }
             let mut line = serde_json::to_vec(&frame).unwrap_or_default();
             line.push(b'\n');
             if body_tx.send(Ok(Bytes::from(line))).await.is_err() {
@@ -566,8 +705,11 @@ async fn exec_start(State(st): State<RunnerState>, Json(req): Json<ExecRequest>)
             }
         }
         let _ = runner.await;
-        st2.running.lock().await.remove(&name);
-        st2.active.lock().await.remove(&name);
+        if !ended {
+            // (A run with the same name may already have started otherwise.)
+            st2.running.lock().await.remove(&name);
+            st2.active.lock().await.remove(&name);
+        }
     });
     let stream = tokio_stream::wrappers::ReceiverStream::new(body_rx).map(|r| r);
     Ok((
@@ -701,6 +843,88 @@ mod tests {
         assert_eq!(del("w1").await.unwrap().status(), 200);
         assert!(!t.path().join("caches/w1").exists());
         assert_eq!(del("..%2Fx/cache").await.unwrap().status(), 400);
+    }
+
+    /// Task endpoints only accept a project workspace as main repository and
+    /// a task workspace (`t<32 hex>`) as task: never a project's main
+    /// repository in place of a task (deleting it, exporting into it …).
+    #[tokio::test]
+    async fn task_endpoints_validate_workspace_kinds() {
+        let (t, a) = serve().await;
+        let c = reqwest::Client::new();
+        let main = "11111111-2222-4333-8444-555555555555";
+        let other = "11111111-2222-4333-8444-666666666666";
+        let task = "t0123456789abcdef0123456789abcdef";
+        for ws in [main, other] {
+            c.post(format!("{a}/v1/workspaces/{ws}"))
+                .bearer_auth("test-token")
+                .json(&InitWorkspace::default())
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+        }
+        let body = TaskWorkspaceRequest {
+            branch: "queue/0123456789ab".into(),
+            merge_base: None,
+            carry: None,
+            allow: vec![],
+        };
+        let post = |path: String| {
+            c.post(format!("{a}/v1/workspaces/{path}"))
+                .bearer_auth("test-token")
+                .json(&body)
+                .send()
+        };
+        assert_eq!(
+            post(format!("{main}/tasks/{other}"))
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+        assert_eq!(
+            post(format!("{task}/tasks/{task}")).await.unwrap().status(),
+            400
+        );
+        assert_eq!(
+            c.delete(format!("{a}/v1/workspaces/{main}/tasks/{other}"))
+                .bearer_auth("test-token")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+        assert!(t
+            .path()
+            .join("workspaces")
+            .join(other)
+            .join(".git")
+            .is_dir());
+        let r: TaskWorkspaceResult = post(format!("{main}/tasks/{task}"))
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(r.created);
+        assert!(t.path().join("workspaces").join(task).join(".git").is_dir());
+        assert_eq!(
+            c.delete(format!(
+                "{a}/v1/workspaces/{main}/tasks/{task}?branch=queue/0123456789ab"
+            ))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+            200
+        );
+        assert!(!t.path().join("workspaces").join(task).exists());
     }
 
     #[tokio::test]

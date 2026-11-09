@@ -16,6 +16,7 @@ pub mod status {
     pub const WAITING_BATCH: &str = "waiting_batch";
     pub const WAITING_INPUT: &str = "waiting_input";
     pub const HELD: &str = "held";
+    pub const MERGING: &str = "merging";
     pub const DONE: &str = "done";
     pub const FAILED: &str = "failed";
     pub const BLOCKED: &str = "blocked";
@@ -56,6 +57,8 @@ pub struct Project {
     pub test_guard: bool,
     pub setup_guard: bool,
     pub secret_allowlist: Vec<String>,
+    /// WP04: tasks of this project at the same time.
+    pub parallelism: i32,
 }
 
 impl Project {
@@ -101,6 +104,7 @@ impl Project {
             has_git_token: self.git_token_enc.is_some(),
             routing: self.routing(),
             data_residency: self.residency(),
+            parallelism: self.parallelism,
         }
     }
 }

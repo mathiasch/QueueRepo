@@ -249,6 +249,7 @@ pub async fn start(
                 connector_id: exec.connector_id,
                 escalation_level: 0,
                 allow_test_changes: false,
+                carry_from: None,
             },
         )
         .await?;
@@ -434,10 +435,12 @@ pub async fn delete(st: &AppState, user: Uuid, id: Uuid) -> anyhow::Result<bool>
         .await?
         .rows_affected();
     for p in projects {
+        let trees = crate::runner::merge::working_trees(st, p).await?;
         sqlx::query("DELETE FROM projects WHERE id=$1 AND is_eval")
             .bind(p)
             .execute(&st.db)
             .await?;
+        crate::runner::merge::remove_working_trees(st, p, &trees).await;
         if let Err(e) = st.runner.delete(p).await {
             tracing::warn!("eval workspace {p} not deleted: {e:#}");
         }

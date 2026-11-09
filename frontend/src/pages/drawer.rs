@@ -229,6 +229,7 @@ fn DrawerActions(
     let status = t.status_kind();
     let id = t.id;
     let has_changes = t.has_changes();
+    let can_revert = crate::logic::branch::can_revert(&t);
     let edit_t = t.clone();
     let start_edit = move |_| {
         editing.set(Some(EditState {
@@ -271,7 +272,7 @@ fn DrawerActions(
             }),
         });
     };
-    let (tc, td) = (t.clone(), t.clone());
+    let (tc, td, tm) = (t.clone(), t.clone(), t.clone());
     view! {
         <div class="drawer-actions">
             {(status.is_editable()).then(|| view! {
@@ -291,7 +292,25 @@ fn DrawerActions(
                     <Icon icon=Ic::X class="sm"/>"Abbrechen"
                 </button>
             })}
-            {(status.can_cancel() && !matches!(status, TaskStatus::Running | TaskStatus::Held)).then(|| view! {
+            {(status == TaskStatus::Merging).then(|| {
+                let title = first_line(&tm.title, 80);
+                view! {
+                    <button class="btn danger" type="button" on:click=move |_| {
+                        store.ask(Confirm {
+                            title: "Übernahme abbrechen?".into(),
+                            body: format!("„{title}“ ist fertig und geprüft. Abbrechen verwirft den Branch mit allen Änderungen – sie kommen nicht in den Hauptstand. „Erneut versuchen“ startet den Auftrag danach von vorn."),
+                            confirm_label: "Abbrechen und verwerfen".into(),
+                            danger: true,
+                            on_confirm: Callback::new(move |_| {
+                                store.run("Abbrechen fehlgeschlagen", async move { api::action(&format!("/tasks/{id}/cancel")).await });
+                            }),
+                        });
+                    }>
+                        <Icon icon=Ic::X class="sm"/>"Übernahme abbrechen"
+                    </button>
+                }
+            })}
+            {(status.can_cancel() && !matches!(status, TaskStatus::Running | TaskStatus::Held | TaskStatus::Merging)).then(|| view! {
                 <button class="btn danger" type="button" on:click=move |_| discard(store, &td)>
                     <Icon icon=Ic::Trash class="sm"/>"Verwerfen"
                 </button>
@@ -314,7 +333,7 @@ fn DrawerActions(
                     {move || if diff.get().is_some() { "Änderungen ausblenden" } else { "Änderungen anzeigen" }}
                 </button>
             })}
-            {(has_changes && status != TaskStatus::Running).then(|| view! {
+            {(can_revert && status != TaskStatus::Running).then(|| view! {
                 <button class="btn danger" type="button" on:click=revert>
                     <Icon icon=Ic::Undo class="sm"/>"Rückgängig machen"
                 </button>
@@ -427,6 +446,7 @@ fn Details(t: Task) -> impl IntoView {
             </Block>
         })}
         {t.gate_parsed().filter(|_| status == TaskStatus::Held).map(|g| view! { <GatePanel id=id gate=g/> })}
+        <super::branch::BranchBlock t=t.clone()/>
         {(!questions.is_empty()).then(|| view! { <DrawerQuestions id=id questions=questions.clone() waiting=status == TaskStatus::WaitingInput/> })}
         {abort.map(|(text, tone)| view! {
             <div data-testid="abort-reason">

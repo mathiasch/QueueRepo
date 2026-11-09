@@ -1,3 +1,4 @@
+pub mod branch;
 pub mod composer;
 pub mod drawer;
 pub mod environment;

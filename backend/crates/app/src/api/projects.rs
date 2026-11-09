@@ -75,7 +75,8 @@ pub fn runner_err(e: anyhow::Error) -> AppError {
 
 async fn ensure_idle(st: &AppState, id: Uuid) -> ApiResult<()> {
     let running: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM tasks WHERE project_id=$1 AND status='running')",
+        "SELECT EXISTS (SELECT 1 FROM tasks WHERE project_id=$1
+                        AND (status='running' OR (status='merging' AND merge_state='merging')))",
     )
     .bind(id)
     .fetch_one(&st.db)
@@ -237,6 +238,11 @@ pub async fn update(
     Json(p): Json<UpdateProject>,
 ) -> ApiResult<Json<ProjectView>> {
     require(&st, id, u.id, Role::Editor).await?;
+    if let Some(n) = p.parallelism {
+        // More parallel tasks cost the owner's resources and raise conflicts.
+        require(&st, id, u.id, Role::Owner).await?;
+        queued_api::branch::validate_parallelism(n).map_err(AppError::bad_request)?;
+    }
     limits::int(
         "Max. Laufzeit (Sekunden)",
         p.max_runtime_secs.flatten(),
@@ -298,7 +304,8 @@ pub async fn update(
             stall_timeout_secs = CASE WHEN $16 THEN $17 ELSE stall_timeout_secs END,
             max_cost_usd = CASE WHEN $18 THEN $19 ELSE max_cost_usd END,
             max_tokens = CASE WHEN $20 THEN $21 ELSE max_tokens END,
-            max_turns = CASE WHEN $22 THEN $23 ELSE max_turns END
+            max_turns = CASE WHEN $22 THEN $23 ELSE max_turns END,
+            parallelism = COALESCE($24, parallelism)
          WHERE id=$1 RETURNING *",
     )
     .bind(id)
@@ -324,6 +331,7 @@ pub async fn update(
     .bind(p.max_tokens.flatten())
     .bind(p.max_turns.is_some())
     .bind(narrow(p.max_turns))
+    .bind(p.parallelism)
     .fetch_one(&st.db)
     .await?;
     st.wake.notify_one();
@@ -338,10 +346,12 @@ pub async fn remove(
 ) -> ApiResult<Json<Value>> {
     require(&st, id, u.id, Role::Owner).await?;
     ensure_idle(&st, id).await?;
+    let trees = crate::runner::merge::working_trees(&st, id).await?;
     sqlx::query("DELETE FROM projects WHERE id=$1")
         .bind(id)
         .execute(&st.db)
         .await?;
+    crate::runner::merge::remove_working_trees(&st, id, &trees).await;
     if let Err(e) = st.runner.delete(id).await {
         tracing::warn!("workspace {id} not deleted: {e:#}");
     }
@@ -566,5 +576,44 @@ pub async fn tasks(
         .bind(id)
         .fetch_all(&st.db)
         .await?,
+    ))
+}
+
+/// `GET /api/projects/{id}/merge-queue`: tasks waiting for or in their merge
+/// into the target branch, in merge order (members of the project).
+pub async fn merge_queue(
+    State(st): State<AppState>,
+    AuthUser(u): AuthUser,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Vec<queued_api::branch::MergeQueueEntry>>> {
+    require(&st, id, u.id, Role::Viewer).await?;
+    let rows: Vec<(Uuid, String, String, Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>)> =
+        sqlx::query_as(
+            "SELECT t.id, t.title, COALESCE(NULLIF(u.name, ''), u.email), t.branch, t.merge_state, t.merge_queued_at
+             FROM tasks t JOIN users u ON u.id = t.user_id
+             WHERE t.project_id = $1 AND t.status = 'merging'
+             ORDER BY (t.merge_state = 'merging') DESC, t.merge_queued_at, t.id",
+        )
+        .bind(id)
+        .fetch_all(&st.db)
+        .await?;
+    Ok(Json(
+        rows.into_iter()
+            .enumerate()
+            .map(|(i, (task_id, title, user, branch, state, queued_at))| {
+                queued_api::branch::MergeQueueEntry {
+                    task_id,
+                    title,
+                    user,
+                    branch: branch.unwrap_or_default(),
+                    state: state
+                        .as_deref()
+                        .and_then(queued_api::branch::MergeState::parse)
+                        .unwrap_or(queued_api::branch::MergeState::Queued),
+                    queued_at,
+                    position: i as u32 + 1,
+                }
+            })
+            .collect(),
     ))
 }

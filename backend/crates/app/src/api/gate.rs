@@ -205,14 +205,15 @@ pub async fn reject(
         st.wake.notify_one();
         return Ok(Json(json!({"ok": true})));
     }
-    if g.stage == GateStage::Changes {
+    if g.stage == GateStage::Changes && g.has_diff {
         st.runner
-            .discard_held(t.project_id, t.id)
+            .discard_held(held_ws(&t), t.id)
             .await
             .map_err(runner_err)?;
     }
     let msg = match g.stage {
         GateStage::Changes => "Freigabe abgelehnt: Die Änderungen wurden verworfen.",
+        GateStage::Review if t.branch.is_some() => "Freigabe abgelehnt: ohne Review nicht übernommen. Die Änderungen bleiben auf dem Branch des Auftrags und kommen nicht in den Hauptstand.",
         GateStage::Review => "Freigabe abgelehnt: ohne Review nicht übernommen. Die Änderungen sind gespeichert und lassen sich mit „Rückgängig“ entfernen.",
         _ => "Freigabe abgelehnt: Auftrag angehalten.",
     };
@@ -233,8 +234,19 @@ pub async fn reject(
     }
     queue::event(&st, &t, "gate", &format!("{msg} (von {who})")).await;
     queue::emit_task(&st, id).await;
+    // The working tree goes; the branch stays for a while (diff, retry).
+    crate::runner::merge::cleanup_task(&st, t.project_id, t.id, false).await;
     st.wake.notify_one();
     Ok(Json(json!({"ok": true})))
+}
+
+/// Where a task's held changes are: its own working tree (WP04), or the
+/// shared workspace for holds from before WP04 (moved on approval).
+pub fn held_ws(t: &Task) -> String {
+    match &t.branch {
+        Some(_) => crate::runner_client::task_ws(t.id),
+        None => t.project_id.to_string(),
+    }
 }
 
 /// `GET /api/tasks/{id}/gate/diff`: the held changes, secrets redacted.
@@ -258,7 +270,7 @@ pub async fn diff(
     }
     let d = st
         .runner
-        .held_diff(t.project_id, t.id)
+        .held_diff(held_ws(&t), t.id)
         .await
         .map_err(runner_err)?;
     Ok(Json(DiffView {

@@ -26,11 +26,12 @@ enum HistoryFilter {
 /// Key that changes whenever a row must be re-rendered.
 fn row_key(t: &Task) -> String {
     format!(
-        "{}-{}-{}-{}",
+        "{}-{}-{}-{}-{:?}",
         t.id,
         t.status,
         t.updated_at.timestamp_micros(),
-        t.position
+        t.position,
+        t.merge_state
     )
 }
 
@@ -51,6 +52,16 @@ pub fn QueuePage() -> impl IntoView {
     };
     let running = by(|s| s == TaskStatus::Running);
     let waiting_batch = by(|s| s == TaskStatus::WaitingBatch);
+    let merging = Memo::new(move |_| {
+        let mut m: Vec<Task> = store.tasks.with(|ts| {
+            ts.iter()
+                .filter(|t| t.status_kind() == TaskStatus::Merging)
+                .cloned()
+                .collect()
+        });
+        m.sort_by_key(|t| t.merge_queued_at);
+        m
+    });
     let attention = by(TaskStatus::needs_user);
     let queued = Memo::new(move |_| {
         let mut q: Vec<Task> = store.tasks.with(|ts| {
@@ -135,6 +146,18 @@ pub fn QueuePage() -> impl IntoView {
                     <h2 id="sec-running">"Läuft gerade"</h2>
                 </div>
                 <For each=move || running.get() key=row_key children=move |t| view! { <RunningCard t=t/> }/>
+            </section>
+        })}
+
+        {move || (!merging.with(Vec::is_empty)).then(|| view! {
+            <section class="section" aria-labelledby="sec-merging">
+                <div class="section-head">
+                    <h2 id="sec-merging">"Wird übernommen" <span class="count">{move || merging.with(Vec::len)}</span></h2>
+                    <HelpTip topic="Wird übernommen" text=status_help(TaskStatus::Merging)/>
+                </div>
+                <div class="list" data-testid="merging-list">
+                    <For each=move || merging.get() key=row_key children=move |t| view! { <TaskRow t=t/> }/>
+                </div>
             </section>
         })}
 
@@ -297,6 +320,11 @@ fn RowMeta(t: Task) -> impl IntoView {
                 }
                 if let Some(h) = retry_hint(&tt, now, &tz()) {
                     extra.push(h);
+                }
+                if tt.status_kind() == TaskStatus::Merging {
+                    if let Some(m) = tt.merge_state_kind() {
+                        extra.push(m.label().to_string());
+                    }
                 }
                 extra.into_iter().map(|e| view! { <span class="sep" aria-hidden="true">"·"</span><span>{e}</span> }).collect_view()
             }}

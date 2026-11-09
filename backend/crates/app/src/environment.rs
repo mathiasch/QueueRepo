@@ -191,6 +191,7 @@ impl Env {
         Some(CacheSpec {
             key_material: material,
             files,
+            scope: None,
         })
     }
 }
