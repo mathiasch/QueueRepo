@@ -1,0 +1,67 @@
+# WP03 – Review (Selbst-Review, harte Lesart)
+
+Gegenstand: kompletter WP03-Diff gegen `ae37b03` (common, runner, api, app, Migration 0006, Frontend, E2E, README; 50 Dateien, +6,6k/−0,3k Zeilen). Maßstab: `work-packages.md` (Gemeinsame Regeln, WP03), Auftrag des Koordinators (kein Host-Root, Sicherheitsmodell nur härten, keine echten Secrets in Fixtures, Treffer nie im Klartext, CLI-Flags nur belegt), Report P0.5/P0.6/P0.8/P0.9, offene Funde WP01-N1, WP02-N1/N14, WP13-N10. Jede Feststellung ist am Code oder an einem Testlauf geprüft.
+
+## Urteil
+
+**Abnahmefähig mit dokumentierten Restrisiken.** Alle blockierenden Funde sind behoben und mit Tests belegt; die Suite ist auf dem finalen Stand zweimal grün (`WP03-test.md`). Der wichtigste Fund dieses Pakets stand in keinem Bericht und war schwerer als alles, was WP03 laut Auftrag liefern sollte: Der Runner hat Git **auf dem Host** in einem vom Agenten kontrollierten Repository ausgeführt. Damit war jede Sandbox (WP02) per `post-commit`-Hook umgehbar. Das ist geschlossen. Der Secret-Scanner ist ein eigener Regelsatz und damit ehrlich gesagt eine Heuristik: Er fängt die gängigen Formate und auffällige Zuweisungen, nicht jedes Geheimnis.
+
+## Akzeptanz gegen WP03
+
+| Anforderung | Status | Beleg |
+|---|---|---|
+| Secret-Scanning von Diffs (Token-Formate + Entropie) vor Commit/Push | erfüllt: jeder Commit-Pfad im Runner (Auftrag, Teil-Commit, WIP/Quarantäne, Freigabe) und jeder Push | `secrets::tests` (9), `gate::tests::secrets_in_added_lines…`, `secrets_block_commits_unless_approved`, `begin_quarantines_leftovers_with_secrets`, `push_to_default_branch_and_secrets_need_approval`, Integration `secret_in_diff_holds_the_commit_until_approved`, System-E2E |
+| … und von Event-Logs | erfüllt: jedes Event, Ergebnis, Fehler, jede Benachrichtigung geschwärzt; feste Token-Formate in der Agenten-Ausgabe halten den Auftrag | `token_in_agent_output_is_redacted_and_holds` (prüft auch die rohe DB) |
+| Treffer blockieren und erzeugen Rückfrage | erfüllt: Status `held` mit Funden, Push-Benachrichtigung, Freigabe/Verwerfen in UI und API | Integration (9), E2E Desktop/iPhone |
+| Treffer nie im Klartext | erfüllt: Fund = Regel + Präfix + Länge, Fingerabdruck = HMAC | Tests durchsuchen Task-JSON, Events (DB), Gate-Diff, Diff, Benachrichtigungen, Seite |
+| Repo-Hooks/MCP standardmäßig aus, pro Projekt freischaltbar | erfüllt für Claude, Gemini (mit belegter Lücke `.gemini/.env`), opencode; Codex braucht nichts | `repo_config_is_restricted_per_cli`, `trusted_repo_config_changes_need_approval`; Belege je CLI unten |
+| Geschützte Pfade erzwingen Freigabe | erfüllt (bestehende Dateien; neue Testdateien erlaubt) | `protected_changes_but_not_new_files`, Integration |
+| Erkennung gelöschter/übersprungener Tests | erfüllt (12 Marker-Muster, gelöschte Testdateien, entfernte Assertions, Verifier-Konfiguration, `package.json`-Skripte) | `test_weakening_markers`, `deleted_tests_removed_assertions_and_verifier_config`, `inspect_reports_…` |
+| Verify auf Basis-Version der geschützten Dateien | erfüllt über die Reihenfolge Gate → Commit → Verify; Verify sieht nie eine unfreigegebene Änderung an geschützten Dateien | Integration prüft, dass Verify vor der Freigabe nicht läuft |
+| Review mit Rubrik, bevorzugt anderer Provider | erfüllt (Legacy-Zugänge; Datenstandort/Pausen geprüft) | `review_prompt_has_rubric_and_approved_findings`; anderer Provider nur per Code-Review belegt (siehe N8) |
+| Auto-Push nie direkt auf den Default-Branch ohne Freigabe | erfüllt, nicht abschaltbar | `push_to_default_branch…`, Integration `clones_remote_and_auto_pushes`, System-E2E mit echtem Bare-Remote |
+| WP01-N1 Review-Fehler → nicht ungeprüft `done` | erfüllt (Phasen-Retry, dann Freigabe; auch Batch-Review) | `review_outage_is_retried_then_needs_a_decision`, `review_rate_limit_pauses_review_provider` |
+| WP13-N10 opencode.json | erfüllt (`OPENCODE_DISABLE_PROJECT_CONFIG`) | Unit-Test, Binary-Strings |
+| WP02-N1 Setup sieht Secrets | gehärtet: Setup mit Secrets nur auf freigegebenem Stand der Setup-Dateien | `changed_setup_files_need_approval_before_setup_with_secrets` |
+| WP02-N14 Secret bereits in HEAD | teilweise: Push-Scan prüft alle noch nicht gepushten Commits; bereits gepushte bleiben (siehe N2) | `push_…` (Secret in einem später wieder entfernten Commit wird gefunden) |
+
+## Blockierende Funde (alle behoben)
+
+| # | Fund | Wie gefunden | Behebung | Beleg |
+|---|---|---|---|---|
+| B1 | **Host-Code-Ausführung über `.git` des Agenten.** Der Runner rief `git status/add/commit/pull/diff/revert/archive` im Workspace auf; `.git/config` und `.git/hooks` gehören dem Agenten. `core.fsmonitor`, `filter.*.clean` (+ `.gitattributes`), `post-commit` (läuft trotz `--no-verify`), `post-merge` beim Pull, `gpg.program`, `diff.external`/`textconv`, `credential.helper` führten Programme **als Runner-User außerhalb der Sandbox** aus. `url.*.insteadOf`, `http.proxy` oder ein umgebogenes `origin` hätten das Git-Token an einen fremden Host geschickt. Auch `setup.rs` (Leck-Bereinigung) rief ungehärtetes Git auf. | Lesen von `git.rs` beim Planen | `HARDEN`-Overrides für jeden Aufruf, `harden()` mit Allowlist-Neuschreiben der Config (gelesen außerhalb jedes Repos, sonst wertet Git `include` aus), Symlink-Prüfung für `.git`/`objects`/`refs`, Alternates entfernt, Pull/Push per URL | `agent_git_config_and_hooks_never_run_on_the_host` (Marker-Datei bleibt aus), `symlinked_git_dirs_are_refused`, `ls_remote_and_config_helpers`, Push nach umgebogenem `origin` |
+| B2 | **Selbst-Commits des Agenten umgingen das Gate.** Der erste Entwurf parkte nur `HEAD..Arbeitsbaum`; ein `git commit` des Agenten im Container brachte Secrets und Teständerungen am Gate vorbei auf den Branch. | Beim Schreiben der Integrationstests | `inspect` scannt `basis..HEAD` je Commit; `hold` parkt mit Elternteil = Basis und setzt den Branch zurück | `commits_the_agent_made_itself_are_held_too` (Commit verschwindet auch aus `log --all` nach Verwerfen) |
+| B3 | **`binary`-Attribut versteckte Secrets.** `git diff` ohne `-a` zeigt für `*.py binary` nur „Binary files differ“. | Selbst-Review | Scan-Diffs mit `-a` | `secrets_block_commits_unless_approved` (zweiter Teil) |
+| B4 | **Freigabe eines „zu groß“-Funds konnte nie committen** (Endlosschleife Freigabe → Scan → wieder zu groß). | Selbst-Review | `allow_large` bei Freigabe | `oversized_changes_block_until_a_human_allows_them` |
+| B5 | **`git prune --expire=now` während ein Agent läuft** hätte noch nicht referenzierte Objekte des laufenden Agenten löschen können (Verwerfen/Abbrechen eines gehaltenen Auftrags, während im selben Projekt ein anderer läuft). | Selbst-Review | Runner kennt aktive Läufe pro Workspace; Prune dann verschoben auf das nächste `begin` | `hold_release_and_discard` (Teil „busy“) |
+| B6 | **Vertraute Agent-Konfiguration erst beim nächsten Lauf geprüft.** Im Freischalt-Modus hätte der Review-Lauf desselben Auftrags eine vom Agenten neu angelegte `.mcp.json`/Hooks bereits geladen. | Selbst-Review | `watch` im Gate (jede Änderung, auch neue Dateien) + Baseline-Update nach Freigabe | `watched_agent_config`, Integration (Stufe `changes` und Stufe `config`) |
+| B7 | **Reiter „Schutz“ blieb leer** (Leptos: `Memo::track()` im Render-Closure abonnierte nicht). | E2E (alle Projekte rot) | Muster wie im Umgebungs-Reiter (`loaded.get().map(…)`) | E2E grün |
+| B8 | **Zwei widersprüchliche „Verwerfen“** im Drawer gehaltener Aufträge (Abbrechen vs. Freigabe ablehnen); in der Liste fehlte ein Weg zur Entscheidung. | Screenshot-/Code-Review | generisches „Verwerfen“ für `held` ausgeblendet, Zeilenaktion „Entscheiden“ | E2E |
+| B9 | **Projekt-API lehnte `file://`-Remotes im E2E-Stack ab** (System-Test des Push-Schutzes nicht ausführbar). | E2E | `ALLOW_LOCAL_GIT_REMOTES=true` nur in `e2e/scripts/stack.sh` | System-E2E |
+
+## Nicht blockierende Funde (offen, bewusst)
+
+| # | Fund | Bewertung |
+|---|---|---|
+| N1 | **Scanner ist eine Heuristik.** Nicht erkannt: unbekannte Formate, base64/verschlüsselte Werte, Werte in Binärdateien, kurze Passwörter mit niedriger Entropie, Secrets in Commit-Nachrichten. Fehlalarme der Entropie-Regel möglich. | Fehlalarm = eine Freigabe; Freigaben werden pro Projekt gemerkt. gitleaks/trufflehog sind nicht installiert und hätten einen Download im Betrieb bedeutet. |
+| N2 | **Teil-Commits unterbrochener Läufe** werden nur auf Secrets geprüft; geschützte Pfade/Tests erst am Auftragsende (über alle Läufe ab dem ersten Ausgangsstand). Ein Push eines *anderen* Auftrags auf einen nicht geschützten Branch kann so ungeprüfte Teständerungen mitnehmen. Bereits gepushte Secrets (WP02-N14) erkennt Queue nicht. | Selten (Unterbrechung + Teständerung + Auto-Push auf Nicht-Standard-Branch). Mit WP04 (Branch pro Auftrag) entfällt das. |
+| N3 | **CLI-Abschaltung nicht live verifiziert.** Claude: Optionen im installierten Binary 2.1.319 (`--help`, Strings), nicht mit Modell ausgeführt. Gemini 0.67.0 und opencode 1.19.5: aus Bundle-Quelltext bzw. Binary-Strings, nicht ausgeführt (Auto-Modus). Codex 0.167.0: nur Strings („Project `.codex/config.toml` … for a trusted repository“). Gemini liest in vertrauten Ordnern `.gemini/.env` immer (nur nicht gesetzte Variablen) – deshalb Baseline-Prüfung. Ob opencode (Bun-Binary) eine `.env` im Arbeitsverzeichnis automatisch lädt, ist **nicht geprüft**. | In README und UI („Beleg“) offen ausgewiesen. Egress-Allowlist (WP02) begrenzt umgeleitete Endpunkte zusätzlich. |
+| N4 | **Setup-Dateien sind eine Heuristik** (Lock-/Manifest-Dateien, im Skript genannte Pfade, Cache-Dateien). Indirekt aufgerufene Skripte (`postinstall` → `scripts/x.js`) erkennt Queue nur über ihr Manifest. | Dokumentiert. Strenger wäre „jede Änderung seit Freigabe“, das hätte jeden Auftrag angehalten. |
+| N5 | **Trust on first use** bei Baselines: der erste Setup-Lauf mit Secrets bzw. der erste Lauf nach dem Freischalten vertraut dem aktuellen Stand, auch wenn ein Agent ihn vorher verändert hat. | Im Bestätigungsdialog und README genannt. |
+| N6 | **Gehaltene Secrets liegen als Git-Objekte im Workspace** (`refs/queue/held/*`). Ein Agent eines *anderen* Auftrags desselben Projekts könnte sie bis zur Entscheidung mit `git show` lesen. | Ohne WP03 wären sie committet und für alle sichtbar gewesen; strikt besser. Eigenes Objekt-Repository außerhalb des Workspace wäre die saubere Lösung (Folgearbeit WP04). |
+| N7 | Fingerabdrücke hängen am `RUNNER_TOKEN`; Rotation verwirft alle Freigaben (Queue fragt erneut). | Dokumentiert. |
+| N8 | „Anderer Review-Anbieter“ wählt nur unter Legacy-Zugängen (claude/codex/gemini), nicht unter Connectoren, und hat keinen eigenen Integrationstest (der Mock kennt nur einen Anbieter). | Logik klein und per Review geprüft; mit Routing (WP13) kann der Review-Zugang ohnehin explizit gewählt werden. |
+| N9 | Symlinks *innerhalb* von `.git/objects/xx/…` oder `refs/heads/…` werden nicht geprüft (nur die oberen Ebenen). | Ausnutzung bräuchte die genaue SHA fremder Objekte. |
+| N10 | Default-Branch per `ls-remote`; ist das Remote nicht erreichbar, gelten `main`/`master` als geschützt, andere Namen nicht. | Fail-closed für die üblichen Namen. |
+| N11 | „Hochladen“ pusht `snapshot_after` und damit auch ältere, noch nicht gepushte Commits (auch anderer Aufträge). | Im Hilfetext der Stufe gesagt. |
+| N12 | Jeder Auftrag baut einen temporären Index (`git add -A`) für die Prüfung: auf sehr großen Arbeitsbäumen spürbar. | Gleiches Volumen wie der folgende Commit. |
+| N13 | Der Review-Agent ist weiter nur per Prompt read-only. | Bestand; Änderungen wären sichtbar. |
+| N14 | `backend/crates/app/src/oidc.rs` enthält seit `d35008f` einen festen privaten Test-Schlüssel (ES256, nur im Test-Modul). Würde ein Agent diese Datei ändern, meldet der Scanner den Schlüssel nicht (nur hinzugefügte Zeilen zählen); würde er ihn kopieren, hält Queue an. | Kein echtes Geheimnis, aber schlechtes Vorbild; Ersetzen durch einen zur Laufzeit erzeugten Schlüssel gehört in ein eigenes Aufräumpaket (WP16-Audit). |
+
+## Geprüft und für gut befunden
+
+- **Kein Host-Root, Sicherheitsmodell nur gehärtet:** keine neuen Capabilities, keine Netzwerkänderung; Container-Argumente unverändert (WP02-Tests grün). `home_env` validiert Namen und Pfade (`safe_rel`).
+- **Keine echten Secrets in Fixtures:** Testwerte werden aus Teilstrings zusammengesetzt (`testdata`) bzw. im Mock aus `/dev/urandom`; WP03 fügt kein vollständiges Token in den Quelltext ein. Geprüft mit den festen Formaten des Scanners (als Skript nachgebaut) über `backend/crates`, `frontend/src`, `e2e` und `docs/roadmap`: einziger Treffer ist ein **bereits vorhandener** Test-Schlüssel (EC, nur für den OIDC-Test) in `backend/crates/app/src/oidc.rs` seit `d35008f` – nicht Teil dieses Pakets, als N14 vermerkt.
+- **Architektur:** Datei-/Git-Arbeit nur im Runner, Protokoll in `queued-common`, Typen und Texte in `queued-api` (UI und Server identisch), App ohne Host-Rechte; nur neue Migration (0006).
+- **Rechte:** Schutzeinstellungen nur Eigentümer (Integration + E2E), Entscheidungen nur Ersteller oder Eigentümer, Fremde 404.
+- **Alt-Verhalten:** Zwei Alt-Tests wurden bewusst an das neue Verhalten angepasst und schärfer gemacht: `clones_remote_and_auto_pushes` (prüft jetzt, dass vor der Freigabe nichts gepusht ist) und `review_rate_limit_pauses_review_provider` (prüft, dass der Auftrag nicht `done` wird). Keine E2E-Prüfung abgeschwächt; Tour um Freigabe-Drawer und Schutz-Reiter (axe hell/dunkel, Desktop/iPhone) erweitert.

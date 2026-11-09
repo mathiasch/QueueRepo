@@ -33,6 +33,7 @@ pub fn status_label(s: TaskStatus) -> &'static str {
         TaskStatus::Running => "Läuft",
         TaskStatus::WaitingBatch => "Wartet auf Anbieter",
         TaskStatus::WaitingInput => "Wartet auf dich",
+        TaskStatus::Held => "Freigabe nötig",
         TaskStatus::Done => "Fertig",
         TaskStatus::Failed => "Fehlgeschlagen",
         TaskStatus::Blocked => "Blockiert",
@@ -52,6 +53,9 @@ pub fn status_help(s: TaskStatus) -> &'static str {
             "Ein Planungs-, Prüf- oder Analyseschritt läuft direkt beim Anbieter – im Batch-Tarif günstiger, kann aber bis zu 24 Stunden dauern. Andere Aufträge laufen weiter."
         }
         TaskStatus::WaitingInput => "Der Agent hat eine Rückfrage und wartet auf deine Antwort.",
+        TaskStatus::Held => {
+            "Eine Schutzprüfung hat etwas gefunden (z. B. ein mögliches Passwort oder geänderte Tests). Es geht erst weiter, wenn du entscheidest."
+        }
         TaskStatus::Done => "Erledigt, geprüft und im Projekt gespeichert.",
         TaskStatus::Failed => {
             "Das Ergebnis war nicht in Ordnung. Ein Reparatur-Auftrag versucht es erneut."
@@ -65,7 +69,7 @@ pub fn status_help(s: TaskStatus) -> &'static str {
 
 pub fn status_tone(s: TaskStatus) -> Tone {
     match s {
-        TaskStatus::PendingApproval | TaskStatus::WaitingInput => Tone::Warning,
+        TaskStatus::PendingApproval | TaskStatus::WaitingInput | TaskStatus::Held => Tone::Warning,
         TaskStatus::Queued | TaskStatus::WaitingBatch => Tone::Info,
         TaskStatus::Running => Tone::Run,
         TaskStatus::Done => Tone::Success,
@@ -88,6 +92,7 @@ pub fn failure_label(c: FailureClass) -> &'static str {
         FailureClass::LimitTokens => "Limit: Tokens",
         FailureClass::LimitTurns => "Limit: Turns",
         FailureClass::Cancelled => "Abgebrochen",
+        FailureClass::Gate => "Freigabe abgelehnt",
     }
 }
 
@@ -118,6 +123,9 @@ pub fn failure_help(c: FailureClass) -> &'static str {
         FailureClass::LimitTokens => "Das Token-Limit wurde erreicht.",
         FailureClass::LimitTurns => "Die maximale Zahl an Arbeitsschritten (Turns) wurde erreicht.",
         FailureClass::Cancelled => "Der Lauf wurde abgebrochen.",
+        FailureClass::Gate => {
+            "Du hast eine Freigabe abgelehnt. Mit „Erneut versuchen“ startet der Auftrag von vorn."
+        }
     }
 }
 
@@ -183,6 +191,7 @@ pub fn event_kind_label(kind: &str) -> &'static str {
         "contract" => "Ergebnis",
         "setup" => "Setup",
         "egress" => "Netzwerk",
+        "gate" => "Schutz",
         _ => "Info",
     }
 }
@@ -233,6 +242,12 @@ pub mod help {
     pub const AUTO_APPROVE: &str = "Schlägt ein Agent mehr neue Aufträge vor als hier eingestellt, musst du sie erst freigeben.";
     pub const FIX: &str = "Wie oft die Queue nach einem fehlgeschlagenen Auftrag automatisch einen Reparatur-Auftrag startet, bevor sie stoppt und dich benachrichtigt.";
     pub const PARALLEL: &str = "Wie viele Agenten gleichzeitig arbeiten dürfen (projektübergreifend). Pro Projekt läuft immer nur einer.";
+    pub const PROTECTION: &str = "Schutzprüfungen laufen, bevor Änderungen gespeichert oder hochgeladen werden. Findet Queue etwas Verdächtiges, hält es den Auftrag an und fragt dich.";
+    pub const TRUST_REPO: &str = "Agenten-Programme können Einstellungen aus dem Repository laden, z. B. Hooks oder MCP-Server. Diese starten eigene Programme oder leiten Zugänge um. Schalte das nur für Repositories ein, deren Inhalt du kontrollierst.";
+    pub const PROTECTED_PATHS: &str = "Bestehende Dateien, die hier passen, darf ein Agent nur mit deiner Freigabe ändern oder löschen. Neue Dateien sind erlaubt. Schreibweise: `tests/` = Ordner, `*.spec.ts` = Dateiname in jedem Ordner, `**` = beliebig viele Ordner.";
+    pub const TEST_GUARD: &str = "Erkennt übersprungene Tests (skip, xfail, ignore, only), gelöschte Testdateien, entfernte Prüfungen und geänderte Test-Einstellungen.";
+    pub const SETUP_GUARD: &str = "Das Vorbereitungs-Skript läuft mit deinen Geheimnissen. Haben Agenten Dateien geändert, die es ausführt, fragt Queue vorher nach.";
+    pub const TEST_TASK: &str = "Für Aufträge, die Tests ändern sollen: Änderungen an Tests und geschützten Dateien brauchen dann keine Freigabe. Gilt nur für diesen Auftrag, nie für automatisch erzeugte.";
     pub const NTFY: &str = "ntfy ist ein kostenloser Push-Dienst. Mit einer geheimen Topic-URL bekommst du Benachrichtigungen aufs Handy, auch ohne installierte App.";
 }
 
@@ -281,6 +296,13 @@ mod tests {
         assert_eq!(event_kind_label("whatever"), "Info");
         assert!(notification_is_error("blocked"));
         assert!(!notification_is_error("question"));
+        assert!(
+            !notification_is_error("gate"),
+            "a gate waits for a decision, it is no error"
+        );
+        assert_eq!(event_kind_label("gate"), "Schutz");
+        assert_eq!(status_label(TaskStatus::Held), "Freigabe nötig");
+        assert_eq!(status_tone(TaskStatus::Held), Tone::Warning);
         assert_eq!(task_kind_label("fix"), "Reparatur");
         let ids: Vec<&str> = ONEMPTY_ACTIONS.iter().map(|a| a.0).collect();
         assert_eq!(ids, queued_api::ONEMPTY_ACTIONS.to_vec());

@@ -10,5 +10,6 @@ pub mod format;
 pub mod labels;
 pub mod limits;
 pub mod progress;
+pub mod protection;
 pub mod shortcuts;
 pub mod task;

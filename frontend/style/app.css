@@ -723,3 +723,16 @@ details > summary { cursor: pointer; }
 .secret-submit .btn { margin-top: 26px; align-self: flex-start; }
 @media (max-width: 560px) { .secret-submit .btn { margin-top: 0; } }
 #env-errors ul, [data-testid="env-errors"] ul { margin: 0; padding-left: var(--sp-4); }
+
+/* WP03: gate panel in the drawer and the protection tab */
+.block.gate-panel { color: var(--text); background: var(--surface-2); border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--border)); border-left: 4px solid var(--warning); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); }
+.block.gate-panel > h3 { color: var(--text); font-size: var(--fs-md); }
+.gate-panel p { margin: 0; }
+.gate-findings { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
+.gate-finding { display: flex; flex-direction: column; gap: 2px; padding: var(--sp-2) var(--sp-3); background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-sm); min-width: 0; overflow-wrap: anywhere; }
+.gate-actions { gap: var(--sp-2); }
+.check-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-2); font-size: var(--fs-sm); }
+.check-list li { display: flex; gap: var(--sp-2); align-items: flex-start; }
+.check-list li > svg { flex: none; margin-top: 2px; }
+.cli-support { list-style: none; margin: var(--sp-2) 0 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
+.cli-support li { display: flex; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }

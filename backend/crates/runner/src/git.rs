@@ -14,6 +14,10 @@ use tokio::process::Command;
 
 pub const QUEUE_DIR: &str = ".queue";
 
+/// Set when a discard could not prune right away (inside `.git`, where the
+/// agent's own `git` never looks).
+const PRUNE_MARKER: &str = ".git/queue-prune-pending";
+
 /// Contract files larger than this are ignored (agent-controlled content).
 const MAX_QUEUE_FILE: u64 = 1024 * 1024;
 
@@ -400,6 +404,12 @@ impl Repo {
         allow: &[String],
     ) -> Result<BeginResult> {
         let mut warnings = vec![];
+        if tokio::fs::symlink_metadata(self.dir.join(PRUNE_MARKER))
+            .await
+            .is_ok()
+        {
+            self.prune().await?;
+        }
         if self.is_dirty().await? {
             self.git(&["add", "-A"]).await?;
             let findings = self.staged_secrets(key, allow).await?;
@@ -470,9 +480,27 @@ impl Repo {
         key: &[u8],
         allow: &[String],
     ) -> Result<CommitOutcome> {
+        self.commit_scanned(message, author_name, author_email, key, allow, false)
+            .await
+    }
+
+    /// [`Repo::commit_checked`]; `allow_large`: a human approved changes too
+    /// large for a complete scan.
+    pub async fn commit_scanned(
+        &self,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+        key: &[u8],
+        allow: &[String],
+        allow_large: bool,
+    ) -> Result<CommitOutcome> {
         if self.is_dirty().await? {
             self.git(&["add", "-A"]).await?;
-            let blocked = self.staged_secrets(key, allow).await?;
+            let mut blocked = self.staged_secrets(key, allow).await?;
+            if allow_large {
+                blocked.retain(|f| f.kind != FindingKind::TooLarge);
+            }
             if !blocked.is_empty() {
                 self.git(&["reset", "-q"]).await?;
                 return Ok(CommitOutcome {
@@ -833,6 +861,7 @@ impl Repo {
                 &req.protected,
                 req.test_guard,
             ));
+            findings.extend(gate::watched_findings(&files, &req.watch));
             if req.test_guard {
                 for f in files.iter().filter(|f| {
                     !f.added && !f.deleted && f.path.rsplit('/').next() == Some("package.json")
@@ -947,20 +976,35 @@ impl Repo {
         Ok(out)
     }
 
-    /// Discards held changes (and prunes their objects).
-    pub async fn discard(&self, task: &str) -> Result<()> {
+    /// Discards held changes and prunes their objects. With `busy` (a
+    /// process runs in the workspace and may be writing objects that are not
+    /// referenced yet) the prune waits for the next `begin`.
+    pub async fn discard(&self, task: &str, busy: bool) -> Result<()> {
         let r = Self::held_ref(task)?;
-        self.drop_ref(&r).await
+        if self.git(&["rev-parse", "--verify", "-q", &r]).await.is_ok() {
+            self.git(&["update-ref", "-d", &r]).await?;
+        }
+        if busy {
+            tokio::fs::write(self.dir.join(PRUNE_MARKER), b"").await?;
+            return Ok(());
+        }
+        self.prune().await
     }
 
     async fn drop_ref(&self, r: &str) -> Result<()> {
         if self.git(&["rev-parse", "--verify", "-q", r]).await.is_ok() {
             self.git(&["update-ref", "-d", r]).await?;
         }
+        self.prune().await
+    }
+
+    /// Removes unreachable objects at once (discarded held secrets).
+    async fn prune(&self) -> Result<()> {
         let _ = self
             .git(&["reflog", "expire", "--expire-unreachable=now", "--all"])
             .await;
         let _ = self.git(&["prune", "--expire=now"]).await;
+        let _ = tokio::fs::remove_file(self.dir.join(PRUNE_MARKER)).await;
         Ok(())
     }
 
@@ -1814,6 +1858,7 @@ mod tests {
                 .collect(),
             test_guard: true,
             allow: vec![],
+            watch: vec![".mcp.json".into()],
         };
         let res = r.inspect(&req, KEY).await.unwrap();
         assert_eq!(res.changed_files, 4);
@@ -1880,6 +1925,7 @@ mod tests {
             author_name: "A".into(),
             author_email: "a@x".into(),
             allow: vec![],
+            allow_large: false,
         };
         let out = r.release(&rel, KEY).await.unwrap();
         assert!(!out.conflict && out.blocked.is_empty());
@@ -1913,11 +1959,34 @@ mod tests {
             .git(&["rev-parse", &format!("{}:s.txt", held.trim())])
             .await
             .unwrap();
-        r.discard(t2).await.unwrap();
+        r.discard(t2, false).await.unwrap();
         assert!(
             r.git(&["cat-file", "-e", blob.trim()]).await.is_err(),
             "blob pruned"
         );
+        // While a process runs in the workspace the prune waits for `begin`.
+        std::fs::write(r.dir.join("s.txt"), format!("{}\n", testdata::github(31))).unwrap();
+        r.hold(t2, &r.head().await.unwrap()).await.unwrap();
+        let held = r
+            .git(&["rev-parse", &format!("refs/queue/held/{t2}")])
+            .await
+            .unwrap();
+        let blob = r
+            .git(&["rev-parse", &format!("{}:s.txt", held.trim())])
+            .await
+            .unwrap();
+        r.discard(t2, true).await.unwrap();
+        assert!(
+            r.git(&["cat-file", "-e", blob.trim()]).await.is_ok(),
+            "not pruned while busy"
+        );
+        assert!(r.dir.join(PRUNE_MARKER).exists());
+        r.begin(None, KEY, &[]).await.unwrap();
+        assert!(
+            r.git(&["cat-file", "-e", blob.trim()]).await.is_err(),
+            "pruned by begin"
+        );
+        assert!(!r.dir.join(PRUNE_MARKER).exists());
         assert!(r.hold("../x", &r.head().await.unwrap()).await.is_err());
     }
 
@@ -1933,6 +2002,7 @@ mod tests {
             author_name: "A".into(),
             author_email: "a@x".into(),
             allow: vec![],
+            allow_large: false,
         };
         let out = r.release(&rel, KEY).await.unwrap();
         assert_eq!(out.blocked.len(), 1);
@@ -1941,6 +2011,28 @@ mod tests {
         let ok = r.release(&rel, KEY).await.unwrap();
         assert!(ok.blocked.is_empty() && !ok.conflict);
         assert!(r.dir.join("k.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn oversized_changes_block_until_a_human_allows_them() {
+        let (_t, r) = repo().await;
+        let line = "abcdefghij".repeat(10) + "\n";
+        std::fs::write(
+            r.dir.join("big.txt"),
+            line.repeat(MAX_SCAN_BYTES / line.len() + 10),
+        )
+        .unwrap();
+        let head = r.head().await.unwrap();
+        let out = r.commit_checked("t", "A", "a@x", KEY, &[]).await.unwrap();
+        assert_eq!(out.sha, head);
+        assert_eq!(out.blocked.len(), 1);
+        assert_eq!(out.blocked[0].kind, FindingKind::TooLarge);
+        let ok = r
+            .commit_scanned("t", "A", "a@x", KEY, &[], true)
+            .await
+            .unwrap();
+        assert!(ok.blocked.is_empty());
+        assert_ne!(ok.sha, head);
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@ pub mod login;
 pub mod onboarding;
 pub mod project;
 pub mod projects;
+pub mod protection;
 pub mod providers;
 pub mod queue;
 pub mod settings;

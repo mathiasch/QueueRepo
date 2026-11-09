@@ -329,6 +329,7 @@ pub fn TaskRow(
     };
     let actions = {
         let t = t.clone();
+        let open_held = open.clone();
         move || {
             let mut out: Vec<AnyView> = vec![];
             if status == TaskStatus::Queued {
@@ -354,6 +355,17 @@ pub fn TaskRow(
                         <Icon icon=Ic::Check class="sm"/>"Freigeben"
                     </button>
                 }.into_any());
+            }
+            if status == TaskStatus::Held {
+                let open = open_held.clone();
+                out.push(
+                    view! {
+                        <button class="btn sm primary" type="button" on:click=move |_| open(id)>
+                            <Icon icon=Ic::Shield class="sm"/>"Entscheiden"
+                        </button>
+                    }
+                    .into_any(),
+                );
             }
             if matches!(status, TaskStatus::Queued | TaskStatus::PendingApproval) {
                 let a = t.clone();

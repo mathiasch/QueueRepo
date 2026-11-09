@@ -82,6 +82,7 @@ fn summary_of(findings: &[GateFinding]) -> String {
 /// Puts the task on hold: status `held`, gate and continuation state stored,
 /// event + push notification. Works from a run (`running`) and from the
 /// batch poller (`waiting_batch`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn hold(
     st: &AppState,
     task: &Task,
@@ -167,6 +168,9 @@ pub(crate) async fn check_changes(
         },
         test_guard: project.test_guard && !test_task,
         allow: project.secret_allowlist.clone(),
+        // Agent configuration the next run (and this task's review) would
+        // load: every change needs an approval, also a new file.
+        watch: agent_config_paths(project, &task.provider),
     };
     let res = st.runner.inspect(project.id, &req).await?;
     let mut findings = res.findings;
@@ -227,6 +231,21 @@ pub(crate) async fn commit(
     )
     .await?;
     Ok(None)
+}
+
+/// Repository files with agent configuration the CLI of `provider` loads.
+fn agent_config_paths(project: &Project, provider: &str) -> Vec<String> {
+    if project.trust_repo_config {
+        cgate::AGENT_CONFIG_PATHS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        agent::always_loaded_config(provider)
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
 }
 
 /// Before an agent run: repository configuration the CLI loads changed
@@ -790,6 +809,8 @@ pub(crate) async fn resume(f: &Flow<'_>, g: TaskGate, usage: &mut Usage) -> Resu
                         author_name: f.commits.author_name.to_string(),
                         author_email: f.commits.author_email.to_string(),
                         allow: project.secret_allowlist.clone(),
+                        // A human approved changes too large for a full scan.
+                        allow_large: p.approved.iter().any(|f| f.kind == FindingKind::TooLarge),
                     },
                 )
                 .await?;
@@ -825,6 +846,16 @@ pub(crate) async fn resume(f: &Flow<'_>, g: TaskGate, usage: &mut Usage) -> Resu
                 .bind(&out.sha)
                 .execute(&st.db)
                 .await?;
+            // Approved agent configuration is the new trusted state (no
+            // second question before the next run).
+            if p.approved
+                .iter()
+                .any(|f| f.kind == FindingKind::AgentConfig)
+            {
+                st.runner
+                    .baseline_approve(project.id, "agent-config", &out.sha)
+                    .await?;
+            }
             after_commit(f, p, None, Step::Verify, usage).await
         }
         GateResume::Review => after_commit(f, p, None, Step::Review, usage).await,

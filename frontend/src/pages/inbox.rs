@@ -114,8 +114,8 @@ pub fn InboxPage() -> impl IntoView {
                                 let open_notification = open_notification.clone();
                                 let unread = n.read_at.is_none();
                                 let error = notification_is_error(&n.kind);
-                                let icon = if error { Ic::Alert } else if n.kind == "done" { Ic::CheckCircle } else if n.kind == "question" { Ic::Message } else { Ic::Bell };
-                                let tone = if error { "tone-danger" } else if n.kind == "done" { "tone-success" } else if unread { "tone-info" } else { "tone-neutral" };
+                                let icon = if error { Ic::Alert } else if n.kind == "done" { Ic::CheckCircle } else if n.kind == "question" { Ic::Message } else if n.kind == "gate" { Ic::Shield } else { Ic::Bell };
+                                let tone = if error { "tone-danger" } else if n.kind == "done" { "tone-success" } else if n.kind == "gate" { "tone-warning" } else if unread { "tone-info" } else { "tone-neutral" };
                                 let created = n.created_at;
                                 let (title, body, kind) = (n.title.clone(), n.body.clone(), n.kind.clone());
                                 view! {

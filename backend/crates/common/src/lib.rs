@@ -61,6 +61,9 @@ pub struct CommitRequest {
     /// Approved secret fingerprints; any other secret blocks the commit.
     #[serde(default)]
     pub allow: Vec<String>,
+    /// A human approved changes too large to scan completely.
+    #[serde(default)]
+    pub allow_large: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

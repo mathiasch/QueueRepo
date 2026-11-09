@@ -39,7 +39,7 @@ Browser / iPhone-PWA ──HTTPS──► Cloudflare Tunnel ──► queued  (U
 ## Ablauf eines Auftrags
 
 ```
-queued ─► running ─► git pull (falls Remote) ─► Setup-Skript (falls vorhanden; mit Geheimnissen, Setup-Netz, Cache)
+queued ─► running ─► git pull (falls Remote) ─► [Setup-Dateien geändert? ─► held] ─► Setup-Skript (falls vorhanden; mit Geheimnissen, Setup-Netz, Cache)
                        │  Fehler / Zeitlimit / Geheimnis in einer Datei ─► blocked (Konfiguration), kein Agent, kein Fix
                        ▼
                      frischer Agent (Auftrag + Handoff/Kontext + Projektziel; ohne Geheimnisse, Agent-Netz)
@@ -52,8 +52,13 @@ queued ─► running ─► git pull (falls Remote) ─► Setup-Skript (falls 
                        │                         (kein Fix-Versuch; nach TRANSIENT_MAX_RETRIES ─► blocked)
                        ├─ Limit (Laufzeit/Kosten/Tokens/Turns) bzw. Konfigurationsfehler ─► blocked, kein Fix
                        ▼
-                  git commit  ─►  verify_command (z. B. `cargo test`)  ─►  Review-Agent (Auftrag + Diff)
-                       ├─ ok   ─► (auto push) ─► done ─► Folgeaufträge (≤ 2 automatisch, > 2 → Freigabe + Push)
+                  Schutzprüfung (WP03): Geheimnisse im Diff/Protokoll, geschützte Dateien, geschwächte Tests
+                       ├─ Fund ─► held („Freigabe nötig“), Änderungen außerhalb des Branches geparkt
+                       │          ├─ Freigeben ─► weiter mit Commit   └─ Verwerfen ─► blocked (Freigabe abgelehnt)
+                       ▼
+                  git commit  ─►  verify_command (z. B. `cargo test`)  ─►  Review-Agent (Auftrag + Diff + Rubrik)
+                       ├─ Review nicht möglich ─► nur das Review wird wiederholt, danach held (nie ungeprüft done)
+                       ├─ ok   ─► (auto push; Standard-Branch nur nach Freigabe) ─► done ─► Folgeaufträge
                        └─ fail ─► failed ─► Fix-Auftrag (Root-Cause-Analyse) vorne in der Queue
                                            nach 2 Fix-Versuchen ─► blocked + Push-Notification
 Queue leer ─► OnEmptyQueue (Review / Recherche / Verbesserungen) ─► schlägt Aufträge vor
@@ -184,6 +189,38 @@ Runner-Variablen dazu (`/etc/queued/runner.env`):
 
 **Upgrade-Hinweis WP02:** `RUNNER_NETWORK` gibt es nicht mehr; ist die Variable gesetzt, startet der Runner nicht (bitte entfernen). Agenten haben ohne weitere Einstellung **kein Internet mehr außer ihrer Modell-API** – wer bisher im Agentenlauf Pakete nachinstalliert hat, verschiebt das ins Setup-Skript oder gibt die Paketquellen im Agent-Netz frei. `RUNNER_DATA_DIR` darf höchstens 80 Bytes lang sein (Pfadgrenze für Unix-Sockets).
 
+## Schutz vor Lecks und ausgetricksten Prüfungen (Projekt → Schutz)
+
+Queue prüft, bevor etwas gespeichert, geprüft oder hochgeladen wird. Findet es etwas, hält es den Auftrag an (Status **„Freigabe nötig“**, Push-Benachrichtigung, Eintrag unter „Wartet auf dich“). Im Auftrag stehen die Funde mit Datei, Zeile und einer Erklärung; die zurückgehaltenen Änderungen lassen sich ansehen. Freigeben dürfen die Person, die den Auftrag angelegt hat, und die Eigentümerin bzw. der Eigentümer des Projekts.
+
+| Prüfung | Wann | Abschaltbar |
+|---|---|---|
+| **Geheimnisse** (Tokens von GitHub, GitLab, AWS, Anthropic, OpenAI, Google, Slack, Stripe, npm, PyPI, JWT, private Schlüssel, Passwörter in URLs und Zuweisungen mit hoher Entropie) | Vor jedem Commit (auch Teil- und WIP-Commits), vor jedem Push, in der Ausgabe des Agenten | nein |
+| **Push auf den Standard-Branch** des Remotes (bei unbekanntem Standard: `main`, `master`) | Auto-Push | nein; „Hochladen“ pusht genau den Stand des Auftrags, „Nicht hochladen“ schließt ohne Push ab |
+| **Review-Ausfall** | Review aktiv, aber nicht möglich | nein; transiente Fehler werden zuerst nur für das Review wiederholt |
+| **Geschützte Dateien** (Standard: CI-Dateien, `tests/`, `test/`, `__tests__/`, `*.test.*`, `*.spec.*`, `*_test.go`, `test_*.py`, `conftest.py` …) | Bestehende Datei geändert, umbenannt oder gelöscht; neue Dateien sind erlaubt | Liste bearbeitbar |
+| **Geschwächte Tests** (neue `skip`/`xfail`/`#[ignore]`/`.only`/`@Disabled` …, gelöschte Testdateien, entfernte Prüfungen, geänderte Test-Einstellungen wie `jest.config.*` oder `package.json`-Skripte) | wie oben | ja |
+| **Setup-Dateien** (Lock-/Manifest-Dateien, im Setup-Skript genannte Pfade, Cache-Dateien) | Vor einem Setup **mit Geheimnissen**, wenn sie sich seit der letzten Freigabe geändert haben (erster Lauf vertraut dem aktuellen Stand) | ja |
+| **Einstellungen aus dem Repository** | Standard: Agenten laden sie nicht. Erlaubt die Eigentümerin sie, braucht jede spätere Änderung daran (`.claude/`, `.mcp.json`, `.gemini/`, `opencode.json`, `.opencode/`, `.codex/`) vor dem nächsten Lauf eine Freigabe | ja (Standard aus) |
+
+- Werte von Geheimnissen erscheinen **nie** im Klartext: Protokoll, Ergebnis, Benachrichtigungen (auch ntfy/Web Push), Diff-Ansicht und API zeigen `[geschwärzt: …]` bzw. „GitHub-Token ghp_… (40 Zeichen)“. Eine Freigabe merkt sich nur einen Fingerabdruck (HMAC mit dem `RUNNER_TOKEN`) im Projekt; wird das Token gewechselt, fragt Queue erneut. „Freigaben vergessen“ im Reiter „Schutz“ setzt das zurück.
+- Gehaltene Änderungen liegen im Runner unter `refs/queue/held/<auftrag>` (nie auf dem Branch, nie gepusht), auch Commits, die der Agent selbst gemacht hat. „Verwerfen“ und „Abbrechen“ löschen sie samt Git-Objekten. Reste unterbrochener Läufe mit Geheimnissen werden nicht als WIP committet, sondern unter `refs/queue/quarantine/…` abgelegt.
+- Verify läuft erst nach der Schutzprüfung: geschützte Dateien sieht der Prüfbefehl nur im Ausgangsstand oder in einer freigegebenen Fassung.
+- **Test-Auftrag:** Im Composer unter „Erweitert“ → „Darf Tests ändern“. Gilt nur für diesen, von einem Menschen angelegten Auftrag (nie für Fix- oder Folgeaufträge).
+- **Review:** Ohne eigene Review-Wahl prüft ein anderer Anbieter als der umsetzende, sofern ein Zugang dafür hinterlegt ist. Der Review-Agent bekommt eine Rubrik (Aufgabe wirklich erfüllt? Tests geschwächt? hart kodierte Ergebnisse? Sicherheit? Umfang?) und die freigegebenen Funde.
+- **Git im Runner:** Hooks, `core.fsmonitor`, Filter, Diff-/Merge-Treiber, Signatur-Programme, Credential-Helper, `url.*.insteadOf` und `http.*` aus der (vom Agenten beschreibbaren) `.git/config` werden nie ausgeführt: Der Runner überschreibt sie per Kommandozeile und schreibt `.git/config` vor jeder Operation aus einer Allowlist neu. Pull und Push gehen immer an die URL aus den Projekteinstellungen.
+
+So wird Repository-Konfiguration je Agent abgeschaltet (Standard):
+
+| CLI | Mittel | Beleg |
+|---|---|---|
+| Claude Code 2.1.319 | `--setting-sources user --strict-mcp-config` (keine Projekt-Settings mit Hooks/`env`/Helfern, keine `.mcp.json`) | Optionen im installierten Programm; nicht mit echtem Modell geprüft |
+| Gemini CLI 0.67.0 | System-Einstellungen mit höchster Priorität (keine Hooks, keine Tool-/MCP-Befehle, keine Projekt-`.env`) und `--allowed-mcp-server-names` mit Zufallsnamen. Gemini braucht das Workspace-Vertrauen weiter (sonst kein `--yolo`) und liest `.gemini/.env` trotzdem – Änderungen daran brauchen deshalb immer eine Freigabe | Quelltext des Bundles; nicht ausgeführt |
+| opencode 1.19.5 | `OPENCODE_DISABLE_PROJECT_CONFIG=1` (keine `opencode.json`, kein `.opencode/` mit Plugins, keine Projekt-`AGENTS.md`) | Programm-Strings; nicht ausgeführt |
+| Codex 0.167.0 | nichts nötig: lädt `.codex/config.toml` nur in vertrauten Ordnern, Queue vertraut nie (die Freischaltung wirkt bei Codex nicht) | Programm-Strings; nicht ausgeführt |
+
+**Upgrade-Hinweis WP03:** Projekte mit Auto-Push auf `main`/`master` (bzw. den Standard-Branch des Remotes) pushen nicht mehr automatisch, sondern fragen pro Auftrag nach. Aufträge mit Review fallen bei einem Review-Ausfall nicht mehr auf „Fertig“ zurück. Änderungen an bestehenden Tests brauchen eine Freigabe (Liste im Reiter „Schutz“ anpassbar, oder Test-Auftrag).
+
 ## Tests
 
 | Ebene | Was | Ausführen |
@@ -240,14 +277,15 @@ cd frontend && trunk serve                      # http://localhost:5173, /api wi
 - Der Review-Agent ist per Prompt read-only, nicht technisch erzwungen. Seine Änderungen würden als WIP-Commit sichtbar.
 - Codex und Gemini kennen kein Kostenlimit, Codex kein Turn-Limit; ihr Token-Verbrauch kommt erst am Ende eines Laufs. Ein Lauf kann ein Kosten-/Token-Limit daher überschreiten, bevor es greift. Der Auftrag wird dann trotzdem `blocked` (wie beim Live-Abbruch): kein „erledigt“, kein Review, kein Fix, keine Folgeaufträge. Die Änderungen bleiben als Teil-Commit im Diff des Auftrags; „Wiederholen“ startet mit frischem Budget. Gleiches gilt, wenn Claudes Live-Zähler zu wenig meldet.
 - Verbrauchswerte aus dem CLI-Stream werden begrenzt (negativ → 0, je Meldung höchstens 10^10 Tokens bzw. 10 000 USD); gemeldete Limit-Resets höchstens 8 Tage in der Zukunft.
-- Ein Provider-Fehler im Review-Lauf pausiert den Review-Provider, der Review wird aber übersprungen statt wiederholt (kein Phasen-Retry).
-- `GEMINI_CLI_TRUST_WORKSPACE=true` (sonst führt Gemini headless keine Tools aus) lässt auch Gemini-Einstellungen aus dem Repo wirken; Härtung gegen nicht vertrauenswürdige Repo-Konfiguration folgt in WP03.
+- `GEMINI_CLI_TRUST_WORKSPACE=true` bleibt nötig (sonst führt Gemini headless keine Tools aus); Hooks, MCP- und Tool-Befehle sowie die Projekt-`.env` schaltet Queue per System-Einstellungen ab, `.gemini/.env` liest Gemini trotzdem (Freigabe bei Änderungen, siehe „Schutz“).
+- **Secret-Scanner (WP03):** eigener Regelsatz, keine Garantie. Unbekannte Token-Formate, kodierte (base64) oder in Binärdateien versteckte Werte und kurze Passwörter mit niedriger Entropie werden nicht erkannt; die Entropie-Regel kann Fehlalarme liefern (dann freigeben). Diffs über 16 MiB werden nicht vollständig geprüft und brauchen eine Freigabe.
+- Teil-Commits unterbrochener Läufe werden auf Geheimnisse geprüft, geschützte Dateien und Tests aber erst am Ende des Auftrags (über alle Läufe ab dem ersten Ausgangsstand).
+- Die Liste der Setup-Dateien ist eine Heuristik: Skripte, die das Setup nur indirekt aufruft (z. B. aus einem `postinstall`), erkennt Queue nur, wenn ihr Pfad im Setup-Skript steht oder sie unter die Manifest-/Lock-Dateien fallen.
 - Kleine Turn-Limits vertragen sich schlecht mit dem Ergebnis-Schema: Claude braucht für den structured output selbst zusätzliche Turns (beobachtet: „say hi" = 3 Turns).
 - Live gegen echte Provider aufgezeichnet sind nur Teile der Fixtures (Claude: Erfolg, Turn-/Kostenlimit, SIGINT; Codex: Netzwerk-Retries; Gemini: ungültiger API-Key). Rate-Limit-, Überlastungs- und Codex-Auth-Streams sind aus den Schemas der gepinnten Versionen konstruiert.
 - Kosten sind Listenpreise aus Recherche-Quellen: Nur die Anthropic-Preise wurden direkt auf der Anbieterseite gelesen, OpenAI/Gemini/Mistral stammen aus Suchauszügen. Long-Context-Aufschläge lassen sich nur prüfen, wo die CLI den Verbrauch pro Anfrage meldet (Claude, opencode); sonst ist der Betrag eine Untergrenze. Abo-Läufe werden zu API-Preisen bewertet.
 - Die Batch-, Azure-, Infomaniak- und LiteLLM-Schnittstellen sowie Bedrock/Vertex/opencode im Echtbetrieb sind nur gegen lokale Fake-Server bzw. Strings im Binary geprüft, nicht gegen die echten Dienste.
-- opencode liest auch eine `opencode.json` im Repository (wie Gemini den Workspace vertraut) – Härtung folgt mit WP03.
 - **Egress (WP02):** Der Proxy prüft Hostnamen, nicht Inhalte (außer „Nur lesen“). Daten können an jede *erlaubte* Domain abfließen (z. B. github.com), Domain-Fronting über CDNs ist nicht verhindert. Bei `Offen` löst der Runner beliebige Namen auf (DNS als Kanal). Welche Hosts die Agent-CLIs brauchen und dass sie `HTTPS_PROXY` beachten, ist Wissen über die CLIs, **nicht live geprüft**; ein fehlender Host zeigt sich als „Blockiert“ im Protokoll. Images ohne `node` haben im Container kein Netz (sicher, aber 10 s Wartezeit). Container müssen als Runner-UID laufen (Agent-Image: Standard), sonst ist der Socket nicht erreichbar.
-- **Geheimnisse im Setup:** Das Setup führt Code aus dem Repository aus (z. B. `preinstall` beim `npm install`), und das Repository wird von früheren Agentenläufen verändert. Ein Agent kann so Code platzieren, der im nächsten Setup die Geheimnisse liest und an eine erlaubte Adresse schickt. Deshalb: enge Setup-Allowlist und nur Tokens mit minimalen Rechten. Die Leck-Suche findet nur wörtliche Kopien (nicht base64 o. Ä.) und liest Dateien bis 8 MiB.
+- **Geheimnisse im Setup:** Das Setup führt Code aus dem Repository aus (z. B. `preinstall` beim `npm install`), und das Repository wird von früheren Agentenläufen verändert. Seit WP03 fragt Queue vor einem Setup mit Geheimnissen nach, wenn sich Setup-Dateien seit der letzten Freigabe geändert haben (Heuristik, siehe oben). Trotzdem: enge Setup-Allowlist und nur Tokens mit minimalen Rechten. Die Leck-Suche findet nur wörtliche Kopien (nicht base64 o. Ä.) und liest Dateien bis 8 MiB.
 - Das Setup läuft bei jedem Auftrag (mit warmem Cache), es gibt keinen Container-Snapshot nach dem Setup.
 

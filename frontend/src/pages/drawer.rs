@@ -1,6 +1,9 @@
 //! Task details: progress, result, review, changes (diff), revert, edit, log.
 use leptos::task::spawn_local;
 use leptos::{html, prelude::*};
+use queued_api::gate::{
+    finding_help, finding_title, FindingKind, GateAction, GateDecision, GateStage, TaskGate,
+};
 use queued_api::{Answer, DiffView, Task, TaskCost, TaskDetail, TaskEvent, TaskStatus, UpdateTask};
 use uuid::Uuid;
 
@@ -288,7 +291,7 @@ fn DrawerActions(
                     <Icon icon=Ic::X class="sm"/>"Abbrechen"
                 </button>
             })}
-            {(status.can_cancel() && status != TaskStatus::Running).then(|| view! {
+            {(status.can_cancel() && !matches!(status, TaskStatus::Running | TaskStatus::Held)).then(|| view! {
                 <button class="btn danger" type="button" on:click=move |_| discard(store, &td)>
                     <Icon icon=Ic::Trash class="sm"/>"Verwerfen"
                 </button>
@@ -423,6 +426,7 @@ fn Details(t: Task) -> impl IntoView {
                 {move || activity.get().map(|a| view! { <p class="box small live">{a}</p> })}
             </Block>
         })}
+        {t.gate_parsed().filter(|_| status == TaskStatus::Held).map(|g| view! { <GatePanel id=id gate=g/> })}
         {(!questions.is_empty()).then(|| view! { <DrawerQuestions id=id questions=questions.clone() waiting=status == TaskStatus::WaitingInput/> })}
         {abort.map(|(text, tone)| view! {
             <div data-testid="abort-reason">
@@ -540,6 +544,119 @@ fn CostBlock(c: TaskCost) -> impl IntoView {
             {c.steps.iter().flat_map(|s| s.notes.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().map(|n| view! { <p class="small muted">{n}</p> }).collect_view()}
             <p class="small muted">{format!("Preistabelle vom {}", c.price_version)}</p>
         </Block>
+    }
+}
+
+/// A gate holds the task (WP03): what was found, why it matters, the held
+/// changes (secrets redacted by the server) and the decision.
+#[component]
+fn GatePanel(id: Uuid, gate: TaskGate) -> impl IntoView {
+    let store = use_store();
+    let stage = gate.stage;
+    let diff = RwSignal::new(None::<String>);
+    let busy = RwSignal::new(false);
+    let has_secret = gate.findings.iter().any(|f| f.kind == FindingKind::Secret);
+    let decide = move |path: &'static str, action: Option<GateAction>, done: &'static str| {
+        busy.set(true);
+        spawn_local(async move {
+            let url = format!("/tasks/{id}/gate/{path}");
+            let res = match action {
+                Some(a) => api::post_ok(&url, &GateDecision { action: a }).await,
+                None => api::action(&url).await,
+            };
+            busy.set(false);
+            match res {
+                Ok(()) => store.announce(done),
+                Err(e) => store.toast_error("Entscheidung fehlgeschlagen", &e),
+            }
+        });
+    };
+    let approve = move |_| {
+        if has_secret {
+            store.ask(Confirm {
+                title: "Mögliches Geheimnis freigeben?".into(),
+                body: "Der Wert wird im Projekt gespeichert und kann hochgeladen werden. Gib ihn nur frei, wenn er kein echtes Passwort, Token oder Schlüssel ist (z. B. Testdaten). Queue merkt sich die Freigabe für dieses Projekt.".into(),
+                confirm_label: "Trotzdem freigeben".into(),
+                danger: true,
+                on_confirm: Callback::new(move |_| decide("approve", Some(GateAction::Approve), "Freigegeben, der Auftrag geht weiter")),
+            });
+        } else {
+            decide(
+                "approve",
+                Some(GateAction::Approve),
+                "Freigegeben, der Auftrag geht weiter",
+            );
+        }
+    };
+    let reject = move |_| {
+        if stage == GateStage::Changes {
+            store.ask(Confirm {
+                title: "Änderungen verwerfen?".into(),
+                body: "Die Änderungen des Agenten werden gelöscht. Der Auftrag wird angehalten; du kannst ihn später erneut starten.".into(),
+                confirm_label: "Verwerfen".into(),
+                danger: true,
+                on_confirm: Callback::new(move |_| decide("reject", None, "Änderungen verworfen")),
+            });
+        } else {
+            decide("reject", None, "Entschieden");
+        }
+    };
+    let toggle_diff = move |_| {
+        if diff.get_untracked().is_some() {
+            diff.set(None);
+            return;
+        }
+        spawn_local(async move {
+            match api::get::<DiffView>(&format!("/tasks/{id}/gate/diff")).await {
+                Ok(d) => diff.set(Some(d.diff)),
+                Err(e) => store.toast_error("Änderungen konnten nicht geladen werden", &e),
+            }
+        });
+    };
+    let findings = gate.findings.clone();
+    view! {
+        <section class="block tone-warning gate-panel" data-testid="gate-panel" aria-labelledby="gate-title">
+            <h3 id="gate-title"><Icon icon=Ic::Shield class="sm"/>" "{stage.title()}<HelpTip topic="Schutzprüfung" text=help::PROTECTION align="align-start"/></h3>
+            <p class="small">{stage.help()}</p>
+            <ul class="gate-findings">
+                {findings.into_iter().map(|f| {
+                    let place = match (f.path.is_empty(), f.line) {
+                        (true, _) => String::new(),
+                        (false, Some(l)) => format!("{}, Zeile {l}", f.path),
+                        (false, None) => f.path.clone(),
+                    };
+                    view! {
+                        <li class="gate-finding" data-kind=format!("{:?}", f.kind)>
+                            <strong>{finding_title(f.kind)}</strong>
+                            {(!place.is_empty()).then(|| view! { <span class="mono small truncate">{place}</span> })}
+                            {(!f.detail.is_empty()).then(|| view! { <span class="small">{f.detail.clone()}</span> })}
+                            <span class="small muted">{finding_help(f.kind)}</span>
+                        </li>
+                    }
+                }).collect_view()}
+            </ul>
+            <div class="row wrap gate-actions">
+                {(stage == GateStage::Review).then(|| view! {
+                    <button class="btn primary" type="button" disabled=move || busy.get()
+                        on:click=move |_| decide("approve", Some(GateAction::RetryReview), "Review wird wiederholt")>
+                        <Icon icon=Ic::Retry class="sm"/>"Review wiederholen"
+                    </button>
+                })}
+                <button class=if stage == GateStage::Review { "btn" } else { "btn primary" } type="button" disabled=move || busy.get() on:click=approve>
+                    <Icon icon=if stage == GateStage::Push { Ic::CloudUpload } else { Ic::Check } class="sm"/>{stage.approve_label()}
+                </button>
+                <button class="btn danger" type="button" disabled=move || busy.get() on:click=reject>
+                    <Icon icon=if stage == GateStage::Changes { Ic::Trash } else { Ic::X } class="sm"/>{stage.reject_label()}
+                </button>
+                {gate.has_diff.then(|| view! {
+                    <button class="btn" type="button" aria-expanded=move || diff.get().is_some().to_string() on:click=toggle_diff>
+                        <Icon icon=Ic::Eye class="sm"/>
+                        {move || if diff.get().is_some() { "Zurückgehaltene Änderungen ausblenden" } else { "Zurückgehaltene Änderungen ansehen" }}
+                    </button>
+                })}
+            </div>
+            {move || diff.get().map(|d| view! { <DiffBlock diff=d/> })}
+        </section>
     }
 }
 

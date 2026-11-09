@@ -132,6 +132,7 @@ impl RunnerClient {
             author_name: author_name.into(),
             author_email: author_email.into(),
             allow: allow.to_vec(),
+            allow_large: false,
         };
         self.post(self.url(ws, "/commit"), &req).await
     }

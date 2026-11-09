@@ -107,6 +107,8 @@ pub(crate) mod fixtures {
             escalation_level: 0,
             plan: None,
             cost: None,
+            gate: None,
+            allow_test_changes: false,
         }
     }
 }

@@ -88,6 +88,10 @@ pub struct InspectRequest {
     /// Approved secret fingerprints of the project.
     #[serde(default)]
     pub allow: Vec<String>,
+    /// Globs of agent configuration the CLI loads: any change, also a new
+    /// file, is reported as [`FindingKind::AgentConfig`].
+    #[serde(default)]
+    pub watch: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -119,6 +123,9 @@ pub struct ReleaseRequest {
     /// Approved secret fingerprints.
     #[serde(default)]
     pub allow: Vec<String>,
+    /// A human approved changes too large to scan completely.
+    #[serde(default)]
+    pub allow_large: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -526,6 +533,29 @@ mod analysis {
         out
     }
 
+    /// Any change (added, changed, deleted) to a watched path.
+    pub fn watched_findings(files: &[FileDiff], watch: &[String]) -> Vec<GateFinding> {
+        files
+            .iter()
+            .filter_map(|f| {
+                let path = if f.deleted { &f.old_path } else { &f.path };
+                crate::glob::matches_any(watch, path).then(|| GateFinding {
+                    kind: FindingKind::AgentConfig,
+                    path: path.clone(),
+                    line: None,
+                    detail: if f.added {
+                        "neu angelegt".into()
+                    } else if f.deleted {
+                        "gelöscht".into()
+                    } else {
+                        "geändert".into()
+                    },
+                    fingerprint: None,
+                })
+            })
+            .collect()
+    }
+
     /// `scripts` of a `package.json` changed (e.g. `"test": "exit 0"`).
     pub fn package_scripts_changed(old: &str, new: &str) -> bool {
         let scripts = |s: &str| {
@@ -724,6 +754,29 @@ mod tests {
         assert_eq!(f[1].detail, "2 Prüfungen entfernt, 0 hinzugefügt");
         // Without the test guard only protected paths count.
         assert!(change_findings(&parse_diff(&d), &[], false).is_empty());
+    }
+
+    #[test]
+    fn watched_agent_config() {
+        let d = diff_of(&[
+            (".mcp.json", "a", &["{}"], &[]),
+            (".claude/settings.json", "m", &["{}"], &["{ }"]),
+            ("src/a.rs", "m", &["x"], &[]),
+        ]);
+        let w: Vec<String> = AGENT_CONFIG_PATHS.iter().map(|s| s.to_string()).collect();
+        let f = watched_findings(&parse_diff(&d), &w);
+        let got: Vec<_> = f
+            .iter()
+            .map(|x| (x.path.as_str(), x.detail.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (".mcp.json", "neu angelegt"),
+                (".claude/settings.json", "geändert")
+            ]
+        );
+        assert!(watched_findings(&parse_diff(&d), &[]).is_empty());
     }
 
     #[test]

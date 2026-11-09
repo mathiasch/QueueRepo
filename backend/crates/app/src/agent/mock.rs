@@ -12,7 +12,7 @@
 //! (runs the decoded shell script in the workspace – eval set, see `eval.rs`),
 //! MOCK_ENV (writes the names of its environment variables to MOCK_ENV.txt),
 //! MOCK_NET:<url> (fetches the URL through the run's egress proxy, WP02),
-//! WP03: MOCK_SECRET (writes a freshly generated fake GitHub token into
+//! WP03: `MOCK_SECRET ` (keyword followed by a space) or MOCK_SECRET_FILE (writes a freshly generated fake GitHub token into
 //! `config/credentials.py`), MOCK_SECRET_LOG (prints such a token),
 //! MOCK_SELF_COMMIT (commits a fake token itself), MOCK_EDIT_TEST (changes
 //! the existing `tests/test_core.py`), MOCK_SKIP_TEST (adds a skipped test),
@@ -65,7 +65,9 @@ esac
 fake_token() { printf 'gh%s_%s' p "$(head -c 400 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 36)"; }
 case "$P" in
   *MOCK_SECRET_LOG*) echo '{"type":"text","text":"found key '"$(fake_token)"' in env"}';;
-  *MOCK_SECRET*) mkdir -p config; echo "GITHUB_TOKEN = \"$(fake_token)\"" > config/credentials.py;;
+esac
+case "$P" in
+  *MOCK_SECRET_FILE*|*"MOCK_SECRET "*) mkdir -p config; echo "GITHUB_TOKEN = \"$(fake_token)\"" > config/credentials.py;;
 esac
 case "$P" in
   *MOCK_SELF_COMMIT*) echo "token: $(fake_token)" > leaked.txt; git add leaked.txt; git -c user.name=a -c user.email=a@x commit -q -m "agent commit";;

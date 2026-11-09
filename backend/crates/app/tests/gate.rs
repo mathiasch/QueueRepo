@@ -467,30 +467,62 @@ async fn trusted_repo_config_changes_need_approval(pool: PgPool) {
     let t1 = a.task(&p, "plain").await;
     a.wait_status(&t1, &["done"]).await;
     // The owner trusts it: first use takes the current state.
-    let (code, v) = a
-        .put(
-            &format!("/api/projects/{p}/protection"),
-            json!({"trust_repo_config": true}),
-        )
-        .await;
-    assert_eq!(code, 200, "{v}");
-    assert_eq!(v["trust_repo_config"], true);
-    let t2 = scripted(
+    let trust = |on: bool| {
+        let a = &a;
+        let p = p.clone();
+        async move {
+            let (code, v) = a
+                .put(
+                    &format!("/api/projects/{p}/protection"),
+                    json!({"trust_repo_config": on}),
+                )
+                .await;
+            assert_eq!(code, 200, "{v}");
+            assert_eq!(v["trust_repo_config"], on);
+        }
+    };
+    trust(true).await;
+    let t2 = a.task(&p, "first trusted run").await;
+    a.wait_status(&t2, &["done"]).await;
+    // An agent changing loaded configuration is held before the commit …
+    let t3 = scripted(
         &a,
         &p,
         "mkdir -p .claude && echo '{\"hooks\":{}}' > .claude/settings.json",
     )
     .await;
-    a.wait_status(&t2, &["done"]).await;
-    let t3 = a.task(&p, "uses the config").await;
     let held = a.wait_status(&t3, &["held"]).await;
-    assert_eq!(held["task"]["gate"]["stage"], "config", "{held}");
+    assert_eq!(held["task"]["gate"]["stage"], "changes", "{held}");
+    assert_eq!(gate_kinds(&held), vec!["agent_config"]);
     assert_eq!(
         held["task"]["gate"]["findings"][0]["path"],
         ".claude/settings.json"
     );
     approve(&a, &t3, "approve").await;
     a.wait_status(&t3, &["done"]).await;
+    // … and the approved state needs no second question.
+    let t4 = a.task(&p, "uses the approved config").await;
+    a.wait_status(&t4, &["done"]).await;
+    // Changes that bypassed the gate (here: made while untrusted) are
+    // caught before the next trusted run.
+    trust(false).await;
+    let t5 = scripted(
+        &a,
+        &p,
+        "echo '{\"hooks\":{\"x\":1}}' > .claude/settings.json",
+    )
+    .await;
+    a.wait_status(&t5, &["done"]).await;
+    trust(true).await;
+    let t6 = a.task(&p, "trusted again").await;
+    let held = a.wait_status(&t6, &["held"]).await;
+    assert_eq!(held["task"]["gate"]["stage"], "config", "{held}");
+    assert_eq!(
+        held["task"]["gate"]["findings"][0]["path"],
+        ".claude/settings.json"
+    );
+    approve(&a, &t6, "approve").await;
+    a.wait_status(&t6, &["done"]).await;
 }
 
 #[sqlx::test(migrator = "queued::MIGRATOR")]

@@ -107,6 +107,7 @@ pub fn Composer() -> impl IntoView {
     let show_steps = RwSignal::new(false);
     let parent = RwSignal::new(String::new());
     let front = RwSignal::new(false);
+    let test_task = RwSignal::new(false);
     let advanced = RwSignal::new(false);
     let busy = RwSignal::new(false);
     let limits = RwSignal::new(LimitForm::default());
@@ -218,6 +219,7 @@ pub fn Composer() -> impl IntoView {
             parent_id: Uuid::parse_str(&parent.get_untracked()).ok(),
             connector_id: parse_access(&access.get_untracked()).0,
             front: front.get_untracked(),
+            allow_test_changes: test_task.get_untracked(),
             limits: lim.create_fields(),
         };
         spawn_local(async move {
@@ -228,6 +230,7 @@ pub fn Composer() -> impl IntoView {
                     context.set(String::new());
                     parent.set(String::new());
                     front.set(false);
+                    test_task.set(false);
                     limits.set(LimitForm::default());
                     store.announce(format!("„{}“ eingereiht", first_line(&t.title, 60)));
                     if let Some(el) = textarea.get_untracked() {
@@ -346,6 +349,13 @@ pub fn Composer() -> impl IntoView {
                                     {move || suggestions.get().into_iter().map(|m| view! { <option value=m></option> }).collect_view()}
                                 </datalist>
                             </Field>
+                        </div>
+                        <div class="row">
+                            <label class="check">
+                                <input type="checkbox" data-testid="test-task" prop:checked=move || test_task.get() on:change=move |ev| test_task.set(event_target_checked(&ev))/>
+                                <span>"Darf Tests ändern (Test-Auftrag)"</span>
+                            </label>
+                            <HelpTip topic="Test-Auftrag" text=help::TEST_TASK/>
                         </div>
                         <h4 class="row">"Limits dieses Auftrags" <HelpTip topic="Limits" text=help::LIMITS/></h4>
                         <TaskLimitInputs form=limits errors=limit_errors/>

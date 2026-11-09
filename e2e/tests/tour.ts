@@ -14,6 +14,8 @@ async function seed(page: Page) {
   const add = async (prompt: string, extra: Record<string, unknown> = {}) =>
     (await (await page.request.post("/api/tasks", { data: { project_id: pid, prompt, ...extra } })).json()).id as string;
   await waitTask(page.request, await add("Startseite mit Terminen und Kontaktformular bauen"), "done");
+  // WP03: a task held by the gate (possible secret in the changes).
+  await waitTask(page.request, await add("MOCK_SECRET Zugangsdaten für den Kalender einbauen"), "held");
   await waitTask(page.request, await add("MOCK_ASK Welche Datenbank soll das Kontaktformular nutzen?"), "waiting_input");
   const slow = await add("MOCK_SLOW Bilder der Galerie für Mobilgeräte optimieren");
   await waitTask(page.request, slow, "running");
@@ -51,6 +53,16 @@ export async function tour(page: Page, info: TestInfo, device: string, full: boo
     await shot(page, out, `${device}-${scheme}-drawer`);
     await page.keyboard.press("Escape");
     await expect(drawer).toBeHidden();
+
+    // WP03: held task with its findings and the masked held changes.
+    await page.locator('article[data-status="held"] button.open').first().click();
+    await expect(drawer.getByTestId("gate-panel")).toContainText("Mögliches Geheimnis in den Änderungen");
+    await drawer.getByRole("button", { name: "Zurückgehaltene Änderungen ansehen" }).click();
+    await expect(drawer.getByTestId("gate-panel").locator(".diff")).toContainText("[geschwärzt: GitHub-Token]");
+    await expectAccessible(page, `gate drawer (${scheme})`);
+    await shot(page, out, `${device}-${scheme}-gate`);
+    await page.keyboard.press("Escape");
+    await expect(drawer).toBeHidden();
     if (!full) continue;
 
     await navLink(page, "Postfach").click();
@@ -81,6 +93,13 @@ export async function tour(page: Page, info: TestInfo, device: string, full: boo
     await expect(page.getByTestId("net-agent").getByText("Python (PyPI)")).toBeVisible();
     await expectAccessible(page, `project environment (${scheme})`);
     await shot(page, out, `${device}-${scheme}-project-environment`, device === "desktop");
+    // WP03: protection settings with the per-CLI details expanded.
+    await page.getByRole("tab", { name: "Schutz" }).click();
+    await expect(page.getByTestId("protection-form")).toBeVisible();
+    await page.getByText("So wird es je Agent abgeschaltet").click();
+    await expect(page.getByText("--strict-mcp-config", { exact: false })).toBeVisible();
+    await expectAccessible(page, `project protection (${scheme})`);
+    await shot(page, out, `${device}-${scheme}-project-protection`, device === "desktop");
     await page.getByRole("tab", { name: "Mitglieder" }).click();
     await expect(page.locator(".member")).toHaveCount(1);
     await expectAccessible(page, `project members (${scheme})`);

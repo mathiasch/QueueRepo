@@ -90,6 +90,8 @@ pub struct RunnerState {
     pub cfg: Arc<RunnerConfig>,
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     running: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    /// Workspace of each active run (run name → workspace id).
+    active: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl RunnerState {
@@ -98,6 +100,7 @@ impl RunnerState {
             cfg: Arc::new(cfg),
             locks: Default::default(),
             running: Default::default(),
+            active: Default::default(),
         }
     }
 
@@ -108,6 +111,11 @@ impl RunnerState {
             .entry(id.to_string())
             .or_default()
             .clone()
+    }
+
+    /// A process runs in this workspace right now.
+    pub async fn workspace_busy(&self, id: &str) -> bool {
+        self.active.lock().await.values().any(|w| w == id)
     }
 
     /// Key of the secret fingerprints (stable as long as the token is).
@@ -284,12 +292,13 @@ async fn commit(
     let l = st.lock(&id).await;
     let _g = l.lock().await;
     Ok(Json(
-        repo.commit_checked(
+        repo.commit_scanned(
             &req.message,
             &req.author_name,
             &req.author_email,
             st.scan_key(),
             &req.allow,
+            req.allow_large,
         )
         .await?,
     ))
@@ -348,7 +357,8 @@ async fn discard_held(
     let repo = existing(&st, &id)?;
     let l = st.lock(&id).await;
     let _g = l.lock().await;
-    repo.discard(&task).await?;
+    let busy = st.workspace_busy(&id).await;
+    repo.discard(&task, busy).await?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
@@ -535,6 +545,10 @@ async fn exec_start(State(st): State<RunnerState>, Json(req): Json<ExecRequest>)
             ));
         }
         running.insert(req.name.clone(), cancel.clone());
+        st.active
+            .lock()
+            .await
+            .insert(req.name.clone(), req.workspace.clone());
     }
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(256);
     let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(256);
@@ -553,6 +567,7 @@ async fn exec_start(State(st): State<RunnerState>, Json(req): Json<ExecRequest>)
         }
         let _ = runner.await;
         st2.running.lock().await.remove(&name);
+        st2.active.lock().await.remove(&name);
     });
     let stream = tokio_stream::wrappers::ReceiverStream::new(body_rx).map(|r| r);
     Ok((
