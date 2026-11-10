@@ -58,18 +58,41 @@ pub struct NewTask {
     pub allow_test_changes: bool,
     /// WP04: task whose unmerged changes this one continues (fix tasks).
     pub carry_from: Option<Uuid>,
+    /// WP05: pull request whose branch this task works on.
+    pub pr_id: Option<Uuid>,
 }
 
 pub async fn insert_task(st: &AppState, t: NewTask) -> sqlx::Result<Task> {
-    let task = sqlx::query_as::<_, Task>(
+    let mut conn = st.db.acquire().await?;
+    let task = insert_task_in(&mut conn, t).await?;
+    announce(st, &task);
+    Ok(task)
+}
+
+/// Tells the UI and the scheduler about a new task (after its transaction
+/// committed, for [`insert_task_in`]).
+pub fn announce(st: &AppState, task: &Task) {
+    st.emit(
+        task.user_id,
+        ServerEvent::Task {
+            task: Box::new(task.clone()),
+        },
+    );
+    st.wake.notify_one();
+}
+
+/// Inserts a task on a connection (inside a transaction); the caller calls
+/// [`announce`] after the commit.
+pub async fn insert_task_in(conn: &mut sqlx::PgConnection, t: NewTask) -> sqlx::Result<Task> {
+    sqlx::query_as::<_, Task>(
         "INSERT INTO tasks (id, user_id, project_id, parent_id, kind, title, prompt, context, provider, model, status,
                             attempt, depth, created_by_agent, position,
                             max_runtime_secs, max_cost_usd, max_tokens, max_turns, connector_id, escalation_level,
-                            allow_test_changes, carry_from)
+                            allow_test_changes, carry_from, pr_id)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
                  CASE WHEN $15 THEN (SELECT COALESCE(MIN(position), 0) - 1 FROM tasks WHERE user_id = $2 AND status = 'queued')
                       ELSE nextval('task_position_seq') END,
-                 $16,$17,$18,$19,$20,$21,$22,$23)
+                 $16,$17,$18,$19,$20,$21,$22,$23,$24)
          RETURNING *",
     )
     .bind(Uuid::new_v4())
@@ -95,16 +118,9 @@ pub async fn insert_task(st: &AppState, t: NewTask) -> sqlx::Result<Task> {
     .bind(t.escalation_level)
     .bind(t.allow_test_changes && !t.created_by_agent)
     .bind(t.carry_from)
-    .fetch_one(&st.db)
-    .await?;
-    st.emit(
-        task.user_id,
-        ServerEvent::Task {
-            task: Box::new(task.clone()),
-        },
-    );
-    st.wake.notify_one();
-    Ok(task)
+    .bind(t.pr_id)
+    .fetch_one(conn)
+    .await
 }
 
 pub async fn load_task(st: &AppState, id: Uuid) -> sqlx::Result<Option<Task>> {

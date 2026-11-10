@@ -226,6 +226,7 @@ fn kind_tags(t: &Task) -> impl IntoView {
     match t.kind.as_str() {
         "fix" => tags.push(view! { <Tag text="Reparatur" tone=Tone::Danger/> }.into_any()),
         "onempty" => tags.push(view! { <Tag text="Automatisch" tone=Tone::Info/> }.into_any()),
+        "pr_fix" => tags.push(view! { <Tag text="PR-Folge" tone=Tone::Info/> }.into_any()),
         _ if t.created_by_agent => tags.push(
             view! { <span class="tag tone-warning agent-tag" title="Von einem Agenten vorgeschlagen">"Vorschlag"</span> }.into_any(),
         ),

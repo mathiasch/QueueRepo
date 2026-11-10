@@ -10,6 +10,7 @@ pub mod errors;
 pub mod format;
 pub mod labels;
 pub mod limits;
+pub mod pr;
 pub mod progress;
 pub mod protection;
 pub mod shortcuts;

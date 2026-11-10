@@ -25,8 +25,12 @@ pub struct AppState {
     pub wake: Arc<Notify>,
     /// Wakes the poller of single-shot/batch jobs.
     pub batch_wake: Arc<Notify>,
-    /// Cancellation handles of running tasks.
-    pub running: Arc<Mutex<HashMap<Uuid, CancellationToken>>>,
+    /// Wakes the pull request poller (WP05; webhooks of WP07 use it too).
+    pub pr_wake: Arc<Notify>,
+    /// Cancellation handles of running tasks (with the generation of the run
+    /// that registered it, see [`AppState::track`]).
+    pub running: Arc<Mutex<HashMap<Uuid, (u64, CancellationToken)>>>,
+    run_gen: Arc<std::sync::atomic::AtomicU64>,
     pub vapid: Arc<Vapid>,
     /// Effective price catalog, cached per override version (see `pricing::current`).
     pub prices: Arc<std::sync::RwLock<Option<PriceCache>>>,
@@ -51,11 +55,46 @@ impl AppState {
             bus,
             wake: Arc::new(Notify::new()),
             batch_wake: Arc::new(Notify::new()),
+            pr_wake: Arc::new(Notify::new()),
             running: Arc::new(Mutex::new(HashMap::new())),
+            run_gen: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             vapid: Arc::new(vapid),
             prices: Arc::new(std::sync::RwLock::new(None)),
             sandbox: Arc::new(std::sync::RwLock::new(None)),
         })
+    }
+
+    /// Registers the cancel token of a new run of `id`; returns the run's
+    /// generation for [`AppState::untrack`].
+    pub async fn track(&self, id: Uuid, token: CancellationToken) -> u64 {
+        let gen = self
+            .run_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.running.lock().await.insert(id, (gen, token));
+        gen
+    }
+
+    /// Forgets the token of run `gen` – never the token of a newer run of
+    /// the same task (a retry claimed while the previous run was still
+    /// cleaning up; before, its token was removed and a cancel was lost).
+    pub async fn untrack(&self, id: Uuid, gen: u64) {
+        let mut m = self.running.lock().await;
+        if m.get(&id).is_some_and(|(g, _)| *g == gen) {
+            m.remove(&id);
+        }
+    }
+
+    /// Cancels the current run of `id`; `false` = no live run registered.
+    /// An already cancelled token belongs to a previous run that is still
+    /// cleaning up (a retry may already be claimed): it does not count.
+    pub async fn cancel_run(&self, id: Uuid) -> bool {
+        match self.running.lock().await.get(&id) {
+            Some((_, tok)) if !tok.is_cancelled() => {
+                tok.cancel();
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn emit(&self, user_id: Uuid, payload: queued_api::ServerEvent) {

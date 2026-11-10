@@ -17,12 +17,23 @@ pub const API_PREFIX: &str = "/v1";
 
 /// Git remote access for clone / pull / push. The token is only sent as an
 /// HTTP header for the single git invocation, never written to disk.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct GitRemote {
     pub url: String,
     pub branch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+}
+
+/// Never prints the token (WP05: tokens never reach logs).
+impl std::fmt::Debug for GitRemote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitRemote")
+            .field("url", &self.url)
+            .field("branch", &self.branch)
+            .field("token", &self.token.as_ref().map(|_| "***"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -115,6 +126,16 @@ pub struct PushRequest {
     /// A human approved the push as a whole (skips the secret scan).
     #[serde(default)]
     pub allow_secrets: bool,
+    /// Branch of the remote whose commits are not scanned again (WP05: a
+    /// new task branch is scanned from where it leaves the remote target
+    /// branch, not over the whole history). Unknown remote state ⇒ full scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_base: Option<String>,
+    /// Expected commit of the pushed branch on the remote (`""` = the branch
+    /// must not exist yet). Another state ⇒ nothing pushed, `moved`. The
+    /// remote already at `sha` ⇒ success without a push (idempotent retry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +145,10 @@ pub struct PushResult {
     /// Nothing was pushed: the push needs a human decision.
     #[serde(default)]
     pub held: Vec<GateFinding>,
+    /// Nothing was pushed: the remote branch is not at `expect` (someone
+    /// else pushed to it).
+    #[serde(default)]
+    pub moved: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,6 +349,11 @@ pub struct TaskWorkspaceRequest {
     /// without other secrets, else quarantined – like `begin`).
     #[serde(default)]
     pub allow: Vec<String>,
+    /// WP05: start from this remote branch (the pull request's head branch,
+    /// fetched now) instead of the target branch of the main repository.
+    /// Also the base a `carry` is applied to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<GitRemote>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

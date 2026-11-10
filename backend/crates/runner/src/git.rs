@@ -66,16 +66,30 @@ pub struct Repo {
 }
 
 /// `-c http.extraHeader=…` so tokens never end up in remote URLs or config.
-fn auth_args(remote: &GitRemote) -> Vec<String> {
-    match &remote.token {
-        Some(t) if !t.is_empty() => {
+/// Authentication of one git call against the app's remote: the token goes
+/// into the process *environment* as `http.extraHeader` (`GIT_CONFIG_COUNT`,
+/// git ≥ 2.31), never onto the command line – `/proc/<pid>/cmdline` is
+/// readable by every process on the host, `/proc/<pid>/environ` only by the
+/// same user (WP05). Basic auth with a fixed user name works for GitHub,
+/// GitLab (any non-empty user name) and Gitea/Forgejo (token as password).
+pub(crate) fn auth_env(remote: Option<&GitRemote>) -> Vec<(&'static str, String)> {
+    match remote
+        .and_then(|r| r.token.as_deref())
+        .filter(|t| !t.is_empty())
+    {
+        Some(t) => {
             let basic = STANDARD.encode(format!("x-access-token:{t}"));
             vec![
-                "-c".into(),
-                format!("http.extraHeader=Authorization: Basic {basic}"),
+                ("GIT_CONFIG_COUNT", "1".to_string()),
+                ("GIT_CONFIG_KEY_0", "http.extraHeader".to_string()),
+                (
+                    "GIT_CONFIG_VALUE_0",
+                    format!("Authorization: Basic {basic}"),
+                ),
             ]
         }
-        _ => vec![],
+        // No inherited extra configuration either.
+        None => vec![("GIT_CONFIG_COUNT", "0".to_string())],
     }
 }
 
@@ -165,6 +179,7 @@ pub(crate) async fn run_git_env(
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "true")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .envs(auth_env(remote))
         .envs(envs.iter().copied())
         .output()
         .await
@@ -334,7 +349,7 @@ impl Repo {
                     let dir = self.dir.to_string_lossy().to_string();
                     let res = run_git(
                         parent,
-                        &auth_args(r),
+                        &[],
                         &["clone", "--quiet", "--", &r.url, &dir],
                         Some(r),
                     )
@@ -468,7 +483,7 @@ impl Repo {
             // header) at another host.
             if let Err(e) = run_git(
                 &self.dir,
-                &auth_args(r),
+                &[],
                 &[
                     "pull",
                     "--ff-only",
@@ -715,6 +730,12 @@ impl Repo {
             &r.branch
         };
         check_branch(branch)?;
+        if let Some(b) = opt.scan_base {
+            check_branch(b)?;
+        }
+        if let Some(e) = opt.expect.filter(|e| !e.is_empty()) {
+            check_rev(e)?;
+        }
         let sha = match opt.sha {
             Some(s) => {
                 check_rev(s)?;
@@ -726,7 +747,39 @@ impl Repo {
             }
             None => self.head().await?,
         };
-        let (default, remote_sha) = self.remote_heads(r, branch).await;
+        let mut wanted = vec![branch];
+        wanted.extend(opt.scan_base);
+        let (default, refs) = match self.remote_refs(r, &wanted).await {
+            Ok(x) => x,
+            // The remote state decides between "push" and "someone else
+            // pushed": unknown is an error (retried), never a guess.
+            Err(e) if opt.expect.is_some() => return Err(e.context("Remote nicht erreichbar")),
+            Err(_) => Default::default(),
+        };
+        let remote_sha = refs.get(branch).cloned();
+        if remote_sha.as_deref() == Some(sha.as_str()) {
+            // Already there (retry after a crash between push and bookkeeping).
+            return Ok(PushOutcome {
+                output: format!("{branch} ist bereits auf {}", &sha[..8.min(sha.len())]),
+                held: vec![],
+                moved: false,
+            });
+        }
+        if let Some(e) = opt.expect {
+            if remote_sha.as_deref().unwrap_or("") != e {
+                return Ok(PushOutcome {
+                    output: format!(
+                        "{branch} wurde auf dem Remote inzwischen geändert ({})",
+                        remote_sha
+                            .as_deref()
+                            .map(|s| &s[..8.min(s.len())])
+                            .unwrap_or("gelöscht")
+                    ),
+                    held: vec![],
+                    moved: true,
+                });
+            }
+        }
         let mut held = vec![];
         let protected = match &default {
             Some(d) => d == branch,
@@ -749,32 +802,44 @@ impl Repo {
             });
         }
         if !opt.allow_secrets {
-            let known = match &remote_sha {
-                Some(rs) if check_rev(rs).is_ok() => self
-                    .git(&["cat-file", "-e", &format!("{rs}^{{commit}}")])
-                    .await
-                    .is_ok(),
-                _ => false,
-            };
-            let range = match (&remote_sha, known) {
-                (Some(rs), true) => format!("{rs}..{sha}"),
-                _ => sha.clone(),
-            };
+            // Commits the remote already has (on the pushed branch or on the
+            // scan base) are not scanned again; unknown objects ⇒ full scan.
+            let mut candidates: Vec<String> = remote_sha.iter().cloned().collect();
+            if let Some(b) = opt.scan_base {
+                candidates.extend(refs.get(b).cloned());
+            }
+            let mut known = vec![];
+            for rs in &candidates {
+                if check_rev(rs).is_ok()
+                    && self
+                        .git(&["cat-file", "-e", &format!("{rs}^{{commit}}")])
+                        .await
+                        .is_ok()
+                {
+                    known.push(rs.clone());
+                }
+            }
             let mut args = vec!["log", "-p", "--format=commit %H"];
             args.extend(SCAN_DIFF);
-            args.push(&range);
+            args.push(&sha);
+            if !known.is_empty() {
+                args.push("--not");
+                args.extend(known.iter().map(String::as_str));
+            }
             held.extend(self.scan_output(&args, opt.key, opt.allow).await?);
         }
         if !held.is_empty() {
             return Ok(PushOutcome {
                 output: String::new(),
                 held,
+                moved: false,
             });
         }
+        // Never forced: a non-fast-forward push is refused by the remote.
         let target = format!("{sha}:refs/heads/{branch}");
         let out = run_git(
             &self.dir,
-            &auth_args(r),
+            &[],
             &["push", "--porcelain", "--", &r.url, &target],
             Some(r),
         )
@@ -782,24 +847,30 @@ impl Repo {
         Ok(PushOutcome {
             output: redact(&out, Some(r)),
             held: vec![],
+            moved: false,
         })
     }
 
     /// Default branch of the remote (`ls-remote --symref`) and the current
-    /// commit of `branch` there (`None` = unknown / not yet created).
-    async fn remote_heads(&self, r: &GitRemote, branch: &str) -> (Option<String>, Option<String>) {
-        let head_ref = format!("refs/heads/{branch}");
-        let Ok(out) = run_git(
-            &self.dir,
-            &auth_args(r),
-            &["ls-remote", "--symref", "--", &r.url, "HEAD", &head_ref],
-            Some(r),
-        )
-        .await
-        else {
-            return (None, None);
-        };
-        parse_ls_remote(&out, &head_ref)
+    /// commits of the given branches there (missing = not created yet).
+    async fn remote_refs(
+        &self,
+        r: &GitRemote,
+        branches: &[&str],
+    ) -> Result<(Option<String>, std::collections::HashMap<String, String>)> {
+        let refs: Vec<String> = branches.iter().map(|b| format!("refs/heads/{b}")).collect();
+        let mut args = vec!["ls-remote", "--symref", "--", &r.url, "HEAD"];
+        args.extend(refs.iter().map(String::as_str));
+        let out = run_git(&self.dir, &[], &args, Some(r)).await?;
+        let (default, all) = parse_ls_remote(&out);
+        let found = branches
+            .iter()
+            .filter_map(|b| {
+                all.get(&format!("refs/heads/{b}"))
+                    .map(|s| (b.to_string(), s.clone()))
+            })
+            .collect();
+        Ok((default, found))
     }
 
     /// Secrets in the staged changes (against HEAD).
@@ -1185,11 +1256,16 @@ pub struct PushOptions<'a> {
     pub allow: &'a [String],
     pub allow_secrets: bool,
     pub key: &'a [u8],
+    /// See [`queued_common::PushRequest::scan_base`].
+    pub scan_base: Option<&'a str>,
+    /// See [`queued_common::PushRequest::expect`].
+    pub expect: Option<&'a str>,
 }
 
 pub struct PushOutcome {
     pub output: String,
     pub held: Vec<GateFinding>,
+    pub moved: bool,
 }
 
 pub(crate) fn too_large(bytes: usize) -> GateFinding {
@@ -1335,9 +1411,9 @@ fn canonical_config(listed: &str) -> String {
     out
 }
 
-fn parse_ls_remote(out: &str, head_ref: &str) -> (Option<String>, Option<String>) {
+fn parse_ls_remote(out: &str) -> (Option<String>, std::collections::HashMap<String, String>) {
     let mut default = None;
-    let mut sha = None;
+    let mut refs = std::collections::HashMap::new();
     for line in out.lines() {
         if let Some(rest) = line.strip_prefix("ref: refs/heads/") {
             if let Some((b, name)) = rest.split_once('\t') {
@@ -1346,12 +1422,12 @@ fn parse_ls_remote(out: &str, head_ref: &str) -> (Option<String>, Option<String>
                 }
             }
         } else if let Some((s, name)) = line.split_once('\t') {
-            if name == head_ref {
-                sha = Some(s.to_string());
+            if name.starts_with("refs/heads/") {
+                refs.insert(name.to_string(), s.to_string());
             }
         }
     }
-    (default, sha)
+    (default, refs)
 }
 
 /// Branch names from the app (no options, no ref tricks).
@@ -1465,6 +1541,8 @@ mod tests {
                     allow: &[],
                     allow_secrets: false,
                     key: KEY,
+                    scan_base: None,
+                    expect: None,
                 },
             )
             .await
@@ -2206,6 +2284,8 @@ mod tests {
             allow: &[],
             allow_secrets: false,
             key: KEY,
+            scan_base: None,
+            expect: None,
         };
         // Empty remote: default branch unknown, `main` counts as protected.
         let o = a.push_checked(&remote, &opt(None)).await.unwrap();
@@ -2289,14 +2369,205 @@ mod tests {
             .is_err());
     }
 
+    /// WP05: pushing a new task branch scans only what leaves the remote's
+    /// target branch; `expect` detects pushes by others; a repeated push of
+    /// the same commit is a no-op; an unreachable remote is an error.
+    #[tokio::test]
+    async fn task_branch_push_scans_from_the_base_and_checks_the_remote_state() {
+        let t = tempfile::tempdir().unwrap();
+        let remote = bare_remote(t.path(), "main").await;
+        let a = Repo::new(t.path(), "a");
+        a.init(&InitWorkspace {
+            remote: Some(remote.clone()),
+            branch: None,
+        })
+        .await
+        .unwrap();
+        // History on the remote's main contains an (allowed earlier) secret.
+        std::fs::write(a.dir.join("old.txt"), format!("{}\n", testdata::github(5))).unwrap();
+        a.commit("old", "A", "a@x").await.unwrap();
+        let base = a.head().await.unwrap();
+        let push =
+            |b: &str, sha: Option<String>, scan: Option<&'static str>, expect: Option<String>| {
+                let r = GitRemote {
+                    branch: b.to_string(),
+                    ..remote.clone()
+                };
+                let a = &a;
+                async move {
+                    a.push_checked(
+                        &r,
+                        &PushOptions {
+                            sha: sha.as_deref(),
+                            allow_protected: true,
+                            allow: &[],
+                            allow_secrets: false,
+                            key: KEY,
+                            scan_base: scan,
+                            expect: expect.as_deref(),
+                        },
+                    )
+                    .await
+                }
+            };
+        // Main itself (approved): the secret is in the range.
+        let o = push("main", None, None, None).await.unwrap();
+        assert_eq!(o.held.len(), 1);
+        a.push_checked(
+            &remote,
+            &PushOptions {
+                sha: None,
+                allow_protected: true,
+                allow: &[],
+                allow_secrets: true,
+                key: KEY,
+                scan_base: None,
+                expect: None,
+            },
+        )
+        .await
+        .unwrap();
+        // A task branch on top: without scan base the whole history counts.
+        std::fs::write(a.dir.join("new.txt"), "clean\n").unwrap();
+        let tip = a.commit("task", "A", "a@x").await.unwrap();
+        let o = push(
+            "queue/aaaaaaaaaaaa",
+            Some(tip.clone()),
+            None,
+            Some(String::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(o.held.len(), 1, "full history without a scan base");
+        let o = push(
+            "queue/aaaaaaaaaaaa",
+            Some(tip.clone()),
+            Some("main"),
+            Some(String::new()),
+        )
+        .await
+        .unwrap();
+        assert!(o.held.is_empty() && !o.moved, "{:?}", o.held);
+        // Repeat (crash between push and bookkeeping): nothing to do.
+        let o = push(
+            "queue/aaaaaaaaaaaa",
+            Some(tip.clone()),
+            Some("main"),
+            Some(String::new()),
+        )
+        .await
+        .unwrap();
+        assert!(!o.moved && o.output.contains("bereits"), "{}", o.output);
+        // A follow-up expects the branch at `tip`; someone else pushed.
+        std::fs::write(a.dir.join("f.txt"), "f\n").unwrap();
+        let follow = a.commit("follow", "A", "a@x").await.unwrap();
+        let o = push(
+            "queue/aaaaaaaaaaaa",
+            Some(follow.clone()),
+            Some("main"),
+            Some(base.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(o.moved, "remote is at tip, not at base");
+        let o = push(
+            "queue/aaaaaaaaaaaa",
+            Some(follow.clone()),
+            Some("main"),
+            Some(tip.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(!o.moved && o.held.is_empty());
+        let on_remote = run_git(
+            t.path(),
+            &[],
+            &[
+                "--git-dir",
+                &remote.url,
+                "rev-parse",
+                "refs/heads/queue/aaaaaaaaaaaa",
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(on_remote.trim(), follow);
+        // Unreachable remote with an expectation: error, not "moved".
+        let gone = GitRemote {
+            url: t.path().join("missing.git").to_string_lossy().into(),
+            branch: "queue/aaaaaaaaaaaa".into(),
+            token: None,
+        };
+        assert!(a
+            .push_checked(
+                &gone,
+                &PushOptions {
+                    sha: Some(&follow),
+                    allow_protected: false,
+                    allow: &[],
+                    allow_secrets: false,
+                    key: KEY,
+                    scan_base: Some("main"),
+                    expect: Some(&tip),
+                },
+            )
+            .await
+            .is_err());
+    }
+
+    /// WP05: the token reaches git through the environment of the single
+    /// call, never through its command line (`/proc/<pid>/cmdline` is
+    /// world-readable); `Debug` never prints it.
+    #[tokio::test]
+    async fn git_token_goes_through_the_environment_not_argv() {
+        let token = "tok-SECRET-123";
+        let r = GitRemote {
+            url: "https://example.invalid/x.git".into(),
+            branch: "main".into(),
+            token: Some(token.into()),
+        };
+        let env = auth_env(Some(&r));
+        let joined: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+        assert!(joined.contains("GIT_CONFIG_KEY_0=http.extraHeader"));
+        assert!(!joined.contains(token), "only base64 in the header value");
+        let t = tempfile::tempdir().unwrap();
+        // Git really reads the header from the environment.
+        let out = run_git(
+            t.path(),
+            &[],
+            &["config", "--get", "http.extraHeader"],
+            Some(&r),
+        )
+        .await
+        .unwrap();
+        assert!(out.starts_with("Authorization: Basic "), "{out}");
+        // No token: no header, and nothing inherited.
+        assert!(run_git(
+            t.path(),
+            &[],
+            &["config", "--get", "http.extraHeader"],
+            None
+        )
+        .await
+        .is_err());
+        assert!(HARDEN.iter().all(|a| !a.contains("extraHeader")));
+        assert!(!format!("{r:?}").contains(token));
+        // The source has no command-line header any more.
+        let src = include_str!("git.rs");
+        let needle = ["format!(\"http.extra", "Header="].concat();
+        assert!(!src.contains(&needle));
+    }
+
     #[test]
     fn ls_remote_and_config_helpers() {
         let out = "ref: refs/heads/trunk\tHEAD\nabc\tHEAD\ndef\trefs/heads/feat\n";
-        assert_eq!(
-            parse_ls_remote(out, "refs/heads/feat"),
-            (Some("trunk".into()), Some("def".into()))
-        );
-        assert_eq!(parse_ls_remote("", "refs/heads/x"), (None, None));
+        let (default, refs) = parse_ls_remote(out);
+        assert_eq!(default.as_deref(), Some("trunk"));
+        assert_eq!(refs.get("refs/heads/feat").map(String::as_str), Some("def"));
+        assert!(!refs.contains_key("HEAD"));
+        let (default, refs) = parse_ls_remote("");
+        assert!(default.is_none() && refs.is_empty());
         let listed = "core.repositoryformatversion\n1\0core.fsmonitor\nevil\0extensions.objectformat\nsha256\0branch.we\"ird.merge\nrefs/heads/x\0url.https://e/.insteadof\nhttps://g/\0";
         let c = canonical_config(listed);
         assert!(c.contains("repositoryformatversion = \"1\""), "{c}");

@@ -32,17 +32,19 @@ enum Tab {
     Git,
     Tasks,
     Settings,
+    Delivery,
     Environment,
     Protection,
     Members,
 }
 
 impl Tab {
-    const ALL: [Tab; 7] = [
+    const ALL: [Tab; 8] = [
         Tab::Files,
         Tab::Git,
         Tab::Tasks,
         Tab::Settings,
+        Tab::Delivery,
         Tab::Environment,
         Tab::Protection,
         Tab::Members,
@@ -53,6 +55,7 @@ impl Tab {
             Tab::Git => "git",
             Tab::Tasks => "tasks",
             Tab::Settings => "settings",
+            Tab::Delivery => "delivery",
             Tab::Environment => "environment",
             Tab::Protection => "protection",
             Tab::Members => "members",
@@ -64,6 +67,7 @@ impl Tab {
             Tab::Git => "Verlauf",
             Tab::Tasks => "Aufträge",
             Tab::Settings => "Einstellungen",
+            Tab::Delivery => "Ergebnis",
             Tab::Environment => "Umgebung",
             Tab::Protection => "Schutz",
             Tab::Members => "Mitglieder",
@@ -75,6 +79,7 @@ impl Tab {
             Tab::Git => Ic::Commit,
             Tab::Tasks => Ic::Queue,
             Tab::Settings => Ic::Settings,
+            Tab::Delivery => Ic::CloudUpload,
             Tab::Environment => Ic::Terminal,
             Tab::Protection => Ic::Shield,
             Tab::Members => Ic::Users,
@@ -207,6 +212,7 @@ pub fn ProjectPage() -> impl IntoView {
                                 <ProjectRouting p=p.clone() on_saved=Callback::new(move |_| reload())/>
                                 <ProjectSettings p=p on_saved=Callback::new(move |_| reload())/>
                             }.into_any(),
+                            Tab::Delivery => view! { <super::delivery::ProjectDelivery p=p/> }.into_any(),
                             Tab::Environment => view! { <super::environment::ProjectEnvironment p=p/> }.into_any(),
                             Tab::Protection => view! { <super::protection::ProjectProtection p=p/> }.into_any(),
                             Tab::Members => view! { <Members id=pid is_owner=p.role == ProjectRole::Owner me=store.me.get_untracked().id/> }.into_any(),
@@ -370,6 +376,7 @@ fn GitLog(p: ProjectView, can_edit: bool) -> impl IntoView {
     view! {
         <div class="stack" style="padding-top: var(--sp-4)">
             <super::branch::MergeQueueCard project=id/>
+            <super::pr::PullRequestsCard project=id/>
             <h2 style="font-size: var(--fs-lg)">"Hauptstand"</h2>
             <div class="row wrap between">
                 <p class="small muted row"><Icon icon=Ic::Branch class="sm"/>
@@ -631,10 +638,16 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
             review_enabled: Some(review.get_untracked()),
             review_provider: Some(review_provider.get_untracked()),
             review_model: Some(review_model.get_untracked()),
-            git_remote_url: Some(remote.get_untracked()),
-            git_branch: Some(branch.get_untracked()),
-            git_token: token.get_untracked(),
-            auto_push: Some(auto_push.get_untracked()),
+            // Git access is the owner's (the server refuses it from editors:
+            // it decides where the owner's token is sent).
+            git_remote_url: is_owner.then(|| remote.get_untracked()),
+            git_branch: is_owner.then(|| branch.get_untracked()),
+            git_token: if is_owner {
+                token.get_untracked()
+            } else {
+                None
+            },
+            auto_push: is_owner.then(|| auto_push.get_untracked()),
             // Owner only (the server refuses it from editors).
             parallelism: is_owner.then(|| parallelism.get_untracked()),
             ..Default::default()
@@ -690,6 +703,18 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
         view! {
             <Field ids=ids label=label hint=hint help=help_text>
                 <input id=fid class="input" disabled=!can_edit aria-describedby=desc placeholder=placeholder bind:value=sig/>
+            </Field>
+        }
+    };
+    let git_text = move |sig: RwSignal<String>,
+                         label: &'static str,
+                         hint: &'static str,
+                         placeholder: &'static str| {
+        let ids = FieldIds::new("ps-git");
+        let (fid, desc) = (ids.id.clone(), ids.described_by());
+        view! {
+            <Field ids=ids label=label hint=hint>
+                <input id=fid class="input" disabled=!is_owner aria-describedby=desc placeholder=placeholder bind:value=sig/>
             </Field>
         }
     };
@@ -831,18 +856,18 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
             <section class="form-section">
                 <header>
                     <h2>"Git"</h2>
-                    <p>"Wohin die Änderungen hochgeladen werden. Leer = nur lokal."</p>
+                    <p>{if is_owner { "Wohin die Änderungen hochgeladen werden. Leer = nur lokal. Ob als Commit, Branch oder Pull Request, steht unter „Ergebnis“." } else { "Den Git-Zugang (Adresse, Branch, Token) ändert nur, wem das Projekt gehört – das Token gehört der Projekt-Eigentümerin bzw. dem Projekt-Eigentümer." }}</p>
                 </header>
                 <div class="grid-3">
-                    {text(remote, "Repository-Adresse", "leer = nur lokal", "", "https://github.com/org/repo.git")}
-                    {text(branch, "Branch", "", "", "")}
+                    {git_text(remote, "Repository-Adresse", "leer = nur lokal. Ein anderer Server löscht das gespeicherte Token.", "https://github.com/org/repo.git")}
+                    {git_text(branch, "Branch", "", "")}
                     <Field ids=token_ids.clone() label="Zugangstoken" hint=if has_token { "Ein Token ist gespeichert. Neues eingeben ersetzt es, leeren entfernt es." } else { "Optional, für private Repositories und Push." }>
                         <input
                             id=token_ids.id.clone()
                             class="input"
                             type="password"
                             autocomplete="off"
-                            disabled=!can_edit
+                            disabled=!is_owner
                             aria-describedby=token_ids.described_by()
                             placeholder=if has_token { "•••••••• (gespeichert)" } else { "optional" }
                             prop:value=move || token.get().unwrap_or_default()
@@ -851,7 +876,7 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
                     </Field>
                 </div>
                 <label class="switch">
-                    <input type="checkbox" role="switch" disabled=move || !can_edit || remote.with(|r| r.trim().is_empty()) prop:checked=move || auto_push.get() on:change=move |ev| auto_push.set(event_target_checked(&ev))/>
+                    <input type="checkbox" role="switch" disabled=move || !is_owner || remote.with(|r| r.trim().is_empty()) prop:checked=move || auto_push.get() on:change=move |ev| auto_push.set(event_target_checked(&ev))/>
                     <span class="check-text">"Automatisch hochladen"<small>"Nach jedem erfolgreichen Auftrag pushen (braucht eine Repository-Adresse)."</small></span>
                 </label>
             </section>

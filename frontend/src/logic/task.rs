@@ -114,6 +114,7 @@ pub(crate) mod fixtures {
             merge_state: None,
             merge_queued_at: None,
             carry_from: None,
+            pr_id: None,
         }
     }
 }

@@ -37,15 +37,19 @@ pub enum MergeState {
     Conflict,
     /// Checks failed after bringing it up to date.
     Failed,
+    /// WP05 (output `branch`/`pr`): the task branch is on the remote; the
+    /// merge into the target branch happens on the git host, by people.
+    Published,
 }
 
 impl MergeState {
-    pub const ALL: [MergeState; 5] = [
+    pub const ALL: [MergeState; 6] = [
         Self::Queued,
         Self::Merging,
         Self::Merged,
         Self::Conflict,
         Self::Failed,
+        Self::Published,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -55,6 +59,7 @@ impl MergeState {
             Self::Merged => "merged",
             Self::Conflict => "conflict",
             Self::Failed => "failed",
+            Self::Published => "published",
         }
     }
 
@@ -69,6 +74,7 @@ impl MergeState {
             Self::Merged => "Übernommen",
             Self::Conflict => "Konflikt",
             Self::Failed => "Prüfung nach Aktualisierung fehlgeschlagen",
+            Self::Published => "Hochgeladen",
         }
     }
 
@@ -79,6 +85,7 @@ impl MergeState {
             Self::Merged => "Die Änderungen sind als ein Commit im Hauptstand. „Rückgängig“ nimmt sie wieder heraus.",
             Self::Conflict => "Ein anderer Auftrag hat inzwischen dieselben Stellen geändert. Queue hat einen Korrektur-Auftrag erstellt, der beides zusammenführt.",
             Self::Failed => "Nach dem Aktualisieren auf den neuesten Stand schlug die Prüfung fehl. Queue hat einen Korrektur-Auftrag erstellt.",
+            Self::Published => "Der geprüfte Branch liegt auf dem Git-Server. Übernommen wird er dort – von Menschen, nie von Queue. „Rückgängig“ gibt es hier deshalb nicht.",
         }
     }
 }

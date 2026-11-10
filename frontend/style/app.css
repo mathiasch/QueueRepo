@@ -741,3 +741,18 @@ details > summary { cursor: pointer; }
 .mono-wrap { font-family: var(--mono); font-size: var(--fs-xs); overflow-wrap: anywhere; }
 .plain { list-style: none; padding: 0; margin: var(--sp-2) 0; display: flex; flex-direction: column; gap: 2px; }
 ol.list { list-style: none; padding: 0; margin: 0; }
+
+/* WP05: output mode, pull requests ------------------------------------------ */
+.choice-list { border: 0; margin: 0; padding: 0; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
+.choice {
+  display: flex; align-items: flex-start; gap: var(--sp-3); min-height: var(--touch); cursor: pointer;
+  border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-3); background: var(--surface);
+}
+.choice input { margin: 3px 0 0; width: 20px; height: 20px; flex: none; accent-color: var(--primary); cursor: pointer; }
+.choice:has(input:checked) { border-color: var(--primary); box-shadow: 0 0 0 1px var(--primary); }
+.choice:has(input:disabled) { cursor: default; }
+.choice .check-text { display: flex; flex-direction: column; gap: 2px; font-weight: 600; min-width: 0; }
+.choice .check-text small { color: var(--text-muted); font-size: var(--fs-xs); font-weight: 400; overflow-wrap: anywhere; }
+.choice input:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.stack-sm { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+.checks li { gap: var(--sp-2); overflow-wrap: anywhere; }

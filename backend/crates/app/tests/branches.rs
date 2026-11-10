@@ -79,7 +79,9 @@ async fn parallel_tasks_run_in_their_own_working_trees_and_merge_serially(pool: 
     for t in [&t1, &t2] {
         let mut d = a.task_json(t).await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while d["task"]["branch"].is_null() || !task_ws(&h, t).join(".git").exists() {
+        // `.git` appears before the runner finished preparing it (init,
+        // fetch, config rewrite): wait until git answers in it.
+        while d["task"]["branch"].is_null() || !git(&task_ws(&h, t), &["symbolic-ref", "HEAD"]).0 {
             assert!(tokio::time::Instant::now() < deadline, "{d}");
             tokio::time::sleep(Duration::from_millis(50)).await;
             d = a.task_json(t).await;
@@ -479,6 +481,21 @@ async fn cancelling_a_task_removes_its_working_tree_and_branch(pool: PgPool) {
             tokio::time::Instant::now() < deadline,
             "working tree still there"
         );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The runner removes the working tree first, then the branch ref.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while git(
+        &h.workspace(&p),
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .0 && tokio::time::Instant::now() < deadline
+    {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(

@@ -148,6 +148,7 @@ pub fn task_kind_label(kind: &str) -> &'static str {
     match kind {
         "fix" => "Reparatur",
         "onempty" => "Automatisch",
+        "pr_fix" => "PR-Folge",
         _ => "Auftrag",
     }
 }
@@ -197,6 +198,7 @@ pub fn event_kind_label(kind: &str) -> &'static str {
         "egress" => "Netzwerk",
         "gate" => "Schutz",
         "merge" => "Übernahme",
+        "pr" => "Pull Request",
         _ => "Info",
     }
 }
@@ -247,6 +249,9 @@ pub mod help {
     pub const AUTO_APPROVE: &str = "Schlägt ein Agent mehr neue Aufträge vor als hier eingestellt, musst du sie erst freigeben.";
     pub const FIX: &str = "Wie oft die Queue nach einem fehlgeschlagenen Auftrag automatisch einen Reparatur-Auftrag startet, bevor sie stoppt und dich benachrichtigt.";
     pub const PARALLEL: &str = "Wie viele Agenten gleichzeitig für dich arbeiten dürfen (über alle Projekte). Wie viele davon im selben Projekt arbeiten, legt jedes Projekt selbst fest (Standard 1).";
+    pub const DELIVERY: &str = "Was ein fertiger, geprüfter Auftrag abliefert: einen Commit im Hauptstand von Queue, einen hochgeladenen Branch oder einen Pull Request. Hochgeladen wird immer erst nach Schutzprüfung, Prüfbefehl und Review – und genau der geprüfte Stand.";
+    pub const HOST: &str = "Queue spricht mit GitHub, GitLab oder Gitea/Forgejo über deren Schnittstelle. Bei github.com, gitlab.com und codeberg.org wird der Dienst automatisch erkannt. Für eigene Server die Art wählen; die API-Adresse wird aus der Repository-Adresse abgeleitet und muss nur bei besonderen Installationen eingetragen werden.";
+    pub const PR: &str = "Queue legt den Pull Request an und beobachtet ihn: Checks, Kommentare, Zustand. Genehmigen und Mergen bleibt bei euch – Queue tut das nie.";
     pub const BRANCH: &str = "Jeder Auftrag arbeitet auf einem eigenen Branch in einem eigenen Arbeitsverzeichnis. Erst wenn er fertig und geprüft ist, übernimmt Queue die Änderungen als einen Commit in den Hauptstand – der Reihe nach, mit erneuter Prüfung, wenn sich der Hauptstand inzwischen geändert hat.";
     pub const MERGE_QUEUE: &str = "Fertige Aufträge werden nacheinander in den Hauptstand übernommen. Hat sich der Hauptstand inzwischen geändert, prüft Queue den Auftrag auf dem neuen Stand noch einmal.";
     pub const PROTECTION: &str = "Schutzprüfungen laufen, bevor Änderungen gespeichert oder hochgeladen werden. Findet Queue etwas Verdächtiges, hält es den Auftrag an und fragt dich.";
@@ -315,6 +320,8 @@ mod tests {
         assert!(status_help(TaskStatus::Merging).contains("Hauptstand"));
         assert_eq!(status_tone(TaskStatus::Held), Tone::Warning);
         assert_eq!(task_kind_label("fix"), "Reparatur");
+        assert_eq!(task_kind_label("pr_fix"), "PR-Folge");
+        assert_eq!(event_kind_label("pr"), "Pull Request");
         let ids: Vec<&str> = ONEMPTY_ACTIONS.iter().map(|a| a.0).collect();
         assert_eq!(ids, queued_api::ONEMPTY_ACTIONS.to_vec());
     }

@@ -119,6 +119,7 @@ pub async fn create(
             escalation_level: 0,
             allow_test_changes: c.allow_test_changes,
             carry_from: None,
+            pr_id: None,
         },
     )
     .await?;
@@ -142,7 +143,12 @@ pub async fn get(
     .bind(id)
     .fetch_all(&st.db)
     .await?;
-    Ok(Json(TaskDetail { task: t, events }))
+    let pull_request = super::pulls::of_task(&st, &t).await?;
+    Ok(Json(TaskDetail {
+        task: t,
+        events,
+        pull_request,
+    }))
 }
 
 pub async fn update(
@@ -258,9 +264,7 @@ pub async fn cancel(
 ) -> ApiResult<Json<Value>> {
     let t = own_task(&st, id, u.id).await?;
     if t.status == status::RUNNING {
-        if let Some(tok) = st.running.lock().await.get(&id) {
-            tok.cancel();
-        }
+        cancel_running(&st, id).await?;
         return Ok(Json(json!({"ok": true})));
     }
     if t.status == status::WAITING_BATCH {
@@ -301,8 +305,7 @@ pub async fn cancel(
     }
     if t.status == status::MERGING {
         // Being merged right now: the merge job stops at its next step.
-        if let Some(tok) = st.running.lock().await.get(&id) {
-            tok.cancel();
+        if st.cancel_run(id).await {
             return Ok(Json(json!({"ok": true})));
         }
         let n = sqlx::query(
@@ -321,7 +324,7 @@ pub async fn cancel(
         crate::runner::merge::cleanup_task(&st, t.project_id, id, true).await;
         return Ok(Json(json!({"ok": true})));
     }
-    set_status(
+    if let Err(e) = set_status(
         &st,
         id,
         &[
@@ -331,11 +334,43 @@ pub async fn cancel(
         ],
         status::CANCELLED,
     )
-    .await?;
+    .await
+    {
+        // The scheduler claimed it in the same moment: cancel the run.
+        let now: Option<String> = sqlx::query_scalar("SELECT status FROM tasks WHERE id=$1")
+            .bind(id)
+            .fetch_optional(&st.db)
+            .await?;
+        if now.as_deref() == Some(status::RUNNING) {
+            cancel_running(&st, id).await?;
+            return Ok(Json(json!({"ok": true})));
+        }
+        return Err(e);
+    }
     // A cancelled task's working tree and branch are gone (it may be
     // retried; it then starts afresh).
     crate::runner::merge::cleanup_task(&st, t.project_id, id, true).await;
     Ok(Json(json!({"ok": true})))
+}
+
+/// Cancels the live run of a running task. Claimed but its token not
+/// registered yet (microseconds), or the previous run of a retried task
+/// still cleaning up: wait for the live token instead of losing the cancel.
+async fn cancel_running(st: &AppState, id: Uuid) -> ApiResult<()> {
+    for _ in 0..30 {
+        if st.cancel_run(id).await {
+            return Ok(());
+        }
+        let still: Option<String> = sqlx::query_scalar("SELECT status FROM tasks WHERE id=$1")
+            .bind(id)
+            .fetch_optional(&st.db)
+            .await?;
+        if still.as_deref() != Some(status::RUNNING) {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok(())
 }
 
 pub async fn retry(

@@ -16,6 +16,7 @@ pub mod branch;
 mod costs;
 pub mod env;
 pub mod gate;
+pub mod pr;
 mod providers;
 pub use costs::*;
 pub use providers::*;
@@ -378,6 +379,10 @@ pub struct Task {
     /// Fix task that continues the changes of this task.
     #[serde(default)]
     pub carry_from: Option<Uuid>,
+    /// WP05: pull request this task works on (follow-ups and their fixes
+    /// push to its branch).
+    #[serde(default)]
+    pub pr_id: Option<Uuid>,
 }
 
 impl Task {
@@ -466,6 +471,9 @@ pub struct TaskEvent {
 pub struct TaskDetail {
     pub task: Task,
     pub events: Vec<TaskEvent>,
+    /// Pull request opened for this task or worked on by it (WP05).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<pr::PullRequestView>,
 }
 
 /// `GET /api/tasks/{id}/diff`.
@@ -654,6 +662,9 @@ pub struct ProjectView {
     /// Tasks of this project that may run at the same time (WP04).
     #[serde(default = "branch::default_parallelism")]
     pub parallelism: i32,
+    /// What a finished task delivers (WP05).
+    #[serde(default)]
+    pub output_mode: pr::OutputMode,
 }
 
 /// Response of `POST /api/projects`: the new project and its first commit.
@@ -980,13 +991,14 @@ mod tests {
             "merge_state",
             "merge_queued_at",
             "carry_from",
+            "pr_id",
         ] {
             full[k] = Value::Null;
         }
         assert_eq!(
             serde_json::to_value(&t).unwrap(),
             full,
-            "rows from before WP04 still parse"
+            "rows from before WP04/WP05 still parse"
         );
         assert_eq!(serde_json::from_value::<Task>(full).unwrap(), t);
         // Before WP04: diff from the first snapshot, always on the target.

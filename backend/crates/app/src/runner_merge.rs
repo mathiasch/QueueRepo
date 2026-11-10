@@ -76,6 +76,34 @@ async fn carry_of(st: &AppState, task: &Task) -> Result<Option<(Carry, String)>,
     )))
 }
 
+/// WP05: a pull-request follow-up starts on the request's branch as it is
+/// on the host now (fetched by the runner from the project's remote URL).
+async fn pr_start(
+    st: &AppState,
+    task: &Task,
+    project: &Project,
+) -> Result<Option<queued_common::GitRemote>, RunError> {
+    let Some(id) = task.pr_id else {
+        return Ok(None);
+    };
+    let row = crate::pr::load(st, id).await?.ok_or_else(|| {
+        RunError::Config("Der Pull Request dieses Auftrags existiert nicht mehr.".into())
+    })?;
+    if !row.state().is_open() {
+        return Err(RunError::Config(format!(
+            "{} ist inzwischen {} – der Folge-Auftrag läuft nicht mehr.",
+            row.label(),
+            row.state().label(false).to_lowercase()
+        )));
+    }
+    let remote = project_remote(st, project)
+        .ok_or_else(|| RunError::Config("Das Projekt hat keine Remote-URL mehr.".into()))?;
+    Ok(Some(queued_common::GitRemote {
+        branch: row.head_branch,
+        ..remote
+    }))
+}
+
 /// Creates or continues the task's own working tree after the main
 /// repository was prepared. Stores branch, merge base and gate base;
 /// returns the gate base (`snapshot_before`).
@@ -86,6 +114,7 @@ pub(crate) async fn prepare(
 ) -> Result<String, RunError> {
     let branch = branch_of(st, task).await?;
     let carry = carry_of(st, task).await?;
+    let start = pr_start(st, task, project).await?;
     let merge_base: Option<String> = sqlx::query_scalar("SELECT merge_base FROM tasks WHERE id=$1")
         .bind(task.id)
         .fetch_one(&st.db)
@@ -100,6 +129,7 @@ pub(crate) async fn prepare(
                 merge_base: merge_base.clone(),
                 carry: carry.as_ref().map(|(c, _)| c.clone()),
                 allow: project.secret_allowlist.clone(),
+                start,
             },
         )
         .await?;
@@ -173,7 +203,12 @@ pub(crate) async fn enqueue(
     .bind(task.id)
     .fetch_one(&st.db)
     .await?;
-    if branch.is_none() || state.as_deref() == Some(MergeState::Merged.as_str()) {
+    if branch.is_none()
+        || matches!(
+            state.as_deref().and_then(MergeState::parse),
+            Some(MergeState::Merged | MergeState::Published)
+        )
+    {
         return Ok(false);
     }
     let after = p.after.clone().or(after);
@@ -211,7 +246,7 @@ pub(crate) async fn enqueue(
 
 /// One merge of the project's merge queue (spawned by the scheduler with
 /// `merge_state='merging'`).
-pub async fn run_merge(st: AppState, task: Task, cancel: CancellationToken) {
+pub async fn run_merge(st: AppState, task: Task, cancel: CancellationToken, gen: u64) {
     let id = task.id;
     let mut usage: Usage = task
         .usage
@@ -243,7 +278,7 @@ pub async fn run_merge(st: AppState, task: Task, cancel: CancellationToken) {
             requeue_merge(&st, &task, &msg).await;
         }
     }
-    st.running.lock().await.remove(&id);
+    st.untrack(id, gen).await;
     st.wake.notify_one();
 }
 
@@ -314,6 +349,11 @@ async fn merge_inner(
             "Auftrag hat keinen Branch zum Übernehmen".into(),
         ));
     };
+    // WP05: output `branch`/`pr` (and every pull-request follow-up): push
+    // the task branch instead of merging it.
+    if task.pr_id.is_some() || project.output().pushes_branch() {
+        return super::publish::publish(st, task, &project, &settings, p, usage).await;
+    }
     let env = environment::load(&st.db, project.id).await?;
     let verify = project
         .verify_command
@@ -494,7 +534,7 @@ async fn set_merge_state(st: &AppState, id: Uuid, m: MergeState) -> sqlx::Result
 
 /// Conflict or failed check after bringing the branch up to date: a real
 /// task failure (fix task continuing the changes while attempts are left).
-async fn merge_failed(
+pub(super) async fn merge_failed(
     st: &AppState,
     task: &Task,
     settings: &Settings,
@@ -589,7 +629,8 @@ async fn remove(st: &AppState, project: Uuid, id: Uuid, drop_branch: bool) {
 pub async fn sweep(st: &AppState) -> anyhow::Result<()> {
     let rows: Vec<(Uuid, Uuid, String, bool)> = sqlx::query_as(
         "SELECT id, project_id, status,
-                status IN ('done','cancelled') OR merge_state = 'merged'
+                (status IN ('done','cancelled') AND merge_state IS DISTINCT FROM 'published')
+                OR merge_state = 'merged'
                 OR finished_at < now() - make_interval(days => $2)
          FROM tasks
          WHERE branch IS NOT NULL AND NOT workspace_cleaned AND status = ANY($1)

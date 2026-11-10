@@ -1,6 +1,8 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, type APIRequestContext, type Page } from "@playwright/test";
-import { mkdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 export const uniqueEmail = (tag: string) => `${tag}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}@e2e.test`;
@@ -108,4 +110,59 @@ export async function simulateInsets(page: Page) {
     else document.addEventListener("DOMContentLoaded", add);
   }, css);
   return landscape;
+}
+
+/** WP05: fake GitHub/GitLab/Gitea of the test stack (`scripts/stack.sh`). */
+export const FAKE_HOST = `http://127.0.0.1:${process.env.E2E_FAKE_HOST_PORT ?? 18095}`;
+export const PR_TOKEN = "tok-e2e-secret-wp05";
+
+/** Bare git remote with a first commit on `main` (a local stand-in for the host's repository). */
+export function bareRemote(): string {
+  const dir = mkdtempSync(join(tmpdir(), "wp05-remote-"));
+  const bare = join(dir, "origin.git");
+  const seed = join(dir, "seed");
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-c", "user.name=Seed", "-c", "user.email=s@x", ...args], { cwd, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
+  git(dir, "init", "-q", "--bare", "-b", "main", bare);
+  git(dir, "clone", "-q", bare, seed);
+  writeFileSync(join(seed, "README.md"), "# app\n");
+  git(seed, "add", "-A");
+  git(seed, "commit", "-q", "-m", "init");
+  git(seed, "push", "-q", "origin", "HEAD:main");
+  return bare;
+}
+
+/** Project in output mode `pr` on the fake host; returns ids and the fake's repo name. */
+export async function prProject(
+  request: APIRequestContext,
+  name: string,
+  opts: { kind?: "github" | "gitlab" | "gitea"; permissions?: Record<string, unknown>; delivery?: Record<string, unknown> } = {},
+) {
+  const kind = opts.kind ?? "github";
+  const bare = bareRemote();
+  const repo = `acme/${name.toLowerCase().replace(/[^a-z0-9]/g, "")}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  const pid = await apiProject(request, { name, git_remote_url: `file://${bare}`, git_branch: "main", git_token: PR_TOKEN });
+  expect((await request.patch(`/api/projects/${pid}`, { data: { review_enabled: false } })).status()).toBe(200);
+  const api = { github: "github/api/v3", gitlab: "gitlab/api/v4", gitea: "gitea/api/v1" }[kind];
+  const d = await request.put(`/api/projects/${pid}/delivery`, {
+    data: { output_mode: "pr", git_host: kind, git_api_url: `${FAKE_HOST}/${api}`, git_repo_path: repo, ...(opts.delivery ?? {}) },
+  });
+  expect(d.status(), await d.text()).toBe(200);
+  const s = await request.post(`${FAKE_HOST}/_fake/setup`, { data: { kind, repo, token: PR_TOKEN, bare, permissions: opts.permissions ?? {} } });
+  expect(s.status()).toBe(200);
+  const control = async (path: string, body: Record<string, unknown>) => {
+    const r = await request.post(`${FAKE_HOST}/_fake/${path}`, { data: { kind, repo, ...body } });
+    expect(r.status(), await r.text()).toBe(200);
+    return r.json();
+  };
+  const state = async () => (await (await request.get(`${FAKE_HOST}/_fake/state?kind=${kind}&repo=${encodeURIComponent(repo)}`)).json()) as {
+    prs: { number: number; head: string; base: string; draft: boolean; open: boolean; labels: string[] }[];
+    requests: string[];
+  };
+  return { pid, repo, kind, bare, control, state };
+}
+
+/** The pull request of a task as the app reports it (null while there is none). */
+export async function taskPull(request: APIRequestContext, task: string) {
+  return ((await (await request.get(`/api/tasks/${task}`)).json()).pull_request ?? null) as Record<string, any> | null;
 }

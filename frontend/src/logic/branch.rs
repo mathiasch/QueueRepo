@@ -7,7 +7,7 @@ use super::labels::Tone;
 pub fn merge_tone(m: MergeState) -> Tone {
     match m {
         MergeState::Queued | MergeState::Merging => Tone::Info,
-        MergeState::Merged => Tone::Success,
+        MergeState::Merged | MergeState::Published => Tone::Success,
         MergeState::Conflict | MergeState::Failed => Tone::Danger,
     }
 }
@@ -34,6 +34,8 @@ pub fn branch_lines(t: &Task) -> Option<Vec<String>> {
     if let Some(b) = t.merge_base.as_deref() {
         let label = if t.on_target() {
             "Übernommen auf Stand"
+        } else if t.pr_id.is_some() {
+            "Gestartet auf Stand des Pull Requests"
         } else {
             "Abgezweigt von Stand"
         };

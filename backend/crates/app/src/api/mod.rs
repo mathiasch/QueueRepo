@@ -5,6 +5,7 @@ mod gate;
 pub mod limits;
 mod projects;
 mod providers;
+mod pulls;
 mod tasks;
 
 use std::convert::Infallible;
@@ -138,6 +139,16 @@ pub fn router(st: AppState) -> Router {
         .route("/tasks/{id}/gate/reject", post(gate::reject))
         .route("/tasks/{id}/gate/diff", get(gate::diff))
         .route("/projects/{id}/protection", get(gate::get).put(gate::put))
+        .route(
+            "/projects/{id}/delivery",
+            get(pulls::get_delivery).put(pulls::put_delivery),
+        )
+        .route("/projects/{id}/delivery/check", post(pulls::check_delivery))
+        .route("/projects/{id}/pulls", get(pulls::list))
+        .route("/pulls/{id}", get(pulls::get))
+        .route("/pulls/{id}/poll", post(pulls::poll_now))
+        .route("/pulls/{id}/auto-fix", post(pulls::auto_fix))
+        .route("/pulls/{id}/extra-round", post(pulls::extra_round))
         // Unknown API paths get a JSON 404 instead of the SPA's index.html.
         .fallback(|| async { AppError::not_found() });
 

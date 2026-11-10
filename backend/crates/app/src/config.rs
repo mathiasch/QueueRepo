@@ -41,6 +41,13 @@ pub struct Config {
     pub allow_private_llm_endpoints: bool,
     /// Allow `file://` / local path git remotes (tests, single-host setups).
     pub allow_local_remotes: bool,
+    /// WP05: poll interval of pull requests (env `PR_POLL_SECS`, default 60;
+    /// 0 = no background poller, only for tests that drive it themselves).
+    pub pr_poll_secs: u64,
+    /// WP05: git host APIs in loopback/private networks (self-hosted
+    /// Gitea/GitLab in the LAN; env `ALLOW_PRIVATE_GIT_HOSTS`, default off).
+    /// Also allows plain `http://` API addresses there.
+    pub allow_private_git_hosts: bool,
 }
 
 pub fn var(k: &str) -> Option<String> {
@@ -91,6 +98,8 @@ impl Config {
             batch_poll_secs: num::<u64>("BATCH_POLL_SECS", 60).max(1),
             allow_private_llm_endpoints: flag("ALLOW_PRIVATE_LLM_ENDPOINTS", false),
             allow_local_remotes: flag("ALLOW_LOCAL_GIT_REMOTES", false),
+            pr_poll_secs: num::<u64>("PR_POLL_SECS", 60),
+            allow_private_git_hosts: flag("ALLOW_PRIVATE_GIT_HOSTS", false),
             data_dir,
         })
     }
@@ -128,6 +137,9 @@ impl Config {
             // Fake provider servers listen on 127.0.0.1.
             allow_private_llm_endpoints: true,
             allow_local_remotes: true,
+            pr_poll_secs: 1,
+            // Fake git host servers listen on 127.0.0.1.
+            allow_private_git_hosts: true,
         }
     }
 
@@ -143,6 +155,14 @@ impl Config {
         crate::llm::Guard {
             allow_private: self.allow_private_llm_endpoints,
             deny: runner.into_iter().collect(),
+        }
+    }
+
+    /// SSRF guard for calls to git host APIs (never the runner).
+    pub fn git_host_guard(&self) -> crate::llm::Guard {
+        crate::llm::Guard {
+            allow_private: self.allow_private_git_hosts,
+            ..self.llm_guard()
         }
     }
 

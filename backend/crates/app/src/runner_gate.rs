@@ -31,6 +31,9 @@ pub(crate) struct Pending {
     pub approved: Vec<GateFinding>,
     /// Review verdict (kept while a push waits for its approval).
     pub review: Option<Value>,
+    /// WP05: a human approved the push of the task branch (output
+    /// `branch`/`pr`; the merge queue publishes with this approval).
+    pub push_approved: bool,
 }
 
 /// Steps of the result flow after the commit.
@@ -510,6 +513,8 @@ pub(crate) async fn push_gated(
         allow_protected: approved,
         allow: project.secret_allowlist.clone(),
         allow_secrets: approved,
+        scan_base: None,
+        expect: None,
     };
     let p = st.runner.push(project.id, &req).await?;
     if !p.held.is_empty() {
@@ -568,6 +573,43 @@ pub(crate) async fn finish_flow(
     let before = p.before.clone();
     let after = p.after.clone().unwrap_or_default();
     match &p.failure {
+        None if task.branch.is_some()
+            && (task.pr_id.is_some() || project.output().pushes_branch()) =>
+        {
+            // WP05: the merge queue pushes the task branch (and opens the
+            // pull request) instead of merging it into the target branch.
+            if push == Some(false) {
+                sqlx::query(
+                    "UPDATE tasks SET merge_state=NULL WHERE id=$1 AND merge_state <> 'published'",
+                )
+                .bind(task.id)
+                .execute(&st.db)
+                .await?;
+                event(
+                    st,
+                    task,
+                    "merge",
+                    "Nicht hochgeladen – die Änderungen bleiben auf dem Branch des Auftrags",
+                )
+                .await;
+            } else {
+                let mut p = p.clone();
+                p.push_approved = push == Some(true);
+                if super::merge::enqueue(st, task, &p, usage).await? {
+                    return Ok(());
+                }
+                event(st, task, "merge", "Keine Änderungen – nichts hochzuladen").await;
+            }
+            let end = End {
+                summary: p.summary,
+                handoff: p.handoff,
+                review,
+                usage,
+            };
+            finish_done(st, task, settings, end, p.follow_ups).await?;
+            super::merge::cleanup_task(st, project.id, task.id, false).await;
+            Ok(())
+        }
         None => {
             // WP04: the task's branch goes through the merge queue first;
             // the push (below) happens after the merge.

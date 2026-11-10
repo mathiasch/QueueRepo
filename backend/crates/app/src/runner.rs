@@ -36,6 +36,8 @@ use queued_common::{gate::GateFinding, secrets};
 mod gate;
 #[path = "runner_merge.rs"]
 pub(crate) mod merge;
+#[path = "runner_publish.rs"]
+mod publish;
 
 /// Agent-generated tasks deeper than this always need approval (loop guard).
 const MAX_AUTO_DEPTH: i32 = 3;
@@ -69,7 +71,7 @@ impl From<sqlx::Error> for RunError {
     }
 }
 
-pub async fn run_task(st: AppState, task: Task, cancel: CancellationToken) {
+pub async fn run_task(st: AppState, task: Task, cancel: CancellationToken, gen: u64) {
     let id = task.id;
     // Usage is cumulative over all runs of this task (limits are per task).
     let mut usage: Usage = task
@@ -124,7 +126,7 @@ pub async fn run_task(st: AppState, task: Task, cancel: CancellationToken) {
             .await;
         }
     }
-    st.running.lock().await.remove(&id);
+    st.untrack(id, gen).await;
     st.wake.notify_one();
 }
 
@@ -812,6 +814,7 @@ async fn run_inner(
         after: None,
         approved: vec![],
         review: None,
+        push_approved: false,
     };
     let flow = gate::Flow {
         st,
@@ -2720,6 +2723,7 @@ pub(crate) async fn complete_review(
         after: Some(p.after),
         approved: vec![],
         review: None,
+        push_approved: false,
     };
     let res = match outcome {
         Ok(r) => {
@@ -2918,6 +2922,7 @@ async fn create_followups(
                 escalation_level: 0,
                 allow_test_changes: false,
                 carry_from: None,
+                pr_id: None,
             },
         )
         .await?;
@@ -3031,6 +3036,7 @@ async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Resu
             escalation_level: level,
             allow_test_changes: false,
             carry_from,
+            pr_id: failed.pr_id,
         },
     )
     .await?;

@@ -238,6 +238,16 @@ pub async fn update(
     Json(p): Json<UpdateProject>,
 ) -> ApiResult<Json<ProjectView>> {
     require(&st, id, u.id, Role::Editor).await?;
+    // WP05: where results go and which token goes there is the owner's
+    // decision. Before, an editor could point the remote at another host
+    // while the owner's stored token was still sent along with every push.
+    if p.git_remote_url.is_some()
+        || p.git_branch.is_some()
+        || p.git_token.is_some()
+        || p.auto_push.is_some()
+    {
+        require(&st, id, u.id, Role::Owner).await?;
+    }
     if let Some(n) = p.parallelism {
         // More parallel tasks cost the owner's resources and raise conflicts.
         require(&st, id, u.id, Role::Owner).await?;
@@ -281,7 +291,20 @@ pub async fn update(
             return Err(AppError::bad_request("unknown provider"));
         }
     }
+    let current = load(&st, id).await?;
+    let host_of = |u: Option<&str>| {
+        u.and_then(queued_api::pr::remote_parts)
+            .map(|r| (r.host, r.port))
+    };
+    let new_url = p.git_remote_url.as_deref().map(str::trim);
+    // A token belongs to one server: a remote on another host without a new
+    // token drops the stored one instead of sending it there.
+    let host_changed = new_url.is_some_and(|n| {
+        let old = current.git_remote_url.as_deref();
+        Some(n) != old && (host_of(Some(n)) != host_of(old) || host_of(Some(n)).is_none())
+    });
     let (token_set, token_enc) = match p.git_token.as_deref().map(str::trim) {
+        None if host_changed => (true, None),
         None => (false, None),
         Some("") => (true, None),
         Some(t) => (
@@ -542,6 +565,8 @@ pub async fn push(
         allow_protected: true,
         allow: p.secret_allowlist.clone(),
         allow_secrets: false,
+        scan_base: None,
+        expect: None,
     };
     let r = st.runner.push(id, &req).await.map_err(runner_err)?;
     if !r.held.is_empty() {

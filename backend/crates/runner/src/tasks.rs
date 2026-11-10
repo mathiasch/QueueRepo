@@ -16,8 +16,8 @@
 //! by exact SHA, with `transfer.fsckObjects`, after `harden()`.
 use anyhow::{bail, Context, Result};
 use queued_common::{
-    gate, is_task_workspace, valid_task_branch, MergeFinish, MergeFinishResult, MergeRequest,
-    MergeResult, TaskWorkspaceRequest, TaskWorkspaceResult,
+    gate, is_task_workspace, valid_task_branch, GitRemote, MergeFinish, MergeFinishResult,
+    MergeRequest, MergeResult, TaskWorkspaceRequest, TaskWorkspaceResult,
 };
 
 use crate::git::{check_rev, run_git, run_git_code, too_large, Repo, MAX_SCAN_BYTES, SCAN_DIFF};
@@ -55,6 +55,35 @@ impl Repo {
             .with_context(|| format!("unknown commit {rev}"))?
             .trim()
             .to_string())
+    }
+
+    /// Fetches `branch` of the app's remote into `refs/queue/start/<tws>`
+    /// and returns its commit (WP05: start of a pull-request follow-up).
+    /// From the URL of the app only (never `origin`), with fsck; the token
+    /// goes into the environment of this one call.
+    async fn fetch_start(&self, r: &GitRemote, task_ws: &str) -> Result<String> {
+        crate::git::check_branch(&r.branch)?;
+        let dest = format!("refs/queue/start/{task_ws}");
+        let spec = format!("+refs/heads/{}:{dest}", r.branch);
+        self.harden().await?;
+        run_git(
+            &self.dir,
+            &FSCK.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &[
+                "fetch",
+                "-q",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--no-recurse-submodules",
+                "--",
+                &r.url,
+                &spec,
+            ],
+            Some(r),
+        )
+        .await
+        .with_context(|| format!("Branch {} des Remotes nicht abrufbar", r.branch))?;
+        self.commit_of(&dest).await
     }
 
     async fn has_ref(&self, r: &str) -> bool {
@@ -257,7 +286,12 @@ impl Repo {
                 warnings,
             });
         }
-        let target = self.head().await?;
+        // WP05: a pull-request follow-up starts on the current state of the
+        // pull request's branch on the host (people may have pushed to it).
+        let target = match &req.start {
+            Some(r) => self.fetch_start(r, task_ws).await?,
+            None => self.head().await?,
+        };
         let mut res = TaskWorkspaceResult {
             created: true,
             warnings,
@@ -531,6 +565,7 @@ impl Repo {
                 format!("refs/queue/merge/{task_ws}"),
                 format!("refs/queue/tasks/{task_ws}"),
                 format!("refs/queue/export/{task_ws}"),
+                format!("refs/queue/start/{task_ws}"),
             ];
             if let Some(b) = branch {
                 refs.push(format!("refs/heads/{b}"));

@@ -59,6 +59,15 @@ pub struct Project {
     pub secret_allowlist: Vec<String>,
     /// WP04: tasks of this project at the same time.
     pub parallelism: i32,
+    /// WP05: delivery (`commit` | `branch` | `pr`, CHECK in the database).
+    pub output_mode: String,
+    pub git_host: Option<String>,
+    pub git_api_url: Option<String>,
+    pub git_repo_path: Option<String>,
+    pub pr_draft: bool,
+    pub pr_labels: Vec<String>,
+    pub pr_auto_fix: bool,
+    pub pr_max_followups: i32,
 }
 
 impl Project {
@@ -73,6 +82,20 @@ impl Project {
         self.protected_paths
             .clone()
             .unwrap_or_else(queued_api::gate::default_protected)
+    }
+
+    pub fn output(&self) -> queued_api::pr::OutputMode {
+        queued_api::pr::OutputMode::parse(&self.output_mode).unwrap_or_default()
+    }
+
+    /// Chosen or detected git host.
+    pub fn host(&self) -> Option<queued_api::pr::GitHost> {
+        self.git_host
+            .as_deref()
+            .and_then(queued_api::pr::GitHost::parse)
+            .or_else(|| {
+                queued_api::pr::detect_host(self.git_remote_url.as_deref().unwrap_or_default())
+            })
     }
 
     pub fn residency(&self) -> Residency {
@@ -105,6 +128,7 @@ impl Project {
             routing: self.routing(),
             data_residency: self.residency(),
             parallelism: self.parallelism,
+            output_mode: self.output(),
         }
     }
 }

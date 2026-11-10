@@ -48,6 +48,7 @@ fn req(branch: &str) -> TaskWorkspaceRequest {
         merge_base: None,
         carry: None,
         allow: vec![],
+        start: None,
     }
 }
 
@@ -686,4 +687,90 @@ async fn broken_task_workspace_is_rebuilt_from_its_branch() {
         base,
         "main repository untouched"
     );
+}
+
+/// WP05: a pull-request follow-up starts on the state of the pull request's
+/// branch on the host (including commits people pushed there), and a carry
+/// is applied on top of that state, not on the target branch.
+#[tokio::test]
+async fn pull_request_follow_up_starts_on_the_remote_branch() {
+    let (t, main) = main_repo().await;
+    let bare = t.path().join("remote.git");
+    run_git(
+        t.path(),
+        &[],
+        &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()],
+        None,
+    )
+    .await
+    .unwrap();
+    let url = bare.to_string_lossy().to_string();
+    // The pull request branch on the host: base + a human's commit.
+    let base = main.head().await.unwrap();
+    main.git(&["push", "-q", "--", &url, &format!("{base}:refs/heads/main")])
+        .await
+        .unwrap();
+    let human = t.path().join("human");
+    agent_git(t.path(), &["clone", "-q", &url, human.to_str().unwrap()]);
+    agent_git(&human, &["checkout", "-q", "-b", BRANCH_A]);
+    std::fs::write(human.join("human.txt"), "pushed on the host\n").unwrap();
+    agent_git(&human, &["add", "-A"]);
+    agent_git(&human, &["commit", "-q", "-m", "human"]);
+    agent_git(&human, &["push", "-q", "origin", BRANCH_A]);
+    let pr_head = agent_git(&human, &["rev-parse", "HEAD"]);
+    // Meanwhile the target branch of the main repository moved on.
+    std::fs::write(main.dir.join("other.txt"), "x\n").unwrap();
+    main.commit("other", "Me", "me@x").await.unwrap();
+
+    let b = Repo::new(t.path(), B);
+    let mut rq = req(BRANCH_B);
+    rq.start = Some(GitRemote {
+        url: url.clone(),
+        branch: BRANCH_A.into(),
+        token: None,
+    });
+    let r = main.prepare_task(&b, B, &rq, KEY).await.unwrap();
+    assert_eq!(r.head, pr_head, "starts on the pull request's head");
+    assert_eq!(r.merge_base, pr_head);
+    assert!(b.dir.join("human.txt").exists());
+    assert!(
+        !b.dir.join("other.txt").exists(),
+        "not on the target branch"
+    );
+    // The start ref is cleaned up with the working tree.
+    main.remove_task(&b, B, None).await.unwrap();
+    assert!(!main.has_ref(&format!("refs/queue/start/{B}")).await);
+
+    // A carry (fix of a follow-up) lands on the pull request's state.
+    let a = Repo::new(t.path(), A);
+    let mut ra = req(BRANCH_A);
+    ra.start = rq.start.clone();
+    main.prepare_task(&a, A, &ra, KEY).await.unwrap();
+    let tip = work(&a, "fix.txt", "fix\n").await;
+    main.sync_task(&a, A, BRANCH_A, &tip).await.unwrap();
+    let mut rc = req(BRANCH_B);
+    rc.start = rq.start.clone();
+    rc.carry = Some(Carry {
+        base: pr_head.clone(),
+        tip: tip.clone(),
+        label: "carried".into(),
+    });
+    let r = main.prepare_task(&b, B, &rc, KEY).await.unwrap();
+    assert_eq!(r.merge_base, pr_head);
+    assert!(r.carried.is_some());
+    assert!(b.dir.join("fix.txt").exists() && b.dir.join("human.txt").exists());
+    assert!(!b.dir.join("other.txt").exists());
+    // A missing branch is an error, not a silent fallback to the target.
+    let c = Repo::new(t.path(), &format!("t{}", "c".repeat(32)));
+    let mut rm = req(&format!("queue/{}", "c".repeat(12)));
+    rm.start = Some(GitRemote {
+        url,
+        branch: "queue/doesnotexist".into(),
+        token: None,
+    });
+    let err = main
+        .prepare_task(&c, &format!("t{}", "c".repeat(32)), &rm, KEY)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("nicht abrufbar"), "{err:#}");
 }

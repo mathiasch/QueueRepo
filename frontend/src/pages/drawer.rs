@@ -40,6 +40,7 @@ pub fn TaskDrawer(id: Uuid) -> impl IntoView {
     let store = use_store();
     let close = use_close_task();
     let fetched = RwSignal::new(None::<Task>);
+    let pull = RwSignal::new(None::<queued_api::pr::PullRequestView>);
     let events = RwSignal::new(Vec::<TaskEvent>::new());
     let loaded = RwSignal::new(false);
     let diff = RwSignal::new(None::<String>);
@@ -56,6 +57,7 @@ pub fn TaskDrawer(id: Uuid) -> impl IntoView {
             match api::get::<TaskDetail>(&format!("/tasks/{id}")).await {
                 Ok(d) => {
                     fetched.set(Some(d.task));
+                    pull.set(d.pull_request);
                     events.update(|evs| {
                         let live = std::mem::take(evs);
                         *evs = d.events;
@@ -171,6 +173,8 @@ pub fn TaskDrawer(id: Uuid) -> impl IntoView {
                             Some(ed) => Some(view! { <EditForm id=id ed=ed editing=editing/> }.into_any()),
                             None => task.get().map(|t| view! { <Details t=t/> }.into_any()),
                         }}
+                        // Outside `Details`: it keeps its own state and refreshes itself.
+                        {move || pull.get().map(|p| view! { <super::pr::PrBlock pr=p/> })}
                         {move || diff.get().map(|d| view! { <DiffBlock diff=d/> })}
                         <LogBlock t=task events=events/>
                     </div>

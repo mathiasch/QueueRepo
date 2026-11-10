@@ -86,6 +86,12 @@ export async function tour(page: Page, info: TestInfo, device: string, full: boo
     await expect(page.getByTestId("project-routing").getByTestId("preset-balanced")).toBeVisible();
     await expectAccessible(page, `project settings (${scheme})`);
     await shot(page, out, `${device}-${scheme}-project-settings`, device === "desktop");
+    // WP05: delivery settings (output mode, git host access).
+    await page.getByRole("tab", { name: "Ergebnis" }).click();
+    await expect(page.getByTestId("delivery-form")).toBeVisible();
+    await expect(page.getByTestId("who-pushes")).toBeVisible();
+    await expectAccessible(page, `project delivery (${scheme})`);
+    await shot(page, out, `${device}-${scheme}-project-delivery`, device === "desktop");
     // WP02: environment editor with the network presets expanded.
     await page.getByRole("tab", { name: "Umgebung" }).click();
     await expect(page.getByTestId("sandbox-status")).toContainText("nicht durchgesetzt");

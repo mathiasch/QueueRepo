@@ -620,17 +620,21 @@ async fn push(
         allow: &req.allow,
         allow_secrets: req.allow_secrets,
         key: st.scan_key(),
+        scan_base: req.scan_base.as_deref(),
+        expect: req.expect.as_deref(),
     };
     Ok(Json(match repo.push_checked(&req.remote, &opt).await {
         Ok(o) => PushResult {
-            ok: o.held.is_empty(),
+            ok: o.held.is_empty() && !o.moved,
             output: o.output,
             held: o.held,
+            moved: o.moved,
         },
         Err(e) => PushResult {
             ok: false,
             output: format!("{e:#}"),
             held: vec![],
+            moved: false,
         },
     }))
 }
@@ -870,6 +874,7 @@ mod tests {
             merge_base: None,
             carry: None,
             allow: vec![],
+            start: None,
         };
         let post = |path: String| {
             c.post(format!("{a}/v1/workspaces/{path}"))

@@ -152,6 +152,14 @@ pub(crate) mod tests {
             setup_guard: true,
             secret_allowlist: vec![],
             parallelism: 1,
+            output_mode: "commit".into(),
+            git_host: None,
+            git_api_url: None,
+            git_repo_path: None,
+            pr_draft: true,
+            pr_labels: vec![],
+            pr_auto_fix: true,
+            pr_max_followups: 3,
         }
     }
 
@@ -202,6 +210,7 @@ pub(crate) mod tests {
             merge_state: None,
             merge_queued_at: None,
             carry_from: None,
+            pr_id: None,
         }
     }
 

@@ -157,9 +157,9 @@ async fn tick(st: &AppState) -> Result<()> {
     }
     while let Some(task) = claim_merge(&st.db).await? {
         let token = CancellationToken::new();
-        st.running.lock().await.insert(task.id, token.clone());
+        let gen = st.track(task.id, token.clone()).await;
         queue::emit_task(st, task.id).await;
-        tokio::spawn(runner::merge::run_merge(st.clone(), task, token));
+        tokio::spawn(runner::merge::run_merge(st.clone(), task, token, gen));
     }
     Ok(())
 }
@@ -336,9 +336,9 @@ pub async fn claim_merge(db: &sqlx::PgPool) -> Result<Option<Task>> {
 
 async fn spawn(st: &AppState, task: Task) {
     let token = CancellationToken::new();
-    st.running.lock().await.insert(task.id, token.clone());
+    let gen = st.track(task.id, token.clone()).await;
     queue::emit_task(st, task.id).await;
-    tokio::spawn(runner::run_task(st.clone(), task, token));
+    tokio::spawn(runner::run_task(st.clone(), task, token, gen));
 }
 
 /// OnEmptyQueue: runs only if the queue is truly idle, nothing waits for the
@@ -444,6 +444,7 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
             escalation_level: 0,
             allow_test_changes: false,
             carry_from: None,
+            pr_id: None,
         },
     )
     .await?;
