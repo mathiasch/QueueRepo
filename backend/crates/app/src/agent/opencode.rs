@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 
 use super::{
     classify::ErrorCategory, error_event, n, s, tool_summary, trunc, usd, AgentEvent, ConnCfg,
-    Credential, Invocation, ParseState,
+    Credential, Invocation, ParseState, RunKind, Session,
 };
 use crate::models::Usage;
 
@@ -60,6 +60,8 @@ pub(super) fn invocation(
     inv: &mut Invocation,
     model: Option<&str>,
     cred: &Credential,
+    kind: RunKind,
+    session: &Session,
 ) -> Result<()> {
     let Some(c) = &cred.conn else {
         bail!("opencode braucht einen Zugang (Connector)");
@@ -83,6 +85,14 @@ pub(super) fn invocation(
         "--model".into(),
         model_ref,
     ];
+    // WP06: built-in agent `plan` ("Plan mode. Disallows all edit tools") and
+    // `--session <id>` ("session id to continue") – 1.19.5 binary, not executed.
+    if kind == RunKind::Plan {
+        inv.args.extend(["--agent".into(), "plan".into()]);
+    }
+    if let Session::Resume(id) = session {
+        inv.args.extend(["--session".into(), id.clone()]);
+    }
     inv.env
         .push(("OPENCODE_CONFIG_CONTENT".into(), config.to_string()));
     inv.env
@@ -301,9 +311,11 @@ mod tests {
             r#"{"type":"text","timestamp":1,"sessionID":"s","part":{"type":"text","text":"Fertig."}}"#,
             &mut st,
         );
+        // WP06: the session id comes first, once per session.
         assert_eq!(
             ev,
             vec![
+                AgentEvent::Session("s".into()),
                 AgentEvent::Text("Fertig.".into()),
                 AgentEvent::Final("Fertig.".into())
             ]

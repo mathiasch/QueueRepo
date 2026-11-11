@@ -3,6 +3,7 @@
 pub mod b64;
 pub mod branch;
 pub mod budget;
+pub mod comments;
 pub mod costs;
 pub mod diff;
 pub mod env;

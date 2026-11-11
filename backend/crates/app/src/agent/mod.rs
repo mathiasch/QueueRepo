@@ -153,6 +153,72 @@ pub struct Invocation {
 pub enum RunKind {
     Agent,
     Review,
+    /// WP06 plan run: the CLI's plan/read-only mode, result = [`crate::models::PlanResult`].
+    Plan,
+}
+
+/// CLI session of a run (WP06).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Session {
+    /// No session handling (review, legacy behaviour).
+    #[default]
+    None,
+    /// A new session; CLIs that accept an id get this one.
+    Start(String),
+    /// Continue this session (steering, "Weiter mit …").
+    Resume(String),
+}
+
+/// A session id from the stream before it reaches a command line: never an
+/// option (`-…`), only id characters.
+pub fn valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 200
+        && !id.starts_with('-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+}
+
+/// The CLI accepts an id for a new session (else it reports its own).
+pub fn session_id_settable(provider: &str) -> bool {
+    matches!(provider, "claude" | "gemini" | "mock")
+}
+
+/// Home-relative session files to persist between runs and names never
+/// persisted (credentials, configuration, Claude's auto-memory), see
+/// `runner/src/sessions.rs`. Paths per CLI: docs/roadmap/WP06-plan.md §2.2.
+pub fn session_files(provider: &str) -> Option<(Vec<String>, Vec<String>)> {
+    let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let (paths, exclude) = match provider {
+        "claude" => (
+            v(&[".claude/projects"]),
+            v(&["memory", ".credentials.json"]),
+        ),
+        "codex" => (
+            v(&[".codex/sessions", ".codex/state_*", ".codex/codex.sqlite*"]),
+            v(&["auth.json", "config.toml"]),
+        ),
+        "gemini" => (
+            v(&[".gemini/tmp", ".gemini/projects.json", ".gemini/history"]),
+            v(&[
+                "oauth_creds.json",
+                "settings.json",
+                ".env",
+                "google_accounts.json",
+            ]),
+        ),
+        "opencode" => (
+            v(&[
+                ".local/share/opencode/storage",
+                ".local/share/opencode/opencode*",
+            ]),
+            v(&["auth.json"]),
+        ),
+        "mock" => (v(&[".mock-sessions"]), vec![]),
+        _ => return None,
+    };
+    Some((paths, exclude))
 }
 
 /// Limits handed to the CLI itself (where it supports them).
@@ -251,6 +317,8 @@ pub enum AgentEvent {
     Structured(Value),
     /// The CLI retries a provider request itself (informational only).
     Retry(RetryInfo),
+    /// Id of the CLI session (WP06), validated with [`valid_session_id`].
+    Session(String),
     /// Terminal provider/CLI error with a recognised category.
     Failure {
         category: ErrorCategory,
@@ -276,6 +344,8 @@ pub struct ParseState {
     last_retry: Option<ErrorCategory>,
     /// Codex: usage summed over `turn.completed` events.
     total: Usage,
+    /// Session id already reported.
+    session: Option<String>,
 }
 
 /// Exit code with which Gemini reports its session turn limit.
@@ -364,6 +434,23 @@ pub fn invocation(
     limits: &RunLimits,
     kind: RunKind,
 ) -> Result<Invocation> {
+    invocation_with(provider, model, cred, limits, kind, &Session::None)
+}
+
+/// [`invocation`] with a CLI session (start with an id, or resume).
+pub fn invocation_with(
+    provider: &str,
+    model: Option<&str>,
+    cred: &Credential,
+    limits: &RunLimits,
+    kind: RunKind,
+    session: &Session,
+) -> Result<Invocation> {
+    if let Session::Start(id) | Session::Resume(id) = session {
+        if !valid_session_id(id) {
+            bail!("ungültige Sitzungs-ID");
+        }
+    }
     let mut inv = Invocation {
         program: String::new(),
         args: vec![],
@@ -374,11 +461,11 @@ pub fn invocation(
         home_env: vec![],
     };
     match provider {
-        "claude" => claude::invocation(&mut inv, model, cred, limits, kind)?,
-        "codex" => codex::invocation(&mut inv, model, cred, kind)?,
-        "gemini" => gemini::invocation(&mut inv, model, cred, limits)?,
-        "opencode" => opencode::invocation(&mut inv, model, cred)?,
-        "mock" => mock::invocation(&mut inv, limits),
+        "claude" => claude::invocation(&mut inv, model, cred, limits, kind, session)?,
+        "codex" => codex::invocation(&mut inv, model, cred, kind, session)?,
+        "gemini" => gemini::invocation(&mut inv, model, cred, limits, kind, session)?,
+        "opencode" => opencode::invocation(&mut inv, model, cred, kind, session)?,
+        "mock" => mock::invocation(&mut inv, limits, kind, session),
         p => bail!("unknown provider {p}"),
     }
     Ok(inv)
@@ -526,19 +613,225 @@ pub fn parse_line(provider: &str, line: &str, st: &mut ParseState) -> Vec<AgentE
             vec![AgentEvent::Text(trunc(line, 2000))]
         };
     };
-    match provider {
+    let mut out = vec![];
+    let id = match provider {
+        "claude" if s(&v, "type") == "system" && s(&v, "subtype") == "init" => s(&v, "session_id"),
+        "codex" if s(&v, "type") == "thread.started" => s(&v, "thread_id"),
+        "gemini" if s(&v, "type") == "init" => s(&v, "session_id"),
+        "opencode" => s(&v, "sessionID"),
+        "mock" if s(&v, "type") == "session" => s(&v, "id"),
+        _ => String::new(),
+    };
+    if valid_session_id(&id) && st.session.as_deref() != Some(id.as_str()) {
+        st.session = Some(id.clone());
+        out.push(AgentEvent::Session(id));
+    }
+    out.extend(match provider {
         "claude" => claude::parse(&v, st),
         "codex" => codex::parse(&v, st),
         "gemini" => gemini::parse(&v, st),
         "opencode" => opencode::parse(&v, st),
         "mock" => mock::parse(&v),
         _ => vec![],
-    }
+    });
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cred(kind: &str) -> Credential {
+        Credential::legacy(kind, "secret-value")
+    }
+
+    #[test]
+    fn plan_mode_and_sessions_per_cli() {
+        let none = RunLimits::default();
+        let start = Session::Start("11111111-2222-4333-8444-555555555555".into());
+        let resume = Session::Resume("abc-123".into());
+        let args = |p: &str, k: &str, kind: RunKind, s: &Session| {
+            let mut c = cred(k);
+            if p == "opencode" {
+                c.conn = Some(ConnCfg {
+                    id: None,
+                    kind: "mistral".into(),
+                    label: "M".into(),
+                    config: serde_json::json!({}),
+                    flex: false,
+                });
+            }
+            invocation_with(p, Some("m"), &c, &none, kind, s).unwrap()
+        };
+        // Claude: plan permission mode + plan schema; own session ids; resume.
+        let i = args("claude", "api_key", RunKind::Plan, &start);
+        let j = i.args.join(" ");
+        assert!(
+            j.contains("--permission-mode plan") && !j.contains("bypassPermissions"),
+            "{j}"
+        );
+        assert!(j.contains(crate::models::PLAN_SCHEMA));
+        assert!(j.contains("--session-id 11111111-2222-4333-8444-555555555555"));
+        let j = args("claude", "api_key", RunKind::Agent, &resume)
+            .args
+            .join(" ");
+        assert!(
+            j.contains("--permission-mode bypassPermissions") && j.contains("--resume abc-123"),
+            "{j}"
+        );
+        assert!(!j.contains("--session-id"));
+        // Codex: plan schema file, resume subcommand before the stdin prompt.
+        let i = args("codex", "api_key", RunKind::Plan, &resume);
+        assert!(i
+            .queue_files
+            .iter()
+            .any(|(n, c)| n == "plan.schema.json" && c == crate::models::PLAN_SCHEMA));
+        let n = i.args.len();
+        assert_eq!(&i.args[n - 3..], ["resume", "abc-123", "-"], "{:?}", i.args);
+        assert!(!args("codex", "api_key", RunKind::Agent, &start)
+            .args
+            .contains(&"resume".to_string()));
+        // Gemini: approval mode plan instead of yolo; session id / resume.
+        let j = args("gemini", "api_key", RunKind::Plan, &start)
+            .args
+            .join(" ");
+        assert!(
+            j.contains("--approval-mode plan") && !j.contains("--yolo"),
+            "{j}"
+        );
+        assert!(j.contains("--session-id 11111111-2222-4333-8444-555555555555"));
+        let j = args("gemini", "api_key", RunKind::Agent, &resume)
+            .args
+            .join(" ");
+        assert!(
+            j.contains("--yolo") && j.contains("--resume abc-123"),
+            "{j}"
+        );
+        // opencode: plan agent, --session.
+        let j = args("opencode", "api_key", RunKind::Plan, &resume)
+            .args
+            .join(" ");
+        assert!(
+            j.contains("--agent plan") && j.contains("--session abc-123"),
+            "{j}"
+        );
+        assert!(!args("opencode", "api_key", RunKind::Agent, &Session::None)
+            .args
+            .join(" ")
+            .contains("--agent"));
+        // Mock: environment.
+        let i = args("mock", "none", RunKind::Plan, &resume);
+        assert!(i.env.contains(&("QUEUE_PLAN_MODE".into(), "1".into())));
+        assert!(i.env.contains(&("QUEUE_RESUME".into(), "abc-123".into())));
+        // No session: no session flags at all (the review run).
+        for p in ["claude", "gemini"] {
+            let j = args(p, "api_key", RunKind::Review, &Session::None)
+                .args
+                .join(" ");
+            assert!(
+                !j.contains("--resume") && !j.contains("--session-id"),
+                "{j}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_ids_from_the_stream_never_become_options() {
+        for ok in [
+            "8bf957ce-8666-4193-8764-42ac12ccb8c2",
+            "ses_01ABC",
+            "t-1",
+            "a.b:c",
+        ] {
+            assert!(valid_session_id(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "--dangerously-skip-permissions",
+            "-r",
+            "a b",
+            "a;b",
+            "a/b",
+            &"x".repeat(201),
+        ] {
+            assert!(!valid_session_id(bad), "{bad}");
+        }
+        let c = cred("api_key");
+        let none = RunLimits::default();
+        assert!(invocation_with(
+            "claude",
+            None,
+            &c,
+            &none,
+            RunKind::Agent,
+            &Session::Resume("--x".into())
+        )
+        .is_err());
+        // A malicious id in the stream is ignored.
+        let mut st = ParseState::default();
+        let ev = parse_line(
+            "codex",
+            r#"{"type":"thread.started","thread_id":"--evil"}"#,
+            &mut st,
+        );
+        assert!(ev.is_empty(), "{ev:?}");
+    }
+
+    #[test]
+    fn session_ids_are_reported_once_per_cli() {
+        let cases = [
+            (
+                "claude",
+                r#"{"type":"system","subtype":"init","session_id":"s-claude","tools":[]}"#,
+                "s-claude",
+            ),
+            (
+                "codex",
+                r#"{"type":"thread.started","thread_id":"01a1b29c-44c6-7e01-9583-7f7215f3aa4b"}"#,
+                "01a1b29c-44c6-7e01-9583-7f7215f3aa4b",
+            ),
+            (
+                "gemini",
+                r#"{"type":"init","timestamp":"x","session_id":"g-1","model":"auto"}"#,
+                "g-1",
+            ),
+            (
+                "opencode",
+                r#"{"type":"step_start","sessionID":"ses_1","part":{}}"#,
+                "ses_1",
+            ),
+            ("mock", r#"{"type":"session","id":"mock-1"}"#, "mock-1"),
+        ];
+        for (p, line, id) in cases {
+            let mut st = ParseState::default();
+            let ev = parse_line(p, line, &mut st);
+            assert_eq!(ev.first(), Some(&AgentEvent::Session(id.into())), "{p}");
+            let again = parse_line(p, line, &mut st);
+            assert!(
+                !again.contains(&AgentEvent::Session(id.into())),
+                "{p} twice"
+            );
+        }
+        // Session files are allow-listed per CLI and never contain credentials.
+        for p in ["claude", "codex", "gemini", "opencode", "mock"] {
+            let (paths, exclude) = session_files(p).unwrap();
+            assert!(
+                paths.iter().all(|x| queued_common::valid_session_path(x)),
+                "{p}"
+            );
+            assert!(
+                !paths
+                    .iter()
+                    .any(|x| x.ends_with("auth.json") || x.ends_with("oauth_creds.json")),
+                "{p}"
+            );
+            if p != "mock" {
+                assert!(!exclude.is_empty(), "{p}");
+            }
+        }
+        assert!(session_files("unknown").is_none());
+        assert!(session_id_settable("claude") && !session_id_settable("codex"));
+    }
 
     #[test]
     fn repo_config_is_restricted_per_cli() {

@@ -68,6 +68,12 @@ async fn main() -> Result<()> {
             None => 15,
         },
         egress: std::sync::Arc::new(egress_cfg),
+        session_ttl_days: match var("RUNNER_SESSION_TTL_DAYS") {
+            Some(v) => v
+                .parse()
+                .context("RUNNER_SESSION_TTL_DAYS must be a number of days")?,
+            None => queued_runner::sessions::DEFAULT_TTL_DAYS,
+        },
     };
     if cfg.kill_grace_secs > 60 {
         // The app's exec HTTP timeout allows for at most 60 s of grace.

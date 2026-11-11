@@ -160,6 +160,8 @@ pub(crate) mod tests {
             pr_labels: vec![],
             pr_auto_fix: true,
             pr_max_followups: 3,
+            plan_mode: false,
+            plan_auto_approve_mins: None,
         }
     }
 
@@ -211,6 +213,14 @@ pub(crate) mod tests {
             merge_queued_at: None,
             carry_from: None,
             pr_id: None,
+            plan_mode: false,
+            plan_state: None,
+            plan_revision: 0,
+            plan_feedback: None,
+            plan_meta: None,
+            agent_session: None,
+            session_from: None,
+            steer_rounds: 0,
         }
     }
 

@@ -205,6 +205,56 @@ pub struct ExecRequest {
     /// process sees (container or host).
     #[serde(default)]
     pub home_env: Vec<(String, String)>,
+    /// WP06 plan runs: the process must not change the workspace. Containers
+    /// mount it read-only; every engine compares the whole tree (including
+    /// `.git` and ignored files) before and after the run and reports
+    /// differences in [`ExecFrame::Exit::changed`].
+    #[serde(default)]
+    pub read_only: bool,
+    /// WP06: persisted CLI session files (resume across runs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionSpec>,
+}
+
+/// CLI session files kept between runs of a task (WP06). The runner copies
+/// the store `sessions/<scope>/<key>` (or `seed` when that is empty) into the
+/// fresh `$HOME` before the request's `home_files` are written, and the
+/// allowed `paths` back after the run. Only regular files and directories,
+/// never symlinks, never names in `exclude`, bounded in size.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SessionSpec {
+    /// Project (main workspace id) the session belongs to: removed with it.
+    pub scope: String,
+    /// Store of this run (the task's workspace id).
+    pub key: String,
+    /// Store to start from when `key` has none yet (continuation of another task).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<String>,
+    /// Home-relative directories or files to persist. The last component may
+    /// end in `*` (prefix match, e.g. `.codex/state*`).
+    pub paths: Vec<String>,
+    /// File or directory names never persisted (credentials, configuration).
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+/// Most changed paths a read-only run reports (the rest is counted).
+pub const MAX_CHANGED_REPORTED: usize = 50;
+
+/// `SessionSpec::paths` entry: relative, no `..`, at most one `*` at the
+/// end of the last component.
+pub fn valid_session_path(p: &str) -> bool {
+    if p.is_empty() || p.len() > 200 || p.starts_with('/') || p.contains('\\') {
+        return false;
+    }
+    let parts: Vec<&str> = p.split('/').collect();
+    parts.iter().enumerate().all(|(i, c)| {
+        let star = c.matches('*').count();
+        !c.is_empty()
+            && *c != "."
+            && *c != ".."
+            && (star == 0 || (star == 1 && c.ends_with('*') && i == parts.len() - 1 && c.len() > 1))
+    })
 }
 
 /// Dependency cache of a setup run. The runner derives the key from
@@ -266,6 +316,14 @@ pub enum ExecFrame {
         /// Secret values found in files after the run (`"NAME in path"`).
         #[serde(default)]
         leaks: Vec<String>,
+        /// WP06 read-only runs: workspace paths that differ after the run
+        /// (at most [`MAX_CHANGED_REPORTED`]) and the total count. A
+        /// comparison that could not be completed counts as a change
+        /// (path `"(Prüfung unvollständig)"`).
+        #[serde(default)]
+        changed: Vec<String>,
+        #[serde(default)]
+        changed_total: usize,
     },
     /// Decision of the egress proxy for one connection/request.
     Egress {
@@ -493,6 +551,8 @@ mod tests {
                     hit: true,
                 }),
                 leaks: vec!["T in .npmrc".into()],
+                changed: vec![],
+                changed_total: 0,
             },
             ExecFrame::Exit {
                 success: false,
@@ -504,6 +564,8 @@ mod tests {
                 killed: true,
                 cache: None,
                 leaks: vec![],
+                changed: vec![],
+                changed_total: 0,
             },
             ExecFrame::Egress {
                 host: "x.com".into(),
@@ -552,6 +614,8 @@ mod tests {
                 killed: false,
                 cache: None,
                 leaks: vec![],
+                changed: vec![],
+                changed_total: 0,
             }
         );
     }
@@ -631,6 +695,29 @@ mod tests {
         }
         let c = CacheSpec::default();
         assert!(!serde_json::to_string(&c).unwrap().contains("scope"));
+    }
+
+    #[test]
+    fn session_paths_are_relative_and_star_only_at_the_end() {
+        for ok in [
+            ".claude/projects",
+            ".codex/state*",
+            ".local/share/opencode/opencode*",
+            "a",
+        ] {
+            assert!(valid_session_path(ok), "{ok}");
+        }
+        for bad in [
+            "", "/etc", "../x", "a/../b", "a/./b", "*", "a/*b", "a*/b", "a//b", "a\\b", "a**",
+        ] {
+            assert!(!valid_session_path(bad), "{bad}");
+        }
+        // Old peers without the WP06 fields still deserialize.
+        let r: ExecRequest = serde_json::from_value(serde_json::json!({
+            "name": "n", "workspace": "w", "program": "p", "timeout_secs": 1
+        }))
+        .unwrap();
+        assert!(!r.read_only && r.session.is_none());
     }
 
     #[test]

@@ -36,8 +36,12 @@ use queued_common::{gate::GateFinding, secrets};
 mod gate;
 #[path = "runner_merge.rs"]
 pub(crate) mod merge;
+#[path = "runner_plan.rs"]
+pub(crate) mod plan;
 #[path = "runner_publish.rs"]
 mod publish;
+#[path = "runner_steer.rs"]
+mod steer;
 
 /// Agent-generated tasks deeper than this always need approval (loop guard).
 const MAX_AUTO_DEPTH: i32 = 3;
@@ -124,6 +128,10 @@ pub async fn run_task(st: AppState, task: Task, cancel: CancellationToken, gen: 
                 matches!(s.as_str(), "done" | "cancelled"),
             )
             .await;
+            // WP06: messages that never reached the agent.
+            if let Err(e) = crate::steer::settle(&st, id).await {
+                tracing::warn!("task {id}: messages not settled: {e:#}");
+            }
         }
     }
     st.untrack(id, gen).await;
@@ -278,6 +286,15 @@ pub(crate) struct RunOutcome {
     pub stderr_tail: String,
     /// Money cost of the run (catalog prices; CLI dollars only as fallback).
     pub step_cost: Option<StepCost>,
+    /// WP06: id of the CLI session (from the stream).
+    pub session_id: Option<String>,
+    /// Stopped by "Sofort zustellen" (not by the user's cancel or a guard).
+    pub steered: bool,
+    /// Tool calls seen (a resume that failed before doing anything has none).
+    pub tools: usize,
+    /// Read-only run: paths it changed anyway (discarded) and their count.
+    pub changed: Vec<String>,
+    pub changed_total: usize,
 }
 
 impl RunOutcome {
@@ -632,6 +649,7 @@ async fn run_inner(
         author_name: &author_name,
         author_email: &author_email,
         allow: &project.secret_allowlist,
+        no_commit: false,
     };
     // Approved gate (WP03): continue where the task was held.
     if let Some(g) = task.gate_parsed().filter(|g| g.resume.is_some()) {
@@ -682,6 +700,28 @@ async fn run_inner(
         return Ok(());
     }
 
+    // WP06 plan mode: a plan a human approves before anything changes.
+    if crate::plan::pending(task) {
+        if let Some(r) = routing
+            .as_ref()
+            .filter(|r| matches!(r.plan.mode, StepMode::Sync | StepMode::Batch))
+        {
+            if defer_single(st, task, &project, &settings, r, "plan", &r.plan, usage).await? {
+                crate::plan::mark_planning(st, task.id).await?;
+                return Ok(());
+            }
+            // No access for the single-shot step: the agent plans itself.
+        }
+        let commits = Committer {
+            no_commit: true,
+            ..commits
+        };
+        return plan::run(
+            st, task, &project, &env, &lim, &acc, remote, &commits, cancel, usage,
+        )
+        .await;
+    }
+
     // Single-shot steps before the agent loop (plan) or instead of it (analysis).
     if let Some(r) = &routing {
         let step = if task.kind == "task" && task.plan.is_none() {
@@ -728,38 +768,97 @@ async fn run_inner(
     if gate::check_agent_config(st, task, &project, &acc.provider, usage).await? {
         return Ok(());
     }
-    let prompt = build_prompt(st, task, &project, &settings).await?;
-    let meter = meter_for(
-        st,
-        &acc,
-        task.model.as_deref(),
+    let step = if task.kind == "onempty" {
+        "analyze"
+    } else {
+        "execute"
+    };
+    // WP06: the CLI session survives between the task's runs (steering,
+    // "Weiter mit …"); OnEmpty analyses keep none.
+    let store = (task.kind != "onempty")
+        .then(|| steer::store_spec(task, &project, &acc.provider))
+        .flatten();
+    let first = if task.kind == "onempty" {
+        steer::First {
+            session: agent::Session::None,
+            prompt: build_prompt(st, task, &project, &settings).await?,
+            resumed: false,
+            claimed: vec![],
+        }
+    } else {
+        steer::first_run(st, task, &project, &acc.provider).await?
+    };
+    let (mut session, mut resumed, mut claimed) = (first.session, first.resumed, first.claimed);
+    let mut next_prompt = first.prompt;
+    let mut clear_result = false;
+    let mut fell_back = false;
+    let out = loop {
+        let meter = meter_for(st, &acc, task.model.as_deref(), step).await;
+        // "Sofort zustellen" is possible while the agent itself runs.
+        let steer_tok = (task.kind != "onempty").then(|| st.steer_arm(task.id));
+        let out = agent_run(
+            st,
+            task,
+            RunSpec {
+                provider: &acc.provider,
+                model: task.model.as_deref(),
+                cred: &acc.cred,
+                prompt: std::mem::take(&mut next_prompt),
+                kind: RunKind::Agent,
+                label: "agent",
+                limits: &lim,
+                used_before: usage,
+                meter,
+                env: &env,
+                trust_repo_config: project.trust_repo_config,
+                session: session.clone(),
+                store: store.clone(),
+                read_only: false,
+                workspace: None,
+                steer: steer_tok,
+                clear_result,
+            },
+            cancel,
+        )
+        .await;
+        st.steer_disarm(task.id);
+        let out = out?;
+        record_run_usage(st, task, &acc, &out, usage).await?;
+        if store.is_some() {
+            steer::remember(st, task, &acc.provider, &session, &out).await;
+        }
         if task.kind == "onempty" {
-            "analyze"
-        } else {
-            "execute"
-        },
-    )
-    .await;
-    let out = agent_run(
-        st,
-        task,
-        RunSpec {
-            provider: &acc.provider,
-            model: task.model.as_deref(),
-            cred: &acc.cred,
-            prompt,
-            kind: RunKind::Agent,
-            label: "agent",
-            limits: &lim,
-            used_before: usage,
-            meter,
-            env: &env,
-            trust_repo_config: project.trust_repo_config,
-        },
-        cancel,
-    )
-    .await?;
-    record_run_usage(st, task, &acc, &out, usage).await?;
+            break out;
+        }
+        if resumed && !fell_back && !cancel.is_cancelled() && steer::resume_failed(&out) {
+            fell_back = true;
+            let r = steer::fallback(st, task, &project, &acc.provider, &claimed).await?;
+            (session, resumed, claimed, next_prompt) = (r.session, r.resumed, r.claimed, r.prompt);
+            clear_result = true;
+            continue;
+        }
+        match steer::next_round(
+            st,
+            task,
+            &project,
+            &acc.provider,
+            &out,
+            &session,
+            cancel,
+            &lim,
+            usage,
+        )
+        .await?
+        {
+            Some(r) => {
+                (session, resumed, claimed, next_prompt) =
+                    (r.session, r.resumed, r.claimed, r.prompt);
+                clear_result = true;
+                fell_back = false;
+            }
+            None => break out,
+        }
+    };
 
     let user_cancel = cancel.is_cancelled();
     let contract = if early(&out, user_cancel, &acc.provider, &lim, usage).is_none() {
@@ -851,6 +950,17 @@ async fn prepare_workspace(
     project: &Project,
     remote: Option<GitRemote>,
 ) -> Result<String, RunError> {
+    main_ready(st, task, project, remote).await?;
+    merge::prepare(st, task, project).await
+}
+
+/// `init` + `begin` of the main repository (pull, leftovers).
+async fn main_ready(
+    st: &AppState,
+    task: &Task,
+    project: &Project,
+    remote: Option<GitRemote>,
+) -> Result<(), RunError> {
     st.runner
         .init(
             project.id,
@@ -867,43 +977,27 @@ async fn prepare_workspace(
     for w in &begin.warnings {
         event(st, task, "status", &format!("git: {w}")).await;
     }
-    merge::prepare(st, task, project).await
+    Ok(())
 }
 
+/// Prompt of an OnEmpty analysis run (task prompts: `steer::fresh_prompt`).
 async fn build_prompt(
     st: &AppState,
-    task: &Task,
+    _task: &Task,
     project: &Project,
     settings: &Settings,
 ) -> sqlx::Result<String> {
-    if task.kind == "onempty" {
-        let history: Vec<(String, Option<String>)> = sqlx::query_as(
-            "SELECT title, summary FROM tasks WHERE project_id=$1 AND status='done' AND kind<>'onempty' ORDER BY finished_at DESC LIMIT 8",
-        )
-        .bind(project.id)
-        .fetch_all(&st.db)
-        .await?;
-        return Ok(prompt::onempty(
-            project,
-            &settings.onempty_actions,
-            &history,
-        ));
-    }
-    let parent = match task.parent_id {
-        Some(pid) => sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-            "SELECT title, handoff, summary FROM tasks WHERE id=$1",
-        )
-        .bind(pid)
-        .fetch_optional(&st.db)
-        .await?
-        .map(|(title, handoff, summary)| Parent {
-            title,
-            handoff,
-            summary,
-        }),
-        None => None,
-    };
-    Ok(prompt::task(task, project, parent.as_ref()))
+    let history: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT title, summary FROM tasks WHERE project_id=$1 AND status='done' AND kind<>'onempty' ORDER BY finished_at DESC LIMIT 8",
+    )
+    .bind(project.id)
+    .fetch_all(&st.db)
+    .await?;
+    Ok(prompt::onempty(
+        project,
+        &settings.onempty_actions,
+        &history,
+    ))
 }
 
 /// Adds a run's usage to the task total, the usage log, the task cost and the budget check.
@@ -1261,6 +1355,8 @@ struct Committer<'a> {
     author_email: &'a str,
     /// Approved secret fingerprints of the project.
     allow: &'a [String],
+    /// WP06 plan runs: nothing to commit (the plan ran in a throwaway copy).
+    no_commit: bool,
 }
 
 impl Committer<'_> {
@@ -1305,6 +1401,9 @@ impl Committer<'_> {
     /// A partial commit must not turn an interruption into a crash; the next
     /// run's `begin` commits leftovers as WIP anyway.
     async fn partial(&self, suffix: String) -> Option<String> {
+        if self.no_commit {
+            return None;
+        }
         match self.commit(&suffix).await {
             Ok(o) if o.blocked.is_empty() => Some(o.sha),
             Ok(o) => {
@@ -1598,6 +1697,8 @@ async fn exec(
             killed: false,
             cache: None,
             leaks: vec![],
+            changed: vec![],
+            changed_total: 0,
         });
     }
     let watcher = {
@@ -1658,6 +1759,18 @@ struct RunSpec<'a> {
     env: &'a Env,
     /// The owner allows the CLI to load configuration from the repository.
     trust_repo_config: bool,
+    /// WP06: CLI session (start with an id / resume).
+    session: agent::Session,
+    /// Session files kept between runs (runner store).
+    store: Option<queued_common::SessionSpec>,
+    /// Plan run: workspace mounted read-only, changes reported.
+    read_only: bool,
+    /// Workspace of the run (default: the task's own working tree).
+    workspace: Option<String>,
+    /// "Sofort zustellen": stops the run without cancelling the task.
+    steer: Option<CancellationToken>,
+    /// Remove a previous run's `.queue/result.json` first (steering rounds).
+    clear_result: bool,
 }
 
 async fn agent_run(
@@ -1692,8 +1805,15 @@ async fn agent_run(
         }
         None => spec.cred,
     };
-    let mut inv = agent::invocation(spec.provider, spec.model, cred, &run_limits, spec.kind)
-        .map_err(|e| RunError::Config(format!("{e:#}")))?;
+    let mut inv = agent::invocation_with(
+        spec.provider,
+        spec.model,
+        cred,
+        &run_limits,
+        spec.kind,
+        &spec.session,
+    )
+    .map_err(|e| RunError::Config(format!("{e:#}")))?;
     if !spec.trust_repo_config {
         agent::restrict_repo_config(&mut inv, spec.provider);
     }
@@ -1720,10 +1840,10 @@ async fn agent_run(
     let egress = spec
         .env
         .agent_policy(agent::egress_hosts(spec.provider, cred));
-    let phase = if spec.kind == RunKind::Review {
-        "Review"
-    } else {
-        "Agent"
+    let phase = match spec.kind {
+        RunKind::Review => "Review",
+        RunKind::Plan => "Plan",
+        RunKind::Agent => "Agent",
     };
     let enforced = environment::sandbox(st).await.egress_enforced;
     event(
@@ -1746,7 +1866,10 @@ async fn agent_run(
     run_env.extend(inv.env.iter().cloned());
     let req = ExecRequest {
         name: run_name(task.id, spec.label),
-        workspace: crate::runner_client::task_ws(task.id),
+        workspace: spec
+            .workspace
+            .clone()
+            .unwrap_or_else(|| crate::runner_client::task_ws(task.id)),
         program: inv.program.clone(),
         args: inv.args.clone(),
         env: run_env,
@@ -1766,10 +1889,26 @@ async fn agent_run(
                 // agent left behind in .queue/ during its own run.
                 q.push(("review.json".into(), String::new()));
             }
+            if spec.clear_result {
+                // A steering round must not be judged by the previous run's contract.
+                q.push(("result.json".into(), String::new()));
+            }
             q
         },
+        read_only: spec.read_only,
+        session: spec.store.clone(),
     };
     let run_cancel = cancel.child_token();
+    // WP06 "Sofort zustellen": the steering token stops this run only.
+    let steered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let steer_watch = spec.steer.clone().map(|tok| {
+        let (rc, flag) = (run_cancel.clone(), steered.clone());
+        tokio::spawn(async move {
+            tok.cancelled().await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            rc.cancel();
+        })
+    });
     let mut guard = caps.live_usage.then(|| Guard::new(tokens_left, cost_left));
 
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(512);
@@ -1810,7 +1949,11 @@ async fn agent_run(
                                 event(st, task, "text", &t).await
                             }
                             AgentEvent::Text(_) => {}
-                            AgentEvent::Tool(t) => event(st, task, "tool", &t).await,
+                            AgentEvent::Tool(t) => {
+                                o.tools += 1;
+                                event(st, task, "tool", &t).await
+                            }
+                            AgentEvent::Session(id) => o.session_id = Some(id),
                             AgentEvent::UsageDelta(mut u) => {
                                 // Catalog price instead of the CLI's dollars (USD prices
                                 // only; the cost limit is in USD).
@@ -1884,6 +2027,12 @@ async fn agent_run(
         (o, meter)
     };
     let (last, (mut o, meter)) = tokio::join!(exec(st, req, &run_cancel, tx), consumer);
+    if let Some(w) = steer_watch {
+        w.abort();
+    }
+    o.steered = steered.load(std::sync::atomic::Ordering::SeqCst)
+        && !cancel.is_cancelled()
+        && o.guard_limit.is_none();
     if let Some((base, master)) = &gw {
         gateway::revoke(base, master, &cred.secret, &st.cfg.llm_guard()).await;
     }
@@ -1896,8 +2045,12 @@ async fn agent_run(
             stalled,
             killed,
             files,
+            changed,
+            changed_total,
             ..
         }) => {
+            o.changed = changed;
+            o.changed_total = changed_total;
             o.success = success;
             o.exit_code = code;
             o.timed_out = timed_out;
@@ -2019,6 +2172,8 @@ async fn run_setup(
         cache,
         secret_env: secrets.iter().map(|(n, _)| n.clone()).collect(),
         home_env: vec![],
+        read_only: false,
+        session: None,
     };
     let values: Vec<String> = secrets.into_iter().map(|(_, v)| v).collect();
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(512);
@@ -2135,6 +2290,8 @@ async fn run_verify(
         cache: None,
         secret_env: vec![],
         home_env: vec![],
+        read_only: false,
+        session: None,
     };
     let enforced = environment::sandbox(st).await.egress_enforced;
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(512);
@@ -2359,6 +2516,12 @@ async fn run_review(
             meter,
             env: rc.env,
             trust_repo_config: project.trust_repo_config,
+            session: agent::Session::None,
+            store: None,
+            read_only: false,
+            workspace: None,
+            steer: None,
+            clear_result: false,
         },
         cancel,
     )
@@ -2923,6 +3086,7 @@ async fn create_followups(
                 allow_test_changes: false,
                 carry_from: None,
                 pr_id: None,
+                plan_mode: false,
             },
         )
         .await?;
@@ -3037,6 +3201,7 @@ async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Resu
             allow_test_changes: false,
             carry_from,
             pr_id: failed.pr_id,
+            plan_mode: false,
         },
     )
     .await?;

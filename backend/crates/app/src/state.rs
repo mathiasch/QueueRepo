@@ -31,6 +31,9 @@ pub struct AppState {
     /// that registered it, see [`AppState::track`]).
     pub running: Arc<Mutex<HashMap<Uuid, (u64, CancellationToken)>>>,
     run_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// WP06 "Sofort zustellen": a token per agent run of a task that stops
+    /// only that run (the task continues with the user's messages).
+    steers: Arc<std::sync::Mutex<HashMap<Uuid, CancellationToken>>>,
     pub vapid: Arc<Vapid>,
     /// Effective price catalog, cached per override version (see `pricing::current`).
     pub prices: Arc<std::sync::RwLock<Option<PriceCache>>>,
@@ -58,6 +61,7 @@ impl AppState {
             pr_wake: Arc::new(Notify::new()),
             running: Arc::new(Mutex::new(HashMap::new())),
             run_gen: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            steers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             vapid: Arc::new(vapid),
             prices: Arc::new(std::sync::RwLock::new(None)),
             sandbox: Arc::new(std::sync::RwLock::new(None)),
@@ -91,6 +95,40 @@ impl AppState {
         match self.running.lock().await.get(&id) {
             Some((_, tok)) if !tok.is_cancelled() => {
                 tok.cancel();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A fresh steering token for the agent run of `id` that starts now.
+    pub fn steer_arm(&self, id: Uuid) -> CancellationToken {
+        let t = CancellationToken::new();
+        self.steers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, t.clone());
+        t
+    }
+
+    /// The agent run of `id` ended (verify/review/merge cannot be steered).
+    pub fn steer_disarm(&self, id: Uuid) {
+        self.steers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+    }
+
+    /// Interrupts the running agent of `id`; `false` = no agent runs now.
+    pub fn steer_now(&self, id: Uuid) -> bool {
+        match self
+            .steers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+        {
+            Some(t) if !t.is_cancelled() => {
+                t.cancel();
                 true
             }
             _ => false,

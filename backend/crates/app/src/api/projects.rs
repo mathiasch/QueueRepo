@@ -106,8 +106,8 @@ pub async fn list(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
 ) -> ApiResult<Json<Vec<ProjectSummary>>> {
-    let rows: Vec<(Uuid, String, String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT p.id, p.name, p.description, m.role, ou.name, p.git_remote_url FROM projects p
+    let rows: Vec<(Uuid, String, String, String, String, Option<String>, bool)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.description, m.role, ou.name, p.git_remote_url, p.plan_mode FROM projects p
          JOIN project_members m ON m.project_id=p.id AND m.user_id=$1
          JOIN users ou ON ou.id = p.owner_id
          WHERE NOT p.is_eval
@@ -119,13 +119,16 @@ pub async fn list(
     Ok(Json(
         rows.into_iter()
             .map(
-                |(id, name, description, role, owner_name, git_remote_url)| ProjectSummary {
-                    id,
-                    name,
-                    description,
-                    role: ProjectRole::parse(&role).unwrap_or(ProjectRole::Viewer),
-                    owner_name,
-                    git_remote_url,
+                |(id, name, description, role, owner_name, git_remote_url, plan_mode)| {
+                    ProjectSummary {
+                        id,
+                        name,
+                        description,
+                        role: ProjectRole::parse(&role).unwrap_or(ProjectRole::Viewer),
+                        owner_name,
+                        git_remote_url,
+                        plan_mode,
+                    }
                 },
             )
             .collect(),
@@ -253,6 +256,14 @@ pub async fn update(
         require(&st, id, u.id, Role::Owner).await?;
         queued_api::branch::validate_parallelism(n).map_err(AppError::bad_request)?;
     }
+    // WP06: plan mode and automatic approval are the owner's decision
+    // (an automatic approval lets agents change code without a human).
+    if p.plan_mode.is_some() || p.plan_auto_approve_mins.is_some() {
+        require(&st, id, u.id, Role::Owner).await?;
+    }
+    if let Some(m) = p.plan_auto_approve_mins {
+        queued_api::steer::validate_auto_approve(m).map_err(AppError::bad_request)?;
+    }
     limits::int(
         "Max. Laufzeit (Sekunden)",
         p.max_runtime_secs.flatten(),
@@ -328,7 +339,9 @@ pub async fn update(
             max_cost_usd = CASE WHEN $18 THEN $19 ELSE max_cost_usd END,
             max_tokens = CASE WHEN $20 THEN $21 ELSE max_tokens END,
             max_turns = CASE WHEN $22 THEN $23 ELSE max_turns END,
-            parallelism = COALESCE($24, parallelism)
+            parallelism = COALESCE($24, parallelism),
+            plan_mode = COALESCE($25, plan_mode),
+            plan_auto_approve_mins = CASE WHEN $26 THEN $27 ELSE plan_auto_approve_mins END
          WHERE id=$1 RETURNING *",
     )
     .bind(id)
@@ -355,6 +368,9 @@ pub async fn update(
     .bind(p.max_turns.is_some())
     .bind(narrow(p.max_turns))
     .bind(p.parallelism)
+    .bind(p.plan_mode)
+    .bind(p.plan_auto_approve_mins.is_some())
+    .bind(p.plan_auto_approve_mins.flatten())
     .fetch_one(&st.db)
     .await?;
     st.wake.notify_one();

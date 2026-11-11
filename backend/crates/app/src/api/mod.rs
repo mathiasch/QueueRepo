@@ -6,6 +6,7 @@ pub mod limits;
 mod projects;
 mod providers;
 mod pulls;
+mod steer;
 mod tasks;
 
 use std::convert::Infallible;
@@ -135,6 +136,24 @@ pub fn router(st: AppState) -> Router {
         .route("/tasks/{id}/move", post(tasks::move_task))
         .route("/tasks/{id}/diff", get(tasks::diff))
         .route("/tasks/{id}/revert", post(tasks::revert))
+        .route("/tasks/{id}/plan/approve", post(steer::plan_approve))
+        .route("/tasks/{id}/plan/revise", post(steer::plan_revise))
+        .route("/tasks/{id}/plan/reject", post(steer::plan_reject))
+        .route(
+            "/tasks/{id}/messages",
+            get(steer::messages).post(steer::send),
+        )
+        .route("/tasks/{id}/messages/{mid}", delete(steer::withdraw))
+        .route("/tasks/{id}/continue", post(steer::continue_task))
+        .route(
+            "/tasks/{id}/comments",
+            get(steer::comments).post(steer::add_comment),
+        )
+        .route("/tasks/{id}/comments/send", post(steer::send_comments))
+        .route(
+            "/tasks/{id}/comments/{cid}",
+            axum::routing::patch(steer::update_comment).delete(steer::delete_comment),
+        )
         .route("/tasks/{id}/gate/approve", post(gate::approve))
         .route("/tasks/{id}/gate/reject", post(gate::reject))
         .route("/tasks/{id}/gate/diff", get(gate::diff))

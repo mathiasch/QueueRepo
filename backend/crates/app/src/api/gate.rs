@@ -73,6 +73,11 @@ pub async fn approve(
 ) -> ApiResult<Json<Value>> {
     let t = decidable(&st, id, u.id).await?;
     let mut g = held_gate(&t)?;
+    if g.stage == GateStage::Plan {
+        // WP06: the plan decisions (with their own rights check).
+        let (t, _) = super::steer::steerable(&st, id, u.id).await?;
+        return super::steer::approve_plan(&st, &t, u.id, None).await;
+    }
     let who = user_label(&st, u.id).await;
     if d.action == GateAction::RetryReview && g.stage != GateStage::Review {
         return Err(AppError::bad_request(
@@ -117,7 +122,9 @@ pub async fn approve(
                 (GateStage::Review, GateAction::RetryReview) => GateResume::Review,
                 (GateStage::Review, _) => GateResume::SkipReview,
                 (GateStage::Push, _) => GateResume::Push,
-                _ => unreachable!("handled above"),
+                (GateStage::Setup | GateStage::Config | GateStage::Plan, _) => {
+                    unreachable!("handled above")
+                }
             });
             // Approved secrets: their fingerprints (never the values) are
             // allowed in this project from now on (commit, push, leftovers).
@@ -180,6 +187,10 @@ pub async fn reject(
 ) -> ApiResult<Json<Value>> {
     let t = decidable(&st, id, u.id).await?;
     let mut g = held_gate(&t)?;
+    if g.stage == GateStage::Plan {
+        let (t, _) = super::steer::steerable(&st, id, u.id).await?;
+        return super::steer::reject_plan(&st, &t, u.id).await;
+    }
     let who = user_label(&st, u.id).await;
     if g.stage == GateStage::Push {
         // "Nicht hochladen": the task finishes without a push.

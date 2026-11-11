@@ -643,6 +643,7 @@ async fn apply(st: &AppState, project: &Project, row: &PrRow, p: Polled) -> anyh
                     allow_test_changes: false,
                     carry_from: None,
                     pr_id: Some(row.id),
+                    plan_mode: false,
                 },
             )
             .await?;

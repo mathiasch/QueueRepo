@@ -3,7 +3,9 @@
 pub mod egress;
 pub mod exec;
 pub mod git;
+pub mod sessions;
 pub mod setup;
+pub mod snapshot;
 pub mod tasks;
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -43,6 +45,8 @@ pub struct RunnerConfig {
     pub kill_grace_secs: u64,
     /// Operator settings of the egress proxy (`RUNNER_EGRESS_*`).
     pub egress: Arc<egress::EgressConfig>,
+    /// WP06: CLI session stores unused for this many days are removed.
+    pub session_ttl_days: u64,
 }
 
 /// Longest data dir path: `<data_dir>/e/<16 hex>/p.sock` must stay below the
@@ -70,6 +74,7 @@ impl RunnerConfig {
                 private_hosts: vec![queued_common::net::HostRule::parse("127.0.0.1").expect("rule")],
                 ..Default::default()
             }),
+            session_ttl_days: sessions::DEFAULT_TTL_DAYS,
         }
     }
 
@@ -242,6 +247,7 @@ async fn delete_ws(
     let _g = l.lock().await;
     repo.delete().await?;
     remove_caches(&st, &id).await?;
+    sessions::remove_scope(&st.cfg, &id);
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
@@ -670,6 +676,12 @@ async fn exec_start(State(st): State<RunnerState>, Json(req): Json<ExecRequest>)
     if !valid_name(&req.name) || !valid_name(&req.workspace) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "invalid name".into()));
     }
+    // WP06: a run saves only into the session store of its own workspace.
+    if let Some(s) = &req.session {
+        if sessions::validate(s).is_err() || s.key != req.workspace {
+            return Err(ApiErr(StatusCode::BAD_REQUEST, "invalid session".into()));
+        }
+    }
     let cancel = CancellationToken::new();
     {
         let mut running = st.running.lock().await;
@@ -963,6 +975,8 @@ mod tests {
             cache: None,
             secret_env: vec![],
             home_env: vec![],
+            read_only: false,
+            session: None,
         };
         let body = c
             .post(format!("{a}/v1/exec"))

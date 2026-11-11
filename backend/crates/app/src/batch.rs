@@ -411,6 +411,34 @@ async fn complete(
             .await?;
     }
     match j.step.as_str() {
+        // WP06 plan mode: the plan waits for a human instead of running at once.
+        "plan" if crate::plan::pending(&task) => {
+            match &r {
+                Ok(resp) if !resp.text.trim().is_empty() => {
+                    let meta = queued_api::steer::PlanMeta {
+                        source: queued_api::steer::PlanSource::SingleShot,
+                        model: Some(j.model.clone()),
+                        ..Default::default()
+                    };
+                    crate::plan::hold(st, &task, "waiting_batch", &resp.text, meta, &total).await?;
+                }
+                _ => {
+                    // Plan mode: without a plan nothing is implemented.
+                    let msg = "Planung per API ergab keinen Plan – der Auftrag wartet (Plan-Modus: ohne genehmigten Plan wird nichts umgesetzt). „Wiederholen“ versucht es erneut.";
+                    event(st, &task, "plan", msg).await;
+                    sqlx::query(
+                        "UPDATE tasks SET status='blocked', failure_class='task', error=$2, plan_state=NULL,
+                                finished_at=now(), updated_at=now() WHERE id=$1 AND status='waiting_batch'",
+                    )
+                    .bind(task.id)
+                    .bind(msg)
+                    .execute(&st.db)
+                    .await?;
+                    queue::emit_task(st, task.id).await;
+                }
+            }
+            st.wake.notify_one();
+        }
         "plan" => {
             let plan = match &r {
                 Ok(resp) if !resp.text.trim().is_empty() => {

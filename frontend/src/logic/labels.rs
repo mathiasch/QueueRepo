@@ -149,6 +149,7 @@ pub fn task_kind_label(kind: &str) -> &'static str {
         "fix" => "Reparatur",
         "onempty" => "Automatisch",
         "pr_fix" => "PR-Folge",
+        "continue" => "Fortsetzung",
         _ => "Auftrag",
     }
 }
@@ -199,6 +200,8 @@ pub fn event_kind_label(kind: &str) -> &'static str {
         "gate" => "Schutz",
         "merge" => "Übernahme",
         "pr" => "Pull Request",
+        "plan" => "Plan",
+        "steer" => "Nachricht",
         _ => "Info",
     }
 }
@@ -239,6 +242,8 @@ pub mod help {
     pub const ONEMPTY: &str = "Ist die Warteschlange leer, kann die Queue selbstständig sinnvolle Arbeit vorschlagen – nur bei freiem Budget und wenn nichts auf dich wartet.";
     pub const TURNS: &str = "Ein Turn ist ein Arbeitsschritt des Agenten (eine Antwort inklusive Werkzeugaufrufen). Das Limit begrenzt, wie viele Schritte ein Lauf machen darf.";
     pub const TOKENS: &str = "Tokens sind die Abrechnungseinheit der KI-Anbieter (grob: ein Token ≈ ¾ Wort). Gezählt werden Eingabe, Ausgabe und Cache-Schreibvorgänge.";
+    pub const APPROVED_PLAN: &str = "Diesen Plan hat ein Mensch genehmigt (ggf. vorher geändert). Der Agent hat ihn als Vorgabe für die Umsetzung bekommen.";
+    pub const PLAN_MODE: &str = queued_api::steer::PLAN_MODE_HELP;
     pub const PLAN: &str = "Vor der Umsetzung hat ein (meist stärkeres) Modell einen kurzen Plan geschrieben. Der Agent hält sich daran, weicht aber ab, wenn der Code etwas anderes zeigt.";
     pub const COSTS: &str = "Berechnet aus den verbrauchten Tokens und der Preistabelle (Listenpreise der Anbieter). Bei Abos zahlst du nicht pro Token – dann zeigt der Betrag, was der Auftrag per API gekostet hätte.";
     pub const ROUTING: &str = "Welches Modell plant, umsetzt und prüft. Teure Modelle nur dort, wo sie sich lohnen: Planung und Prüfung sind kurze Einzelschritte und laufen günstig im Batch-Tarif.";

@@ -120,6 +120,7 @@ pub async fn create(
             allow_test_changes: c.allow_test_changes,
             carry_from: None,
             pr_id: None,
+            plan_mode: c.plan_mode.unwrap_or(project.plan_mode),
         },
     )
     .await?;

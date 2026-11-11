@@ -14,10 +14,12 @@ use uuid::Uuid;
 
 pub mod branch;
 mod costs;
+pub mod diff;
 pub mod env;
 pub mod gate;
 pub mod pr;
 mod providers;
+pub mod steer;
 pub use costs::*;
 pub use providers::*;
 
@@ -383,9 +385,49 @@ pub struct Task {
     /// push to its branch).
     #[serde(default)]
     pub pr_id: Option<Uuid>,
+    /// WP06: the agent first writes a plan that a human approves.
+    #[serde(default)]
+    pub plan_mode: bool,
+    /// [`steer::PlanState`] (`None` = no plan mode or not planned yet).
+    #[serde(default)]
+    pub plan_state: Option<String>,
+    /// Number of revisions a human asked for.
+    #[serde(default)]
+    pub plan_revision: i32,
+    /// Note for the next plan run ("Überarbeiten lassen").
+    #[serde(default)]
+    pub plan_feedback: Option<String>,
+    /// [`steer::PlanMeta`] as JSON (questions, attempted changes, source).
+    #[serde(default)]
+    pub plan_meta: Option<Value>,
+    /// [`steer::AgentSession`] as JSON: the CLI session of the last run.
+    #[serde(default)]
+    pub agent_session: Option<Value>,
+    /// "Weiter mit …": the task whose CLI session this one continues.
+    #[serde(default)]
+    pub session_from: Option<Uuid>,
+    /// Steering rounds (resumes for user messages) so far.
+    #[serde(default)]
+    pub steer_rounds: i32,
 }
 
 impl Task {
+    pub fn plan_state_kind(&self) -> Option<steer::PlanState> {
+        self.plan_state.as_deref().and_then(steer::PlanState::parse)
+    }
+
+    pub fn plan_meta_parsed(&self) -> Option<steer::PlanMeta> {
+        self.plan_meta
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    pub fn agent_session_parsed(&self) -> Option<steer::AgentSession> {
+        self.agent_session
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
     pub fn cost_parsed(&self) -> Option<TaskCost> {
         self.cost
             .as_ref()
@@ -537,6 +579,9 @@ pub struct CreateTask {
     /// Test task: may change protected paths/tests without approval.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_test_changes: bool,
+    /// WP06: plan first (`None` = the project's default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_mode: Option<bool>,
     #[serde(flatten)]
     pub limits: TaskLimitFields,
 }
@@ -627,6 +672,9 @@ pub struct ProjectSummary {
     pub role: ProjectRole,
     pub owner_name: String,
     pub git_remote_url: Option<String>,
+    /// WP06: new tasks of the project plan first (composer default).
+    #[serde(default)]
+    pub plan_mode: bool,
 }
 
 /// `GET/PATCH /api/projects/{id}`: the project without its encrypted git
@@ -665,6 +713,12 @@ pub struct ProjectView {
     /// What a finished task delivers (WP05).
     #[serde(default)]
     pub output_mode: pr::OutputMode,
+    /// WP06: new tasks plan first (default of the composer option).
+    #[serde(default)]
+    pub plan_mode: bool,
+    /// Plans are approved automatically after this many minutes (`None` = never).
+    #[serde(default)]
+    pub plan_auto_approve_mins: Option<i32>,
 }
 
 /// Response of `POST /api/projects`: the new project and its first commit.
@@ -751,6 +805,16 @@ pub struct UpdateProject {
     /// Tasks of the project at the same time (1–8, owner only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallelism: Option<i32>,
+    /// WP06 plan mode default of new tasks (owner only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_mode: Option<bool>,
+    /// Automatic plan approval in minutes; `null` = off (owner only).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub plan_auto_approve_mins: Option<Option<i32>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -992,13 +1056,21 @@ mod tests {
             "merge_queued_at",
             "carry_from",
             "pr_id",
+            "plan_state",
+            "plan_feedback",
+            "plan_meta",
+            "agent_session",
+            "session_from",
         ] {
             full[k] = Value::Null;
         }
+        full["plan_mode"] = Value::Bool(false);
+        full["plan_revision"] = 0.into();
+        full["steer_rounds"] = 0.into();
         assert_eq!(
             serde_json::to_value(&t).unwrap(),
             full,
-            "rows from before WP04/WP05 still parse"
+            "rows from before WP04/WP05/WP06 still parse"
         );
         assert_eq!(serde_json::from_value::<Task>(full).unwrap(), t);
         // Before WP04: diff from the first snapshot, always on the target.
@@ -1075,6 +1147,7 @@ mod tests {
             connector_id: None,
             front: true,
             allow_test_changes: false,
+            plan_mode: None,
             limits: TaskLimitFields {
                 max_runtime_secs: Some(Some(90)),
                 ..Default::default()

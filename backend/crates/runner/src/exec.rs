@@ -90,7 +90,20 @@ pub fn build_command(
                 .args(["--security-opt", "no-new-privileges", "--cap-drop", "ALL"])
                 .args([
                     "-v",
-                    &vol(workspace, "/workspace"),
+                    // WP06 plan runs: the workspace cannot be written at all.
+                    &if req.read_only {
+                        format!(
+                            "{}:/workspace:{}",
+                            workspace.display(),
+                            if cfg.volume_opts.is_empty() {
+                                "ro".to_string()
+                            } else {
+                                format!("ro,{}", cfg.volume_opts)
+                            }
+                        )
+                    } else {
+                        vol(workspace, "/workspace")
+                    },
                     "-v",
                     &vol(home, "/home/agent"),
                 ])
@@ -209,6 +222,8 @@ pub async fn probe(cfg: &RunnerConfig) -> Result<Vec<CliProbe>> {
             cache: None,
             secret_env: vec![],
             home_env: vec![],
+            read_only: false,
+            session: None,
         };
         let mut cmd = build_command(cfg, &req, &ws, &home, &Sandbox::default());
         let version = match tokio::time::timeout(Duration::from_secs(20), cmd.output()).await {
@@ -434,6 +449,29 @@ async fn run_inner(
     let home = run_dir.join("home");
     let _ = tokio::fs::remove_dir_all(run_dir).await;
     tokio::fs::create_dir_all(&home).await?;
+    anyhow::ensure!(
+        !(req.read_only && req.cache.is_some()),
+        "a read-only run has no dependency cache"
+    );
+    // WP06: the CLI's session files of earlier runs, before the app's files
+    // (credentials and configuration of this run always win).
+    if let Some(spec) = req.session.clone() {
+        let (c, h) = (cfg.clone(), home.clone());
+        let ttl = Duration::from_secs(cfg.session_ttl_days.max(1) * 86_400);
+        let restored = tokio::task::spawn_blocking(move || {
+            crate::sessions::sweep(&c, ttl);
+            crate::sessions::restore(&c, &spec, &h)
+        })
+        .await?;
+        if let Err(e) = restored {
+            tracing::warn!("session of {} not restored: {e:#}", req.name);
+            let _ = tx
+                .send(ExecFrame::Err {
+                    line: "queue: frühere Sitzung konnte nicht wiederhergestellt werden".into(),
+                })
+                .await;
+        }
+    }
     for (rel, content) in &req.home_files {
         anyhow::ensure!(safe_rel(rel), "invalid home file path");
         let p = home.join(rel);
@@ -491,6 +529,17 @@ async fn run_inner(
     sb.env.extend(home_env(cfg, req, &home)?);
     let proxy = start_egress(cfg, req, egress_dir, tx, &mut sb).await?;
 
+    let before = if req.read_only {
+        let ws = workspace.clone();
+        Some(
+            tokio::task::spawn_blocking(move || {
+                crate::snapshot::take(&ws, crate::snapshot::MAX_ENTRIES)
+            })
+            .await?,
+        )
+    } else {
+        None
+    };
     let mut child = build_command(cfg, req, &workspace, &home, &sb)
         .spawn()
         .with_context(|| format!("failed to start {}", req.program))?;
@@ -612,6 +661,38 @@ async fn run_inner(
         }
     }
 
+    // WP06: what a read-only run changed anyway (the caller discards the
+    // workspace; this is the evidence).
+    let (changed, changed_total) = match before {
+        Some(b) => {
+            let ws = workspace.clone();
+            let after = tokio::task::spawn_blocking(move || {
+                crate::snapshot::take(&ws, crate::snapshot::MAX_ENTRIES)
+            })
+            .await?;
+            crate::snapshot::diff(&b, &after, queued_common::MAX_CHANGED_REPORTED)
+        }
+        None => (vec![], 0),
+    };
+    if let Some(spec) = req.session.clone() {
+        let (c, h) = (cfg.clone(), home.clone());
+        match tokio::task::spawn_blocking(move || crate::sessions::save(&c, &spec, &h)).await? {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = tx
+                    .send(ExecFrame::Err {
+                        line: format!(
+                            "queue: Sitzung zu groß (über {} MiB oder {} Dateien) – nicht gespeichert",
+                            crate::sessions::MAX_BYTES / (1024 * 1024),
+                            crate::sessions::MAX_FILES
+                        ),
+                    })
+                    .await;
+            }
+            Err(e) => tracing::warn!("session of {} not saved: {e:#}", req.name),
+        }
+    }
+
     let mut files = vec![];
     for rel in &req.read_back {
         if safe_rel(rel) {
@@ -631,6 +712,8 @@ async fn run_inner(
         files,
         cache: cache.map(|c| c.info),
         leaks,
+        changed,
+        changed_total,
     })
 }
 
@@ -670,6 +753,8 @@ mod tests {
             cache: None,
             secret_env: vec![],
             home_env: vec![],
+            read_only: false,
+            session: None,
         }
     }
 
@@ -1014,6 +1099,134 @@ mod tests {
                 engine == Engine::Docker
             );
         }
+    }
+
+    #[test]
+    fn read_only_runs_mount_the_workspace_read_only() {
+        let t = tempfile::tempdir().unwrap();
+        for (opts, want) in [("", "/w:/workspace:ro"), ("Z", "/w:/workspace:ro,Z")] {
+            let mut c = cfg(t.path(), Engine::Podman);
+            c.volume_opts = opts.into();
+            let mut r = req("claude", &["-p"]);
+            r.read_only = true;
+            let a = args_of(&build_command(
+                &c,
+                &r,
+                Path::new("/w"),
+                Path::new("/h"),
+                &Sandbox::default(),
+            ));
+            assert!(a.windows(2).any(|w| w[0] == "-v" && w[1] == want), "{a:?}");
+            // The home stays writable (the CLI keeps its session there).
+            assert!(a.iter().any(|x| x.starts_with("/h:/home/agent")), "{a:?}");
+            r.read_only = false;
+            let a = args_of(&build_command(
+                &c,
+                &r,
+                Path::new("/w"),
+                Path::new("/h"),
+                &Sandbox::default(),
+            ));
+            assert!(
+                !a.iter().any(|x| x.starts_with("/w:/workspace:ro")),
+                "{a:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_run_reports_every_change_and_refuses_a_cache() {
+        let t = tempfile::tempdir().unwrap();
+        let c = cfg(t.path(), Engine::None);
+        let ws = c.workspaces().join("w1");
+        tokio::fs::create_dir_all(ws.join(".git")).await.unwrap();
+        tokio::fs::write(ws.join("a.txt"), "a").await.unwrap();
+        tokio::fs::write(ws.join(".git/HEAD"), "ref").await.unwrap();
+        let changed_of = |f: &[ExecFrame]| match f.last().unwrap() {
+            ExecFrame::Exit {
+                changed,
+                changed_total,
+                ..
+            } => (changed.clone(), *changed_total),
+            o => panic!("{o:?}"),
+        };
+        // Reading only: nothing changed.
+        let mut r = req("sh", &["-c", "cat a.txt .git/HEAD; ls -la >/dev/null"]);
+        r.read_only = true;
+        let f = collect(&c, r, CancellationToken::new()).await;
+        assert_eq!(changed_of(&f), (vec![], 0));
+        // Engine none cannot stop writes – they are found.
+        let mut r = req(
+            "sh",
+            &["-c", "echo b > a.txt; echo x > new.txt; echo h > .git/HEAD"],
+        );
+        r.read_only = true;
+        let f = collect(&c, r, CancellationToken::new()).await;
+        let (paths, total) = changed_of(&f);
+        assert_eq!(total, 3, "{paths:?}");
+        for p in ["a.txt", "new.txt", ".git/HEAD"] {
+            assert!(paths.contains(&p.to_string()), "{paths:?}");
+        }
+        // A normal run reports nothing.
+        let f = collect(
+            &c,
+            req("sh", &["-c", "echo c > a.txt"]),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(changed_of(&f), (vec![], 0));
+        let mut r = req("true", &[]);
+        r.read_only = true;
+        r.cache = Some(queued_common::CacheSpec::default());
+        let f = collect(&c, r, CancellationToken::new()).await;
+        assert!(
+            matches!(f.last(), Some(ExecFrame::Fail { error }) if error.contains("read-only")),
+            "{f:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_sessions_survive_between_runs_without_credentials() {
+        let t = tempfile::tempdir().unwrap();
+        let c = cfg(t.path(), Engine::None);
+        let key = "t0123456789abcdef0123456789abcdef";
+        tokio::fs::create_dir_all(c.workspaces().join(key))
+            .await
+            .unwrap();
+        let spec = queued_common::SessionSpec {
+            scope: "11111111-1111-4111-8111-111111111111".into(),
+            key: key.into(),
+            seed: None,
+            paths: vec![".claude/projects".into()],
+            exclude: vec![".credentials.json".into()],
+        };
+        let mut r = req(
+            "sh",
+            &["-c", "mkdir -p $HOME/.claude/projects/p && echo turn1 > $HOME/.claude/projects/p/s.jsonl && echo tok > $HOME/.claude/projects/p/.credentials.json"],
+        );
+        r.workspace = key.into();
+        r.session = Some(spec.clone());
+        collect(&c, r, CancellationToken::new()).await;
+        // Next run: the transcript is back, the credential file is not; a
+        // file the app writes for the run wins over a restored one.
+        let mut r = req(
+            "sh",
+            &["-c", "cat $HOME/.claude/projects/p/s.jsonl; ls $HOME/.claude/projects/p; cat $HOME/.claude/projects/p/app.txt"],
+        );
+        r.workspace = key.into();
+        r.session = Some(spec);
+        r.home_files = vec![(".claude/projects/p/app.txt".into(), "from-app".into())];
+        let f = collect(&c, r, CancellationToken::new()).await;
+        let out: Vec<String> = f
+            .iter()
+            .filter_map(|x| match x {
+                ExecFrame::Out { line } => Some(line.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(out[0], "turn1", "{f:?}");
+        assert!(!out.iter().any(|l| l.contains("credentials")), "{out:?}");
+        assert_eq!(out.last().unwrap(), "from-app");
     }
 
     fn args_of(cmd: &Command) -> Vec<String> {

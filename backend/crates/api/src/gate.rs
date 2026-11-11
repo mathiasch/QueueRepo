@@ -20,6 +20,8 @@ pub enum GateStage {
     Review,
     /// Auto-push to the default branch (or secrets in pushed commits).
     Push,
+    /// WP06 plan mode: the agent's plan waits for approval (nothing changed yet).
+    Plan,
 }
 
 impl GateStage {
@@ -30,6 +32,7 @@ impl GateStage {
             Self::Config => "config",
             Self::Review => "review",
             Self::Push => "push",
+            Self::Plan => "plan",
         }
     }
 
@@ -40,6 +43,7 @@ impl GateStage {
             Self::Config => "Agenten-Einstellungen im Repository geändert",
             Self::Review => "Prüfung durch den Review-Agenten war nicht möglich",
             Self::Push => "Hochladen (Push) braucht deine Freigabe",
+            Self::Plan => "Der Plan wartet auf deine Freigabe",
         }
     }
 
@@ -51,6 +55,7 @@ impl GateStage {
             Self::Config => "Du hast erlaubt, dass Agenten Einstellungen aus dem Repository laden. Diese Einstellungen wurden seit der letzten Freigabe geändert und könnten Programme starten. „Freigeben“ vertraut dem aktuellen Stand und startet den Auftrag neu.",
             Self::Review => "Die Änderungen sind gespeichert, wurden aber noch nicht vom Review-Agenten geprüft. Du kannst die Prüfung wiederholen oder die Änderungen ohne Prüfung übernehmen.",
             Self::Push => "Der Auftrag ist fertig. Queue lädt nie ohne Freigabe auf den Standard-Branch hoch. „Hochladen“ pusht genau den Stand dieses Auftrags (und frühere, noch nicht hochgeladene Commits).",
+            Self::Plan => "Der Agent hat sich das Projekt angesehen und beschreibt, wie er die Aufgabe lösen will. Geändert hat er noch nichts. „Plan genehmigen“ lässt ihn den Plan umsetzen. Mit „Ändern“ kannst du den Plan selbst anpassen oder einen neuen anfordern, „Verwerfen“ beendet den Auftrag.",
         }
     }
 
@@ -60,6 +65,7 @@ impl GateStage {
             Self::Setup | Self::Config => "Freigeben und neu starten",
             Self::Review => "Ohne Prüfung übernehmen",
             Self::Push => "Hochladen",
+            Self::Plan => "Plan genehmigen",
         }
     }
 
@@ -68,6 +74,7 @@ impl GateStage {
             Self::Changes => "Änderungen verwerfen",
             Self::Setup | Self::Config | Self::Review => "Auftrag anhalten",
             Self::Push => "Nicht hochladen",
+            Self::Plan => "Plan verwerfen",
         }
     }
 }

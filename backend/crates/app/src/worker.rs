@@ -125,6 +125,13 @@ pub async fn run(st: AppState) {
 }
 
 async fn tick(st: &AppState) -> Result<()> {
+    // WP06: due automatic plan approvals; messages of tasks that ended.
+    if let Err(e) = crate::plan::auto_approve_due(st).await {
+        tracing::warn!("automatic plan approval failed: {e:#}");
+    }
+    if let Err(e) = crate::steer::sweep(st).await {
+        tracing::warn!("message sweep failed: {e:#}");
+    }
     let users: Vec<Settings> = sqlx::query_as("SELECT * FROM user_settings")
         .fetch_all(&st.db)
         .await?;
@@ -445,6 +452,7 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
             allow_test_changes: false,
             carry_from: None,
             pr_id: None,
+            plan_mode: false,
         },
     )
     .await?;

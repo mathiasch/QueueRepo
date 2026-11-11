@@ -175,7 +175,8 @@ pub fn TaskDrawer(id: Uuid) -> impl IntoView {
                         }}
                         // Outside `Details`: it keeps its own state and refreshes itself.
                         {move || pull.get().map(|p| view! { <super::pr::PrBlock pr=p/> })}
-                        {move || diff.get().map(|d| view! { <DiffBlock diff=d/> })}
+                        <super::steer::MessagesBlock id=id task=task events=events/>
+                        {move || diff.get().map(|d| view! { <super::steer::CommentDiff id=id diff=d/> })}
                         <LogBlock t=task events=events/>
                     </div>
                 </Show>
@@ -404,6 +405,9 @@ fn Details(t: Task) -> impl IntoView {
     let usage = t.usage_parsed();
     let cost = t.cost_parsed().filter(|c| !c.steps.is_empty());
     let plan = t.plan.clone().filter(|p| !p.trim().is_empty());
+    let plan_waits =
+        status == TaskStatus::Held && t.gate_parsed().is_some_and(|g| g.stage == GateStage::Plan);
+    let plan_approved = t.plan_state.as_deref() == Some("approved");
     let questions = t.questions_list();
     let started = t.started_at.is_some();
     let phase = Memo::new(move |_| {
@@ -449,7 +453,12 @@ fn Details(t: Task) -> impl IntoView {
                 {move || activity.get().map(|a| view! { <p class="box small live">{a}</p> })}
             </Block>
         })}
-        {t.gate_parsed().filter(|_| status == TaskStatus::Held).map(|g| view! { <GatePanel id=id gate=g/> })}
+        {t.gate_parsed().filter(|_| status == TaskStatus::Held).map(|g| if g.stage == GateStage::Plan {
+            // WP06: the plan waits for a decision.
+            view! { <super::steer::PlanPanel t=t.clone()/> }.into_any()
+        } else {
+            view! { <GatePanel id=id gate=g/> }.into_any()
+        })}
         <super::branch::BranchBlock t=t.clone()/>
         {(!questions.is_empty()).then(|| view! { <DrawerQuestions id=id questions=questions.clone() waiting=status == TaskStatus::WaitingInput/> })}
         {abort.map(|(text, tone)| view! {
@@ -520,7 +529,11 @@ fn Details(t: Task) -> impl IntoView {
             }
         })
         }}
-        {plan.map(|p| view! { <Collapsible title="Plan" text=p help=help::PLAN/> })}
+        {plan.filter(|_| !plan_waits).map(|p| if plan_approved {
+            view! { <Collapsible title="Genehmigter Plan" text=p help=help::APPROVED_PLAN/> }.into_any()
+        } else {
+            view! { <Collapsible title="Plan" text=p help=help::PLAN/> }.into_any()
+        })}
         {usage.map(|u| view! {
             <Block title="Verbrauch" help=help::TOKENS>
                 <div class="usage">

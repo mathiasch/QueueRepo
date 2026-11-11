@@ -16,6 +16,8 @@ async function seed(page: Page) {
   await waitTask(page.request, await add("Startseite mit Terminen und Kontaktformular bauen"), "done");
   // WP03: a task held by the gate (possible secret in the changes).
   await waitTask(page.request, await add("MOCK_SECRET Zugangsdaten für den Kalender einbauen"), "held");
+  // WP06: a plan that waits for approval.
+  await waitTask(page.request, await add("Spendenformular mit Bestätigungsmail", { plan_mode: true }), "held");
   await waitTask(page.request, await add("MOCK_ASK Welche Datenbank soll das Kontaktformular nutzen?"), "waiting_input");
   const slow = await add("MOCK_SLOW Bilder der Galerie für Mobilgeräte optimieren");
   await waitTask(page.request, slow, "running");
@@ -51,16 +53,39 @@ export async function tour(page: Page, info: TestInfo, device: string, full: boo
     await drawer.getByText("Protokoll anzeigen").click();
     await expectAccessible(page, `drawer (${scheme})`);
     await shot(page, out, `${device}-${scheme}-drawer`);
+    // WP06: "Weiter mit …" and commenting in the diff.
+    await expect(drawer.getByTestId("messages")).toContainText("Weiter mit diesem Auftrag");
+    await drawer.getByTestId("comment-mode").click();
+    await drawer.getByTestId("diff").locator("button.d-line").first().click();
+    await drawer.getByTestId("comment-bar").getByRole("button", { name: "Kommentar schreiben" }).click();
+    await expect(drawer.getByTestId("comment-form").getByLabel("Dein Kommentar")).toBeVisible();
+    await expectAccessible(page, `drawer comments (${scheme})`);
+    await shot(page, out, `${device}-${scheme}-comments`);
     await page.keyboard.press("Escape");
     await expect(drawer).toBeHidden();
 
     // WP03: held task with its findings and the masked held changes.
-    await page.locator('article[data-status="held"] button.open').first().click();
+    await page.locator('article[data-status="held"]', { hasText: "Zugangsdaten für den Kalender" }).locator("button.open").click();
     await expect(drawer.getByTestId("gate-panel")).toContainText("Mögliches Geheimnis in den Änderungen");
     await drawer.getByRole("button", { name: "Zurückgehaltene Änderungen ansehen" }).click();
     await expect(drawer.getByTestId("gate-panel").locator(".diff")).toContainText("[geschwärzt: GitHub-Token]");
     await expectAccessible(page, `gate drawer (${scheme})`);
     await shot(page, out, `${device}-${scheme}-gate`);
+    await page.keyboard.press("Escape");
+    await expect(drawer).toBeHidden();
+
+    // WP06: the plan view (with the editor open) and the message box of a running task.
+    await page.locator('article[data-status="held"]', { hasText: "Spendenformular" }).locator("button.open").click();
+    await expect(drawer.getByTestId("plan-panel")).toContainText("MOCKPLAN-STEP-1");
+    await drawer.getByTestId("plan-panel").getByRole("button", { name: "Ändern" }).click();
+    await expectAccessible(page, `plan drawer (${scheme})`);
+    await shot(page, out, `${device}-${scheme}-plan`);
+    await page.keyboard.press("Escape");
+    await expect(drawer).toBeHidden();
+    await page.locator('article[data-status="running"] button.open').first().click();
+    await expect(drawer.getByTestId("messages").getByRole("button", { name: "Sofort zustellen" })).toBeVisible();
+    await expectAccessible(page, `message box (${scheme})`);
+    await shot(page, out, `${device}-${scheme}-messages`);
     await page.keyboard.press("Escape");
     await expect(drawer).toBeHidden();
     if (!full) continue;

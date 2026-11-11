@@ -117,6 +117,8 @@ async fn run_script(
         cache: None,
         secret_env: vec![],
         home_env: vec![],
+        read_only: false,
+        session: None,
     };
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -251,6 +253,7 @@ pub async fn start(
                 allow_test_changes: false,
                 carry_from: None,
                 pr_id: None,
+                plan_mode: false,
             },
         )
         .await?;

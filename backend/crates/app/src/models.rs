@@ -68,6 +68,9 @@ pub struct Project {
     pub pr_labels: Vec<String>,
     pub pr_auto_fix: bool,
     pub pr_max_followups: i32,
+    /// WP06: new tasks plan first; automatic plan approval (minutes, `None` = never).
+    pub plan_mode: bool,
+    pub plan_auto_approve_mins: Option<i32>,
 }
 
 impl Project {
@@ -129,6 +132,8 @@ impl Project {
             data_residency: self.residency(),
             parallelism: self.parallelism,
             output_mode: self.output(),
+            plan_mode: self.plan_mode,
+            plan_auto_approve_mins: self.plan_auto_approve_mins,
         }
     }
 }
@@ -139,6 +144,18 @@ impl Project {
 pub const RESULT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["status","summary","handoff","questions","follow_up_tasks"],"properties":{"status":{"type":"string","enum":["done","failed","needs_input"]},"summary":{"type":"string","description":"max 5 lines, what changed"},"handoff":{"type":"string","description":"max 15 lines for the next agent: current state, decisions, open points, relevant files"},"questions":{"type":"array","items":{"type":"string"}},"follow_up_tasks":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["title","prompt"],"properties":{"title":{"type":"string"},"prompt":{"type":"string"}}}}}}"#;
 
 /// JSON schema of [`ReviewResult`] (strict, see [`RESULT_SCHEMA`]).
+/// WP06 plan runs (Claude `--json-schema`, Codex `--output-schema`): the plan
+/// and open questions. Live-checked with Claude Code 2.1.322 in plan mode.
+pub const PLAN_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["plan","questions"],"properties":{"plan":{"type":"string","description":"the implementation plan: steps, files, risks, how to verify"},"questions":{"type":"array","items":{"type":"string"},"description":"only decisions you cannot make yourself"}}}"#;
+
+/// Result of a plan run.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlanResult {
+    pub plan: String,
+    #[serde(default)]
+    pub questions: Vec<String>,
+}
+
 pub const REVIEW_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["approved","issues"],"properties":{"approved":{"type":"boolean"},"issues":{"type":"array","items":{"type":"string"}}}}"#;
 
 /// Contract between queue and agent: structured output of the CLI or
@@ -204,7 +221,7 @@ mod tests {
 
     #[test]
     fn schemas_are_strict_and_match_structs() {
-        for s in [RESULT_SCHEMA, REVIEW_SCHEMA] {
+        for s in [RESULT_SCHEMA, REVIEW_SCHEMA, PLAN_SCHEMA] {
             let v: Value = serde_json::from_str(s).expect("valid JSON");
             assert_strict(&v, "$");
         }

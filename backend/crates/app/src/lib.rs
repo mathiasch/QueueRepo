@@ -21,6 +21,7 @@ pub mod llm;
 pub mod models;
 pub mod notify;
 pub mod oidc;
+pub mod plan;
 pub mod pr;
 pub mod pricing;
 pub mod prompt;
@@ -30,6 +31,7 @@ pub mod routing;
 pub mod runner;
 pub mod runner_client;
 pub mod state;
+pub mod steer;
 pub mod worker;
 
 use anyhow::Context;

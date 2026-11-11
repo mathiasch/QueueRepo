@@ -12,19 +12,21 @@ use serde_json::Value;
 
 use super::{
     classify::ErrorCategory, error_event, n, s, trunc, AgentEvent, ConnCfg, Credential, Invocation,
-    ParseState, RetryInfo, RunKind,
+    ParseState, RetryInfo, RunKind, Session,
 };
-use crate::models::{Usage, RESULT_SCHEMA, REVIEW_SCHEMA};
+use crate::models::{Usage, PLAN_SCHEMA, RESULT_SCHEMA, REVIEW_SCHEMA};
 
 pub(super) fn invocation(
     inv: &mut Invocation,
     model: Option<&str>,
     cred: &Credential,
     kind: RunKind,
+    session: &Session,
 ) -> Result<()> {
     let (file, schema) = match kind {
         RunKind::Agent => ("result.schema.json", RESULT_SCHEMA),
         RunKind::Review => ("review.schema.json", REVIEW_SCHEMA),
+        RunKind::Plan => ("plan.schema.json", PLAN_SCHEMA),
     };
     inv.program = "codex".into();
     inv.args = [
@@ -40,6 +42,16 @@ pub(super) fn invocation(
     inv.queue_files.push((file.into(), schema.into()));
     if let Some(m) = model {
         inv.args.extend(["--model".into(), m.into()]);
+    }
+    // WP06: `codex exec … resume <SESSION_ID> -` (0.167.0 binary strings:
+    // "Resume a previous session by id …", "Prompt to send after resuming
+    // the session. If `-` is used, read from stdin"; not executed). Codex
+    // reports its id in `thread.started`. Plan runs keep the bypass: the
+    // container is Codex's sandbox in every run (its own Landlock sandbox
+    // inside a container is not verified); the runner mounts the workspace
+    // read-only and discards it.
+    if let Session::Resume(id) = session {
+        inv.args.extend(["resume".into(), id.clone()]);
     }
     inv.args.push("-".into()); // prompt from stdin
     let kind = match &cred.conn {

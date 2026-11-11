@@ -49,7 +49,10 @@ async fn branch_of(st: &AppState, task: &Task) -> Result<String, RunError> {
 }
 
 /// Changes of the task this fix continues (unmerged work on its branch).
-async fn carry_of(st: &AppState, task: &Task) -> Result<Option<(Carry, String)>, RunError> {
+pub(super) async fn carry_of(
+    st: &AppState,
+    task: &Task,
+) -> Result<Option<(Carry, String)>, RunError> {
     let Some(pid) = task.carry_from else {
         return Ok(None);
     };
@@ -78,7 +81,7 @@ async fn carry_of(st: &AppState, task: &Task) -> Result<Option<(Carry, String)>,
 
 /// WP05: a pull-request follow-up starts on the request's branch as it is
 /// on the host now (fetched by the runner from the project's remote URL).
-async fn pr_start(
+pub(super) async fn pr_start(
     st: &AppState,
     task: &Task,
     project: &Project,
@@ -277,6 +280,10 @@ pub async fn run_merge(st: AppState, task: Task, cancel: CancellationToken, gen:
             .await;
             requeue_merge(&st, &task, &msg).await;
         }
+    }
+    // WP06: messages sent while the task was being merged.
+    if let Err(e) = crate::steer::settle(&st, id).await {
+        tracing::warn!("task {id}: messages not settled: {e:#}");
     }
     st.untrack(id, gen).await;
     st.wake.notify_one();
@@ -580,8 +587,8 @@ async fn clean_carried(st: &AppState, project: Uuid, task: &Task) {
 /// Removes a task's working tree; with `branch` also its branch in the main
 /// repository (best effort – the hourly sweep retries).
 pub(crate) async fn cleanup_task(st: &AppState, project: Uuid, id: Uuid, branch: bool) {
-    let Ok(Some((b, active))) = sqlx::query_as::<_, (Option<String>, bool)>(
-        "SELECT branch, EXISTS (SELECT 1 FROM tasks c WHERE c.carry_from = t.id AND NOT (c.status = ANY($2)))
+    let Ok(Some((b, active, plan_mode))) = sqlx::query_as::<_, (Option<String>, bool, bool)>(
+        "SELECT branch, EXISTS (SELECT 1 FROM tasks c WHERE c.carry_from = t.id AND NOT (c.status = ANY($2))), plan_mode
          FROM tasks t WHERE id=$1",
     )
     .bind(id)
@@ -591,6 +598,14 @@ pub(crate) async fn cleanup_task(st: &AppState, project: Uuid, id: Uuid, branch:
     else {
         return;
     };
+    if plan_mode {
+        // WP06: a throwaway plan working tree left by a crash (normally
+        // removed right after the plan run).
+        let _ = st
+            .runner
+            .remove_task(project, super::plan::plan_ws_id(id), None)
+            .await;
+    }
     if b.is_none() {
         return;
     }

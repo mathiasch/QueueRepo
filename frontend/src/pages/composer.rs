@@ -108,6 +108,8 @@ pub fn Composer() -> impl IntoView {
     let parent = RwSignal::new(String::new());
     let front = RwSignal::new(false);
     let test_task = RwSignal::new(false);
+    // WP06: plan first (`None` = the project's default).
+    let plan_first = RwSignal::new(None::<bool>);
     let advanced = RwSignal::new(false);
     let busy = RwSignal::new(false);
     let limits = RwSignal::new(LimitForm::default());
@@ -132,6 +134,12 @@ pub fn Composer() -> impl IntoView {
                 .or(ps.first())
                 .map(|(id, _)| *id)
         })
+    });
+    let project_plan_mode = Memo::new(move |_| {
+        let pid = project_id.get();
+        store
+            .projects
+            .with(|ps| ps.iter().any(|p| Some(p.id) == pid && p.plan_mode))
     });
     let parents = Memo::new(move |_| {
         let Some(pid) = project_id.get() else {
@@ -220,6 +228,7 @@ pub fn Composer() -> impl IntoView {
             connector_id: parse_access(&access.get_untracked()).0,
             front: front.get_untracked(),
             allow_test_changes: test_task.get_untracked(),
+            plan_mode: plan_first.get_untracked(),
             limits: lim.create_fields(),
         };
         spawn_local(async move {
@@ -231,6 +240,7 @@ pub fn Composer() -> impl IntoView {
                     parent.set(String::new());
                     front.set(false);
                     test_task.set(false);
+                    plan_first.set(None);
                     limits.set(LimitForm::default());
                     store.announce(format!("„{}“ eingereiht", first_line(&t.title, 60)));
                     if let Some(el) = textarea.get_untracked() {
@@ -349,6 +359,15 @@ pub fn Composer() -> impl IntoView {
                                     {move || suggestions.get().into_iter().map(|m| view! { <option value=m></option> }).collect_view()}
                                 </datalist>
                             </Field>
+                        </div>
+                        <div class="row">
+                            <label class="check">
+                                <input type="checkbox" data-testid="plan-first"
+                                    prop:checked=move || plan_first.get().unwrap_or_else(|| project_plan_mode.get())
+                                    on:change=move |ev| plan_first.set(Some(event_target_checked(&ev)))/>
+                                <span class="check-text">"Erst einen Plan zeigen"<small>"Der Agent ändert nichts, bis du seinen Plan freigibst."</small></span>
+                            </label>
+                            <HelpTip topic="Plan-Modus" text=help::PLAN_MODE/>
                         </div>
                         <div class="row">
                             <label class="check">

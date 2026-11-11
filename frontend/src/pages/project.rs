@@ -600,6 +600,8 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
     let auto_push = RwSignal::new(p.auto_push);
     let is_owner = p.role == ProjectRole::Owner;
     let parallelism = RwSignal::new(p.parallelism);
+    let plan_mode = RwSignal::new(p.plan_mode);
+    let plan_auto = RwSignal::new(p.plan_auto_approve_mins);
     let limits = RwSignal::new(LimitForm::from_project(&p));
     let errors = RwSignal::new(Vec::<(LimitField, String)>::new());
     let busy = RwSignal::new(false);
@@ -650,6 +652,9 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
             auto_push: is_owner.then(|| auto_push.get_untracked()),
             // Owner only (the server refuses it from editors).
             parallelism: is_owner.then(|| parallelism.get_untracked()),
+            // WP06, owner only as well.
+            plan_mode: is_owner.then(|| plan_mode.get_untracked()),
+            plan_auto_approve_mins: is_owner.then(|| plan_auto.get_untracked()),
             ..Default::default()
         };
         lim.apply_to_project(&mut body);
@@ -770,6 +775,7 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
     };
     let goal_ids = FieldIds::new("ps-goal");
     let par_ids = FieldIds::new("ps-par");
+    let auto_ids = FieldIds::new("ps-plan-auto");
     let token_ids = FieldIds::new("ps-token");
     let rp_ids = FieldIds::new("ps-rprov");
     view! {
@@ -805,6 +811,35 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
                                 {if n == 1 { "1 – nacheinander".to_string() } else { format!("{n} gleichzeitig") }}
                             </option>
                         }).collect_view()}
+                    </select>
+                </Field>
+            </section>
+            <section class="form-section" data-testid="plan-settings">
+                <header>
+                    <h2 class="row">"Erst planen, dann umsetzen" <HelpTip topic="Plan-Modus" text=queued_api::steer::PLAN_MODE_HELP align="align-start"/></h2>
+                    <p>"Der Agent zeigt dir zuerst seinen Plan. Er ändert nichts, bevor du ihn freigibst."</p>
+                </header>
+                <label class="switch">
+                    <input type="checkbox" role="switch" name="plan_mode" disabled=!can_edit || !is_owner prop:checked=move || plan_mode.get() on:change=move |ev| plan_mode.set(event_target_checked(&ev))/>
+                    <span class="check-text">"Plan-Modus für neue Aufträge"<small>{if is_owner { "Gilt als Voreinstellung; im Auftrag unter „Erweitert“ änderbar." } else { "Nur die Eigentümerin oder der Eigentümer des Projekts kann das ändern." }}</small></span>
+                </label>
+                <Field ids=auto_ids.clone() label="Automatisch genehmigen" help=queued_api::steer::AUTO_APPROVE_HELP hint="Standard: nie. Ein Plan mit offenen Fragen wartet immer auf einen Menschen.">
+                    <select
+                        id=auto_ids.id.clone()
+                        class="select"
+                        name="plan_auto_approve"
+                        disabled=!can_edit || !is_owner
+                        aria-describedby=auto_ids.described_by()
+                        prop:value=move || plan_auto.get().map(|m| m.to_string()).unwrap_or_default()
+                        on:change=move |ev| plan_auto.set(event_target_value(&ev).parse().ok())
+                    >
+                        {queued_api::steer::AUTO_APPROVE_CHOICES.iter().map(|(v, label)| {
+                            let v = *v;
+                            view! { <option value=v.map(|m| m.to_string()).unwrap_or_default() selected=move || plan_auto.get() == v>{*label}</option> }
+                        }).collect_view()}
+                        {move || plan_auto.get().filter(|m| !queued_api::steer::AUTO_APPROVE_CHOICES.iter().any(|(v, _)| *v == Some(*m))).map(|m| view! {
+                            <option value=m.to_string() selected=true>{queued_api::steer::auto_approve_label(Some(m))}</option>
+                        })}
                     </select>
                 </Field>
             </section>

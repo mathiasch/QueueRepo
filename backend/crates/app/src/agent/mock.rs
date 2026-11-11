@@ -22,20 +22,75 @@
 //! file conflict in the merge queue and different files do not),
 //! MOCK_RESOLVE (removes git conflict markers, keeping both sides – a fix
 //! task inherits the keyword from the original prompt).
+//! WP06: sessions in `$HOME/.mock-sessions/<id>` (`QUEUE_SESSION_ID`,
+//! `QUEUE_RESUME`; an unknown id fails like Claude's "No conversation
+//! found"); a resumed run only logs and finishes (MOCK_STEER_SLOW: slowly).
+//! Plan mode (`QUEUE_PLAN_MODE=1`) writes nothing and answers a plan with
+//! MOCKPLAN-STEP-n lines (MOCK_PLAN_WRITE: tries to write a file anyway,
+//! MOCK_PLAN_ASK: structured plan with a question, MOCK_PLAN_EMPTY: no plan,
+//! MOCK_PLAN_SLOW: 30 s). Tokens MOCKMSG*/MOCKPLAN*/MOCKNOTE*/MOCKCOMMENT*
+//! in a prompt are appended to `SEEN.md` (`SEEN-<file>` with MOCK_FILE, so
+//! parallel tasks do not conflict) – what reached the agent.
+//! MOCK_REWRITE / MOCK_PREPEND: once answered (MOCK_ASK), the run line
+//! replaces the file / goes on top (changes the diff under inline comments).
 use serde_json::Value;
 
 use super::{
     classify::ErrorCategory, error_event, n, s, AgentEvent, Invocation, LimitKind, RetryInfo,
-    RunLimits,
+    RunKind, RunLimits, Session,
 };
 use crate::models::Usage;
 
-const MOCK_SCRIPT: &str = r#"P=$(cat); mkdir -p .queue
-echo '{"type":"text","text":"mock agent: reading task"}'
+const MOCK_SCRIPT: &str = r#"P=$(cat)
+if [ -n "$QUEUE_RESUME" ]; then
+  if [ ! -f "$HOME/.mock-sessions/$QUEUE_RESUME" ]; then
+    echo "No conversation found with session ID: $QUEUE_RESUME" >&2
+    echo '{"type":"error","text":"No conversation found with session ID: '"$QUEUE_RESUME"'"}'; exit 1
+  fi
+  SID=$QUEUE_RESUME
+else
+  SID=${QUEUE_SESSION_ID:-mock-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')}
+fi
+mkdir -p "$HOME/.mock-sessions"; N=0
+[ -f "$HOME/.mock-sessions/$SID" ] && N=$(wc -l < "$HOME/.mock-sessions/$SID" | tr -d ' ')
+printf '%s\n' "$P" | head -c 200 | tr '\n' ' ' >> "$HOME/.mock-sessions/$SID"; echo >> "$HOME/.mock-sessions/$SID"
+echo '{"type":"session","id":"'"$SID"'"}'
+if [ "$QUEUE_PLAN_MODE" = 1 ]; then
+  echo '{"type":"text","text":"mock agent: planning (read-only)"}'
+  [ -e PLAN_SIDE_EFFECT.txt ] && echo '{"type":"text","text":"mock agent: saw a leftover"}'
+  echo '{"type":"usage","input_tokens":900,"output_tokens":120}'
+  case "$P" in *MOCK_PLAN_WRITE*) echo sneaky > PLAN_SIDE_EFFECT.txt 2>/dev/null; echo '{"type":"tool","text":"edit PLAN_SIDE_EFFECT.txt"}';; esac
+  case "$P" in *MOCK_PLAN_SLOW*) sleep 30;; esac
+  case "$P" in *MOCK_PLAN_EMPTY*) echo '{"type":"final","text":""}'; exit 0;; esac
+  R=""; case "$P" in *"Revision requested"*) R=" (überarbeitet)";; esac
+  case "$P" in
+    *MOCK_PLAN_ASK*) printf '%s\n' '{"type":"structured","value":{"plan":"Plan'"$R"':\n1. MOCKPLAN-STEP-1 MOCK_LOG.md ergänzen","questions":["Postgres oder SQLite?"]}}';;
+    *) printf '%s\n' '{"type":"final","text":"Plan'"$R"':\n1. MOCKPLAN-STEP-1 MOCK_LOG.md ergänzen\n2. MOCKPLAN-STEP-2 prüfen"}';;
+  esac
+  exit 0
+fi
+mkdir -p .queue
 L=MOCK_LOG.md
 case "$P" in *MOCK_FILE:*) L=$(printf '%s\n' "$P" | sed -n 's/.*MOCK_FILE:\([A-Za-z0-9_.-]*\).*/\1/p' | head -n 1);; esac
+S=SEEN.md; [ "$L" != MOCK_LOG.md ] && S="SEEN-$L"
+T=$(printf '%s\n' "$P" | grep -o 'MOCK\(MSG\|PLAN\|NOTE\|COMMENT\)[A-Za-z0-9_-]*' | sort -u | tr '\n' ' ')
+[ -n "$T" ] && echo "run ${QUEUE_RESUME:+resume }$T" >> "$S"
+if [ -n "$QUEUE_RESUME" ]; then
+  echo '{"type":"text","text":"mock agent: resumed session '"$SID"' after '"$N"' earlier prompts"}'
+  echo '{"type":"usage","input_tokens":300,"output_tokens":40,"cache_read_tokens":1200}'
+  echo "resumed $(date -u +%FT%TZ) $(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$L"
+  case "$P" in *MOCK_STEER_SLOW*) echo '{"type":"text","text":"working slowly"}'; sleep 30;; esac
+  echo '{"status":"done","summary":"mock resumed","handoff":"resumed handoff"}' > .queue/result.json
+  echo '{"type":"final","text":"resumed"}'; exit 0
+fi
+echo '{"type":"text","text":"mock agent: reading task"}'
 echo '{"type":"tool","text":"edit '"$L"'"}'
-echo "run $(date -u +%FT%TZ) $(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$L"
+R="run $(date -u +%FT%TZ) $(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+case "$P" in
+  *MOCK_REWRITE*"Answers from user"*) echo "$R" > "$L";;
+  *MOCK_PREPEND*"Answers from user"*) { echo "$R"; cat "$L"; } > "$L.new"; mv "$L.new" "$L";;
+  *) echo "$R" >> "$L";;
+esac
 echo '{"type":"usage","input_tokens":1200,"output_tokens":150,"cache_read_tokens":800}'
 case "$P" in
   *"strict code reviewer"*)
@@ -112,9 +167,22 @@ case "$P" in
 esac
 echo '{"type":"final","text":"finished"}'"#;
 
-pub(super) fn invocation(inv: &mut Invocation, limits: &RunLimits) {
+pub(super) fn invocation(
+    inv: &mut Invocation,
+    limits: &RunLimits,
+    kind: RunKind,
+    session: &Session,
+) {
     inv.program = "sh".into();
     inv.args = vec!["-c".into(), MOCK_SCRIPT.into()];
+    if kind == RunKind::Plan {
+        inv.env.push(("QUEUE_PLAN_MODE".into(), "1".into()));
+    }
+    match session {
+        Session::Start(id) => inv.env.push(("QUEUE_SESSION_ID".into(), id.clone())),
+        Session::Resume(id) => inv.env.push(("QUEUE_RESUME".into(), id.clone())),
+        Session::None => {}
+    }
     // Analogue of the CLI flags, so integration tests can see what was passed.
     if let Some(t) = limits.turns {
         inv.env.push(("QUEUE_MAX_TURNS".into(), t.to_string()));

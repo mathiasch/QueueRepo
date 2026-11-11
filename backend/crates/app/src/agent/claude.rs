@@ -14,9 +14,9 @@ use serde_json::Value;
 use super::{
     classify::{epoch_value, ErrorCategory},
     count, n, s, tool_summary, trunc, usd, AgentEvent, ConnCfg, Credential, Invocation, LimitKind,
-    ParseState, RetryInfo, RunKind, RunLimits,
+    ParseState, RetryInfo, RunKind, RunLimits, Session,
 };
-use crate::models::{Usage, RESULT_SCHEMA, REVIEW_SCHEMA};
+use crate::models::{Usage, PLAN_SCHEMA, RESULT_SCHEMA, REVIEW_SCHEMA};
 
 pub(super) fn invocation(
     inv: &mut Invocation,
@@ -24,6 +24,7 @@ pub(super) fn invocation(
     cred: &Credential,
     limits: &RunLimits,
     kind: RunKind,
+    session: &Session,
 ) -> Result<()> {
     inv.program = "claude".into();
     inv.args = [
@@ -32,17 +33,32 @@ pub(super) fn invocation(
         "stream-json",
         "--verbose",
         "--permission-mode",
-        "bypassPermissions",
+        // WP06: plan mode (live-checked with 2.1.322: reads, writes nothing
+        // in the workspace, delivers the plan as structured output).
+        if kind == RunKind::Plan {
+            "plan"
+        } else {
+            "bypassPermissions"
+        },
         "--permission-prompts",
         "none",
         "--json-schema",
         match kind {
             RunKind::Agent => RESULT_SCHEMA,
             RunKind::Review => REVIEW_SCHEMA,
+            RunKind::Plan => PLAN_SCHEMA,
         },
     ]
     .map(String::from)
     .to_vec();
+    // `--session-id <uuid>` / `--resume <id>` (live-checked with 2.1.322:
+    // resume works in a fresh HOME with only `.claude/projects` restored,
+    // also with another permission mode and from another directory).
+    match session {
+        Session::Start(id) => inv.args.extend(["--session-id".into(), id.clone()]),
+        Session::Resume(id) => inv.args.extend(["--resume".into(), id.clone()]),
+        Session::None => {}
+    }
     if let Some(t) = limits.turns {
         inv.args.extend(["--max-turns".into(), t.to_string()]);
     }

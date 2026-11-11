@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use super::{
     error_event, n, s, tool_summary, trunc, AgentEvent, Credential, Invocation, LimitKind,
-    ParseState, RunLimits,
+    ParseState, RunKind, RunLimits, Session,
 };
 use crate::models::Usage;
 
@@ -26,17 +26,30 @@ pub(super) fn invocation(
     model: Option<&str>,
     cred: &Credential,
     limits: &RunLimits,
+    kind: RunKind,
+    session: &Session,
 ) -> Result<()> {
     inv.program = "gemini".into();
-    inv.args = [
-        "--output-format",
-        "stream-json",
-        "--yolo",
-        "-p",
-        "Follow the instructions given on stdin.",
-    ]
-    .map(String::from)
-    .to_vec();
+    inv.args = ["--output-format", "stream-json"]
+        .map(String::from)
+        .to_vec();
+    // WP06: `--approval-mode plan` ("plan (read-only mode)"), `--session-id`
+    // and `--resume <uuid>` – 0.67.0 bundle (yargs options and
+    // `resolveSession`), not executed.
+    if kind == RunKind::Plan {
+        inv.args.extend(["--approval-mode".into(), "plan".into()]);
+    } else {
+        inv.args.push("--yolo".into());
+    }
+    inv.args.extend([
+        "-p".into(),
+        "Follow the instructions given on stdin.".into(),
+    ]);
+    match session {
+        Session::Start(id) => inv.args.extend(["--session-id".into(), id.clone()]),
+        Session::Resume(id) => inv.args.extend(["--resume".into(), id.clone()]),
+        Session::None => {}
+    }
     if let Some(m) = model {
         inv.args.extend(["--model".into(), m.into()]);
     }
