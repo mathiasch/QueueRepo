@@ -20,6 +20,7 @@
 //! WP04: MOCK_FILE:<name> (the run line goes to `<name>` instead of
 //! `MOCK_LOG.md`; every run line is unique, so two tasks writing the same
 //! file conflict in the merge queue and different files do not),
+//! MOCK_LONG (like MOCK_SLOW, 300 s – long UI walkthroughs),
 //! MOCK_RESOLVE (removes git conflict markers, keeping both sides – a fix
 //! task inherits the keyword from the original prompt).
 //! WP06: sessions in `$HOME/.mock-sessions/<id>` (`QUEUE_SESSION_ID`,
@@ -103,6 +104,7 @@ case "$P" in
 esac
 case "$P" in
   *MOCK_SLOW*) echo '{"type":"text","text":"working slowly"}'; sleep 30;;
+  *MOCK_LONG*) echo '{"type":"text","text":"working slowly"}'; sleep 300;;
   *MOCK_QUIET*) sleep 6;;
   *MOCK_USAGE_TOTAL*) echo '{"type":"usage_total","input_tokens":4000,"output_tokens":500}';;
   *MOCK_TRAP*)

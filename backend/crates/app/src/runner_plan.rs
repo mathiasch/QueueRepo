@@ -45,8 +45,50 @@ pub(crate) fn extract_plan(structured: Option<&Value>, final_text: &str) -> Opti
     let t = final_text.trim();
     (!t.is_empty()).then(|| PlanResult {
         plan: t.to_string(),
-        questions: vec![],
+        questions: text_questions(t),
     })
+}
+
+/// Questions in a plain-text plan (CLIs without a schema): the lines of a
+/// final "Questions"/"Fragen" section, as the plan prompt asks for. Without
+/// them an automatic approval could pass over open questions.
+fn text_questions(plan: &str) -> Vec<String> {
+    let heading = |l: &str| {
+        let h = l
+            .trim()
+            .trim_start_matches('#')
+            .trim()
+            .trim_matches('*')
+            .trim_end_matches(':')
+            .trim()
+            .to_lowercase();
+        matches!(
+            h.as_str(),
+            "questions" | "open questions" | "fragen" | "offene fragen"
+        )
+    };
+    let Some(start) = plan.lines().position(heading) else {
+        return vec![];
+    };
+    plan.lines()
+        .skip(start + 1)
+        .take_while(|l| !l.trim_start().starts_with('#'))
+        .map(|l| {
+            l.trim()
+                .trim_start_matches(['-', '*', '•'])
+                .trim()
+                .to_string()
+        })
+        .filter(|l| {
+            !l.is_empty()
+                && !matches!(
+                    l.to_lowercase().as_str(),
+                    "none" | "keine" | "none." | "keine."
+                )
+        })
+        .map(|l| l.chars().take(500).collect())
+        .take(20)
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -277,6 +319,21 @@ mod tests {
         let p = extract_plan(Some(&json!({"plan": ""})), "Plan: x").unwrap();
         assert_eq!((p.plan.as_str(), p.questions.len()), ("Plan: x", 0));
         assert!(extract_plan(None, "  ").is_none());
+        // Plain-text plans: a final questions section counts as questions.
+        let p = extract_plan(
+            None,
+            "1. a\n2. b\n\n## Questions\n- Postgres or SQLite?\n- Which port?\n",
+        )
+        .unwrap();
+        assert_eq!(p.questions, ["Postgres or SQLite?", "Which port?"]);
+        let p = extract_plan(None, "Schritte\n\n**Fragen:**\n* Welche Datenbank?").unwrap();
+        assert_eq!(p.questions, ["Welche Datenbank?"]);
+        let p = extract_plan(None, "1. a\n\nQuestions:\nNone\n").unwrap();
+        assert!(p.questions.is_empty());
+        assert!(extract_plan(None, "1. ask questions later")
+            .unwrap()
+            .questions
+            .is_empty());
         assert!(extract_plan(Some(&json!({"status": "done"})), "").is_none());
     }
 

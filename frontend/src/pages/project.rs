@@ -821,7 +821,7 @@ fn ProjectSettings(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
                 </header>
                 <label class="switch">
                     <input type="checkbox" role="switch" name="plan_mode" disabled=!can_edit || !is_owner prop:checked=move || plan_mode.get() on:change=move |ev| plan_mode.set(event_target_checked(&ev))/>
-                    <span class="check-text">"Plan-Modus für neue Aufträge"<small>{if is_owner { "Gilt als Voreinstellung; im Auftrag unter „Erweitert“ änderbar." } else { "Nur die Eigentümerin oder der Eigentümer des Projekts kann das ändern." }}</small></span>
+                    <span class="check-text">"Plan-Modus für neue Aufträge"<small>{if is_owner { "Gilt als Voreinstellung; im Auftrag unter „Erweitert“ änderbar." } else { "Ändern kann nur, wem das Projekt gehört." }}</small></span>
                 </label>
                 <Field ids=auto_ids.clone() label="Automatisch genehmigen" help=queued_api::steer::AUTO_APPROVE_HELP hint="Standard: nie. Ein Plan mit offenen Fragen wartet immer auf einen Menschen.">
                     <select

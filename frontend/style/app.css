@@ -263,8 +263,9 @@ button, .btn, input, select, textarea { font: inherit; color: inherit; }
   display: inline-grid; place-items: center; min-width: 20px; height: 20px; padding: 0 6px; border-radius: var(--r-full);
   background: var(--primary); color: var(--on-primary); font-size: 11px; font-weight: 750; line-height: 1;
 }
-.badge.attention { background: var(--warning); color: light-dark(#fff, #1a1200); }
-:root:not([data-theme="dark"]) .badge.attention { background: #b45309; }
+/* Light: dark amber with white text; dark: bright amber with dark text (the
+   old `:not([data-theme="dark"])` rule also hit the system dark mode). */
+.badge.attention { background: light-dark(#b45309, var(--warning)); color: light-dark(#fff, #1a1200); }
 
 /* Help tip (toggletip) */
 .help { position: relative; display: inline-flex; vertical-align: middle; }
@@ -768,7 +769,7 @@ ol.list { list-style: none; padding: 0; margin: 0; }
   display: flex; gap: 10px; padding: 0 14px 0 6px; white-space: pre; min-height: 1.5em; min-width: 100%; width: max-content;
   text-align: left; font: inherit; color: inherit; border: 0; border-radius: 0; margin: 0;
 }
-.diff .d-line { cursor: pointer; background-clip: padding-box; }
+.diff .d-line { cursor: pointer; background-clip: padding-box; min-height: 24px; align-items: center; } /* WCAG 2.5.8 */
 .diff .d-line.d-ctx { background: transparent; }
 .diff .d-line:hover { box-shadow: inset 2px 0 0 var(--border-strong); }
 .diff .d-line[aria-pressed="true"] { box-shadow: inset 4px 0 0 var(--primary); background: color-mix(in srgb, var(--primary) 18%, var(--surface-2)); }

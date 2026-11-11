@@ -19,7 +19,8 @@ async function seed(page: Page) {
   // WP06: a plan that waits for approval.
   await waitTask(page.request, await add("Spendenformular mit Bestätigungsmail", { plan_mode: true }), "held");
   await waitTask(page.request, await add("MOCK_ASK Welche Datenbank soll das Kontaktformular nutzen?"), "waiting_input");
-  const slow = await add("MOCK_SLOW Bilder der Galerie für Mobilgeräte optimieren");
+  // Runs through the whole walkthrough (both colour schemes), cancelled at the end.
+  const slow = await add("MOCK_LONG Bilder der Galerie für Mobilgeräte optimieren");
   await waitTask(page.request, slow, "running");
   await add("Impressum und Datenschutzerklärung ergänzen", { max_tokens: 200000, max_turns: 30 });
   await add("Barrierefreiheit der Navigation prüfen");

@@ -49,6 +49,9 @@ Grundlage: `WP06-plan.md`. Branch `mvp`, nicht committet. Testbericht: `WP06-tes
 | — | Nachricht an `waiting_input` = Antwort | sonst wartete die Nachricht auf eine Antwort, die nie kommt |
 | — | Zustellart nach gescheitertem Resume korrigiert („Übergabe“) | die Anzeige „in die laufende Sitzung“ wäre falsch gewesen |
 | — | Diff-Zeilen: Sichtbarer Text Teil des Namens | axe `label-content-name-mismatch` (WCAG 2.5.3) |
+| Fragen nur aus structured output | zusätzlich aus einem Abschnitt „Questions“/„Fragen“ im Text-Plan | Selbst-Review (B6): Text-Pläne (Gemini, opencode, Planung per API) hätten trotz offener Fragen automatisch genehmigt werden können |
+| — | `.badge.attention` per `light-dark()` | Bestands-Kontrastfehler im System-Dunkelmodus, sichtbar durch den zusätzlichen gehaltenen Auftrag in der Tour |
+| — | Mock `MOCK_LONG` (300 s) in der Tour | der laufende Seed-Auftrag war im zweiten Farbdurchgang schon fertig |
 
 ## 4. Belege je CLI
 
