@@ -153,7 +153,11 @@ async fn plan_mode_changes_nothing_and_approval_implements_the_plan(pool: PgPool
     assert!(!read(&h, &p, "MOCK_LOG.md").is_empty());
     assert!(!h.workspace(&p).join("PLAN_SIDE_EFFECT.txt").exists());
     // A leftover of a crashed plan run is never what the next plan run sees.
-    let blocker = a.task(&p, "MOCK_SLOW blocker").await;
+    // Without plan mode: otherwise the blocker itself is planned and held
+    // after ~0.1 s, and `running` was only visible by luck (race, WP07).
+    let blocker = a
+        .task_with(&p, "MOCK_SLOW blocker", json!({"plan_mode": false}))
+        .await;
     a.wait_status(&blocker, &["running"]).await;
     let t3 = a.task(&p, "MOCK_PLAN_WRITE second plan").await;
     let stale = plan_ws(&h, &t3);

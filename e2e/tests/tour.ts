@@ -24,6 +24,13 @@ async function seed(page: Page) {
   await waitTask(page.request, slow, "running");
   await add("Impressum und Datenschutzerklärung ergänzen", { max_tokens: 200000, max_turns: 30 });
   await add("Barrierefreiheit der Navigation prüfen");
+  // WP07: template, schedule, webhook (fired once by hand), API token.
+  const tpl = await (await page.request.post(`/api/projects/${pid}/templates`, { data: { name: "Linkprüfung", title: "Defekte Links finden", prompt: "Finde defekte Links auf der Website" } })).json();
+  await page.request.post(`/api/projects/${pid}/triggers`, { data: { template_id: tpl.id, kind: "schedule", name: "Jeden Montag", cron: "0 8 * * 1", timezone: "Europe/Zurich" } });
+  const hook = await (await page.request.post(`/api/projects/${pid}/triggers`, { data: { template_id: tpl.id, kind: "webhook", name: "Nach dem Deploy" } })).json();
+  // Fired by hand: the task waits behind the long-running one (history shows "erstellt").
+  expect((await page.request.post(`/api/triggers/${hook.trigger.id}/fire`, { data: {} })).status()).toBe(201);
+  await page.request.post("/api/tokens", { data: { name: "Laptop", scopes: ["projects:read", "tasks:read", "tasks:write"], expires_in_days: 90 } });
   return { pid, slow };
 }
 
@@ -132,6 +139,14 @@ export async function tour(page: Page, info: TestInfo, device: string, full: boo
     await expect(page.getByText("--strict-mcp-config", { exact: false })).toBeVisible();
     await expectAccessible(page, `project protection (${scheme})`);
     await shot(page, out, `${device}-${scheme}-project-protection`, device === "desktop");
+    // WP07: templates, triggers and the history of a fired one.
+    await page.getByRole("tab", { name: "Automatisierung" }).click();
+    await expect(page.getByTestId("trigger-row")).toHaveCount(2);
+    const hookRow = page.getByTestId("trigger-row").filter({ hasText: "Nach dem Deploy" });
+    await hookRow.getByTestId("trigger-history").locator("summary").click();
+    await expect(hookRow.getByTestId("run-row")).toHaveCount(1);
+    await expectAccessible(page, `project automation (${scheme})`);
+    await shot(page, out, `${device}-${scheme}-project-automation`, device === "desktop");
     await page.getByRole("tab", { name: "Mitglieder" }).click();
     await expect(page.locator(".member")).toHaveCount(1);
     await expectAccessible(page, `project members (${scheme})`);
@@ -143,6 +158,7 @@ export async function tour(page: Page, info: TestInfo, device: string, full: boo
     await page.locator("#connectors").getByRole("button", { name: "Zugang hinzufügen" }).click();
     await expect(page.getByTestId("connector-form")).toBeVisible();
     await expect(page.getByTestId("price-table")).toBeVisible();
+    await expect(page.getByTestId("token-row")).toHaveCount(1);
     await expectAccessible(page, `settings (${scheme})`);
     await shot(page, out, `${device}-${scheme}-settings`, device === "desktop");
 

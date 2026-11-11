@@ -28,10 +28,11 @@ Browser / iPhone-PWA ──HTTPS──► Cloudflare Tunnel ──► queued  (U
 
 | Komponente | Pfad | Verantwortung |
 |---|---|---|
-| `queued` | `backend/crates/app` | API, Auth, Scheduler (`FOR UPDATE SKIP LOCKED`), Budgets, Prompts, Fix-Loop, OnEmptyQueue |
+| `queued` | `backend/crates/app` | API, Auth (Cookie + API-Tokens), Scheduler (`FOR UPDATE SKIP LOCKED`), Zeitpläne und Webhooks, Budgets, Prompts, Fix-Loop, OnEmptyQueue |
 | `queued-runner` | `backend/crates/runner` | Git (init/clone/commit/diff/revert/push, Arbeitsverzeichnis pro Auftrag, Merge-Queue-Schritte), Sandbox-Exec mit NDJSON-Streaming, Cancel |
 | `queued-common` | `backend/crates/common` | Wire-Protokoll zwischen beiden |
-| `queued-api` | `backend/crates/api` | HTTP-/SSE-Typen, geteilt von Backend und Frontend (kompiliert auch nach WASM) |
+| `queued-api` | `backend/crates/api` | HTTP-/SSE-Typen, geteilt von Backend und Frontend (kompiliert auch nach WASM); auch Token-Format, Berechtigungen und Cron-Dialekt (WP07) |
+| `queuectl` | `backend/crates/queuectl` | Kommandozeilen-Client mit API-Token (WP07, siehe „Automatisierung“) |
 | Frontend `queued-web` | `frontend/` | Rust/Leptos (CSR, WebAssembly, Build mit Trunk), PWA mit Web Push, Safe-Area-fähig (Notch/Dynamic Island), Tab-Leiste unten auf dem iPhone, hell/dunkel, WCAG 2.2 AA |
 | Tests | `backend/**/tests`, `frontend/src/**` (`cargo test`), `e2e/` | siehe unten |
 
@@ -309,6 +310,118 @@ Höchstens 10 Zustell-Runden und 20 wartende Nachrichten pro Auftrag, 4 000 Zeic
 
 **Rechte:** Plan entscheiden und Nachrichten senden dürfen die Person, die den Auftrag angelegt hat (solange sie mindestens Bearbeiter ist), und die Projekt-Eigentümerin bzw. der -Eigentümer; Betrachter lesen mit. „Weiter mit …“ und Kommentare: alle Bearbeiter (der neue Auftrag gehört dann dir und läuft mit deinen Zugängen). Nachrichten, Kommentare, bearbeitete Pläne und Anmerkungen kommen in eigenen, mit Zufallsgrenze markierten Blöcken in den Prompt (Längen begrenzt, Geheimnisse geschwärzt).
 
+## Automatisierung: Vorlagen, Zeitpläne, Webhooks, API und `queuectl`
+
+**Vorlagen** (Projekt → Automatisierung → Vorlagen, ab Bearbeiter): ein gespeicherter Auftrag mit Titel, Beschreibung, „Erst planen“ und Kostenobergrenze. Auslöser starten Aufträge aus Vorlagen; im Auftragsformular (Erweitert → „Aus Vorlage“) und mit `queuectl add --template` kannst du sie auch von Hand nutzen.
+
+**Auslöser** (Projekt → Automatisierung → Auslöser). Ein Auslöser gehört der Person, die ihn anlegt; seine Aufträge laufen **immer mit ihrem Zugang** zum Anbieter, nie mit dem eines anderen Mitglieds. Nur sie ändert ihn, startet ihn von Hand oder erzeugt ein neues Secret; ausschalten und löschen darf zusätzlich die Projekt-Eigentümerin. Verliert sie die Bearbeitungsrechte im Projekt, schaltet sich der Auslöser beim nächsten Versuch ab (Verlauf + Benachrichtigung).
+
+| Art | Startet | Hinweise |
+|---|---|---|
+| Zeitplan | nach Cron (`Minute Stunde Tag Monat Wochentag`, z. B. `15 7 * * 1-5`) in einer Zeitzone (`Europe/Zurich`) | Minute muss eine feste Zahl sein ⇒ **höchstens stündlich**; `@daily` usw. gehen. Zeitumstellung: eine Ortszeit, die es nicht gibt, läuft eine Stunde später; eine doppelte nur einmal; zwischen zwei Läufen liegt immer mindestens eine Stunde |
+| Einmalig | zu einem Zeitpunkt | danach erledigt |
+| Webhook | signierter `POST` an `PUBLIC_URL/api/hooks/<id>` | siehe unten |
+| GitHub | GitHub-Webhook mit Filtern | siehe unten |
+| Nur per API | `POST /api/triggers/<id>/fire` mit Token | z. B. aus CI |
+
+Für alle gilt: „Nicht starten, solange der letzte Auftrag läuft“ (Standard an), höchstens N Aufträge pro Stunde (Standard 10, 1–100; darüber `429` und Eintrag „abgelehnt“), „Jetzt auslösen“ von Hand. Der **Verlauf** zeigt jede Auslösung mit Ergebnis (erstellt, ignoriert, übersprungen, abgelehnt, fehlgeschlagen), Grund und Link zum Auftrag (90 Tage, höchstens 500 Einträge pro Auslöser). Was ein Absender mitschickt, bekommt der Agent **nur als markierten Datenblock** (`<<<EVENT_DATA_<zufall>` … mit der Regel davor, dass es keine Anweisung ist; Grenzen im Inhalt entschärft, Geheimnisse geschwärzt, höchstens 16 000 Bytes) – nie im Titel oder in der Aufgabe.
+
+**Zuverlässigkeit der Zeitpläne.** Ein fälliger Termin wird in **einer** Datenbank-Transaktion erledigt: Zeile sperren (`FOR UPDATE SKIP LOCKED`), Termin im Verlauf eintragen (eindeutig pro Auslöser und Termin), Auftrag anlegen, nächsten Termin setzen. Stürzt Queue vorher ab, passiert nichts und der Termin läuft nach dem Neustart genau einmal; danach nie ein zweites Mal – auch nicht mit mehreren App-Instanzen. War Queue zum Termin nicht erreichbar (mehr als 10 min zu spät), gilt er als verpasst: Mit „Verpasste Läufe einmal nachholen“ (Standard an) läuft **genau ein** Auftrag, egal wie viele Termine verpasst wurden (Verlauf: „Nachgeholt …; N frühere Termine verpasst“), sonst steht „Verpasst“ im Verlauf. Ausgeschaltete Auslöser holen nach dem Einschalten nichts nach. Takt: `TRIGGER_TICK_SECS` (Standard 15).
+
+### Webhook einrichten (eigene Systeme)
+
+Nach dem Anlegen zeigt Queue **einmal** Adresse und Secret (`qwh_…`; bei Verlust „Neues Secret“). Der Absender schickt:
+
+```
+POST /api/hooks/<id>
+X-Queue-Timestamp: <Unix-Sekunden>        # höchstens ±300 s Abweichung
+X-Queue-Delivery:  <eindeutige ID>        # 1–100 Zeichen A–Z a–z 0–9 . _ : -
+X-Queue-Signature: sha256=<hex HMAC-SHA256(secret, "<timestamp>.<delivery>.<body>")>
+```
+
+```bash
+TS=$(date +%s); ID=$(uuidgen); BODY='{"service":"api","status":"failed"}'
+SIG=$(printf '%s.%s.%s' "$TS" "$ID" "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')
+curl -X POST "$URL" -H 'Content-Type: application/json' -H "X-Queue-Timestamp: $TS" \
+  -H "X-Queue-Delivery: $ID" -H "X-Queue-Signature: sha256=$SIG" --data "$BODY"
+```
+
+Antworten: `201` Auftrag angelegt, `200` Duplikat/ignoriert/übersprungen, `401` Signatur oder Zeitstempel falsch (nichts gespeichert), `404` unbekannt, `409` ausgeschaltet oder kein Auftrag möglich, `413` größer als 1 MiB, `429` Limit (`Retry-After`). Die Signatur wird in konstanter Zeit verglichen. Jede Delivery-ID zählt einmal (sie ist mitsigniert, ein abgefangener Aufruf lässt sich also auch mit neuer ID nicht wiederholen); ein abgelehnter Aufruf (Limit, Fehler) darf mit derselben ID wiederholt werden.
+
+### GitHub einrichten
+
+1. Projekt → Automatisierung → Neuer Auslöser → **GitHub**: Ereignisse wählen, optional Branches (`main`, `release/*`; `*` ohne `/`, `**` mit), Labels, Repository (leer = das des Projekts aus „Ergebnis“ bzw. der Remote-Adresse).
+2. Queue zeigt einmal Adresse und Secret. Auf GitHub im Repository: **Settings → Webhooks → Add webhook**, *Payload URL* = Adresse, *Content type* `application/json` (Form-Kodierung geht auch), *Secret* = Secret, „Let me select individual events“: die passenden Ereignisse (unten). GitHub schickt sofort einen *Ping*, der im Verlauf erscheint.
+
+| Ereignis in Queue | GitHub-Ereignis | löst aus bei | Schleifenschutz |
+|---|---|---|---|
+| Push | `push` | neue Commits auf passendem Branch | nicht bei gelöschtem Branch, Tags, Branches `queue/…`, wenn der neueste Commit von Queue committet wurde (`queue@localhost`), nicht von Bots (abschaltbar) |
+| Issues | `issues` | `opened`, `reopened`, `labeled` (nur mit Label-Filter und passendem Label) | ein Auftrag pro Issue (außer „wieder geöffnet“), nicht von Bots |
+| Pull Requests | `pull_request` | `opened`, `reopened`, `synchronize`, `ready_for_review`, `labeled`; Branch-Filter = Ziel-Branch | ein Auftrag pro PR-Commit, keine Entwürfe (abschaltbar), nie für Queues eigene PRs |
+| Fehlgeschlagene Checks | `check_run` | `completed` mit `failure`, `timed_out`, `startup_failure` | ein Auftrag pro Commit; nie auf `queue/…` (dafür ist der Auto-Fix aus WP05 da) |
+
+Signatur: `X-Hub-Signature-256` (HMAC-SHA256 über den Body, konstanter Vergleich, geprüft mit dem Testvektor aus GitHubs Doku). GitHub signiert keinen Zeitstempel; Wiederholungen erkennt Queue an `X-GitHub-Delivery` **und** am SHA-256 des Bodys (90 Tage gespeichert). Zusätzlich gilt für **Queues eigene Pull Requests** (WP05): Jedes gültig signierte Ereignis dazu (`pull_request`, `pull_request_review`, `pull_request_review_comment`, `issue_comment` am PR, `check_run`, `check_suite`, `push` auf `queue/…`) lässt den Pull Request **sofort** abfragen – der Zustand kommt weiterhin nur aus der GitHub-API, der Inhalt des Webhooks wird dafür nie verwendet. Dafür die genannten Ereignisse zusätzlich abonnieren.
+
+Belegt sind Header und Felder aus GitHubs offizieller OpenAPI-Beschreibung (`github/rest-api-description`, Schemas `webhook-*`) und der Webhook-Doku (`github/docs`); nicht belegt ist der Wert `"Bot"` von `sender.type` (Queue erkennt Bots zusätzlich an `[bot]` im Login). Getestet ist gegen nachgebaute Zustellungen, nicht gegen GitHub selbst.
+
+### API-Tokens und REST-API
+
+Einstellungen → **API-Zugang**: Token mit Namen, Berechtigungen und Ablauf (7 Tage bis 1 Jahr, ohne Ablauf gibt es nicht) anlegen. Das Token (`qk_…`, 256 Bit Zufall + Prüfsumme, vom Secret-Scanner erkannt) wird **einmal** angezeigt; gespeichert wird nur sein SHA-256. Die Liste zeigt Präfix, Rechte, Ablauf und „zuletzt benutzt“; Widerrufen wirkt sofort (auch auf offene Live-Verbindungen spätestens nach 10 min).
+
+Aufruf mit `Authorization: Bearer qk_…`. Mit Token gilt **nur** das Token (ein Cookie wird ignoriert), und nur auf diesen Endpunkten – alles andere (Konto, Einstellungen, Zugänge, **Token-Verwaltung**, Mitglieder, Geheimnisse, Ergebnis/Git-Zugang, Schutz-Freigaben, Benachrichtigungen) antwortet `403`. Rollen und Projekte gelten wie im Browser.
+
+| Berechtigung | Endpunkte |
+|---|---|
+| (jedes Token) | `GET /api/whoami` |
+| `projects:read` | `GET /api/projects`, `GET /api/projects/{id}`, `GET /api/projects/{id}/templates` |
+| `tasks:read` | `GET /api/tasks`, `GET /api/tasks/{id}`, `GET /api/projects/{id}/tasks`, `GET /api/tasks/{id}/diff`, `GET /api/tasks/{id}/messages`, `GET /api/events` (SSE) |
+| `tasks:write` | `POST /api/tasks`, `PATCH /api/tasks/{id}`, `POST /api/tasks/{id}/cancel`, `POST /api/tasks/{id}/retry` |
+| `tasks:steer` | `POST /api/tasks/{id}/messages`, `DELETE /api/tasks/{id}/messages/{mid}`, `POST /api/tasks/{id}/continue`, `POST /api/tasks/{id}/answer`, `POST /api/tasks/{id}/plan/{approve,revise,reject}` |
+| `triggers:read` | `GET /api/projects/{id}/triggers`, `GET /api/triggers/{id}`, `GET /api/triggers/{id}/runs`, `GET /api/timezones`, `POST /api/triggers/preview` |
+| `triggers:write` | `POST /api/projects/{id}/templates`, `PATCH/DELETE /api/templates/{id}`, `POST /api/projects/{id}/triggers`, `PATCH/DELETE /api/triggers/{id}`, `POST /api/triggers/{id}/secret` |
+| `triggers:fire` | `POST /api/triggers/{id}/fire` (Body optional `{"text": "…"}`; der Text geht als Datenblock an den Agenten) |
+
+Fehler: `401` mit `invalid token`, `token expired` oder `token revoked`; `403` mit `token lacks scope …` bzw. `this endpoint cannot be used with an API token`. Beispiel:
+
+```bash
+curl -H "Authorization: Bearer $QUEUE_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"project_id":"<uuid>","prompt":"Tests für den Login ergänzen"}' https://queue.example/api/tasks
+curl -X POST -H "Authorization: Bearer $QUEUE_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"text":"Build 1234 ist rot"}' https://queue.example/api/triggers/<id>/fire
+```
+
+### `queuectl`
+
+Kleines Kommandozeilen-Werkzeug im Backend-Workspace (`cd backend && cargo build --release --bin queuectl` ⇒ `target/release/queuectl`).
+
+```bash
+mkdir -p ~/.config/queuectl && umask 077
+cat > ~/.config/queuectl/config <<'EOF2'
+url = https://queue.example
+token = qk_…
+project = Vereins-Website        # Standardprojekt (optional)
+EOF2
+chmod 600 ~/.config/queuectl/config
+queuectl whoami
+```
+
+Das Token steht **nie auf der Kommandozeile** (es gibt keine Option dafür): aus `QUEUE_TOKEN` oder aus der Datei (`$QUEUECTL_CONFIG`, sonst `$XDG_CONFIG_HOME/queuectl/config` bzw. `~/.config/queuectl/config`). Eine Datei mit Token muss dir gehören und darf für niemand anderen lesbar sein (`0600`), sonst bricht `queuectl` ab. `QUEUE_URL`/`QUEUE_PROJECT` überschreiben die Datei. `http://` nur für `localhost` (sonst ginge das Token im Klartext übers Netz; Ausnahme `insecure = true`), Weiterleitungen werden nie verfolgt, Format und Prüfsumme des Tokens prüft `queuectl` vor dem ersten Aufruf.
+
+| Befehl | Was |
+|---|---|
+| `queuectl add [-p PROJEKT] [-t TITEL] [--template NAME] [--plan] [--max-cost USD] [-w] TEXT…` | Auftrag anlegen (Text auch über stdin mit `-`); `-w` verfolgt ihn danach |
+| `queuectl list [-p PROJEKT] [-s STATUS]` | Aufträge |
+| `queuectl status ID` | Details (ID oder eindeutiger Anfang, z. B. `3f2a9c1d`) |
+| `queuectl watch ID [--poll] [--timeout S]` | live verfolgen (SSE, verbindet neu; `--poll` fragt ab) bis zum Ende |
+| `queuectl cancel ID` | abbrechen |
+| `queuectl steer ID [--now] TEXT…` | Nachricht an den Agenten (zurückziehbar bis zur Zustellung) |
+| `queuectl continue ID [--plan] TEXT…` | „Weiter mit …“ |
+| `queuectl plan ID approve` / `revise TEXT…` / `reject` | Plan entscheiden |
+| `queuectl fire AUSLÖSER-ID [TEXT…]` | eigenen Auslöser starten |
+| `queuectl projects`, `queuectl whoami` | Projekte, Token prüfen |
+
+`--json` gibt die Rohdaten aus. Exit-Codes: `0` ok, `1` Auftrag nicht erfolgreich (fehlgeschlagen, blockiert, abgebrochen) bzw. Server lehnt ab, `2` Bedienung/Konfiguration, `3` Token fehlt, ungültig, abgelaufen, widerrufen oder ohne Berechtigung. Beispiel für CI: `queuectl add -w --template "Abhängigkeiten" "Nur Patch-Versionen" || exit 1`.
+
 ## Tests
 
 | Ebene | Was | Ausführen |
@@ -321,8 +434,10 @@ Höchstens 10 Zustell-Runden und 20 wartende Nachrichten pro Auftrag, 4 000 Zeic
 | Integration WP05 | Pull Requests gegen Fake-Server für GitHub, GitLab und Gitea (`tests/common/fake_git_host.rs`) mit echtem Git-Remote: Anlegen (Entwurf, Labels), rote CI ⇒ Folge-Auftrag auf demselben Branch (Fast-Forward, Dedupe pro CI-Lauf), Kommentare ohne Schreibrecht/Bots/ohne `/queue` ignoriert, Runden-Grenze und „weitere Runde“, Neustart mitten im Abfragen (genau einmal), fremder Push auf den PR-Branch wird nie überschrieben, Modus „Branch“, Rollen/Mandanten, Rate-Limit/`Retry-After`, falsches Token, nie Approve/Merge, Token nirgends sichtbar | `cargo test -p queued --test pull_requests` |
 | Integration WP13 | Zugänge (Verschlüsselung, Zugriff), Kosten je Schritt aus der Preistabelle, Live-Kostenlimit, Datenstandort, Vorlagen, Planung/Review/Analyse per Batch (Anthropic, OpenAI, Mistral) und direkt gegen Fake-Server, Eskalation, Abbruch/Neustart, Schätzung, Kostenübersicht, Admin-Preise, LiteLLM-Schlüssel, CLI-Status, Eval-Set | `cargo test -p queued --test providers` |
 | Integration WP06 | Plan-Lauf ändert nichts (Wegwerf-Kopie, Änderungsversuch gemeldet, Reste eines alten Plan-Laufs unsichtbar), Genehmigen ⇒ Umsetzung mit Plan im Prompt, bearbeiteter Plan, Überarbeiten, Verwerfen, automatische Genehmigung (nie bei Fragen), Planung per API zur Freigabe, Nachrichten (Zurückziehen, Zustellung beim Start, in die laufende Sitzung, „Sofort zustellen“, nach Abschluss als Fortsetzung, Abbruch verwirft), „Weiter mit …“ (Sitzung nur für den eigenen Auftrag, Fallback ohne Sitzung), Kommentare (Validierung, eine Nachricht, verschoben/veraltet), Rechte, Längen | `cargo test -p queued --test plan_steering` |
+| Integration WP07 | Jede Token-Route mit und ohne ihre Berechtigung (403), Konto/Einstellungen/Token-Verwaltung nie per Token, abgelaufen/widerrufen/Tippfehler (401), Token schlägt Cookie, Mandanten und Rollen; Auslösen per API (Datenblock, „läuft schon“, Limit + `Retry-After`, Rechte); Webhook (falsche Signatur, Zeitfenster, Replay, neue ID mit alter Signatur, 1 MiB, Secret-Wechsel); GitHub (Filter, Ping, Form-Kodierung, Dedupe per Delivery-ID und Body, ein Auftrag pro Commit, `poke` der WP05-PRs); Zeitplan genau einmal bei gesperrter Zeile, Absturz vor Commit, zwei Instanzen, Neustart und veralteter Instanz; verpasste Läufe mit/ohne Nachholen; einmalig; Eigentümer verliert Rechte | `cargo test -p queued --test tokens --test triggers` |
 | Unit (Frontend) | Formatierung, Status-/Fehlertexte, Budget-Anzeige, Limit-Eingaben, Fortschrittsphasen, Diff, Tastaturkürzel, VAPID-Decoding, Geldbeträge/Schätzung | `cd frontend && cargo test` |
 | System | echte Binaries als getrennte Prozesse: Runner-Auth, Session-Pflicht, Flow über die Prozessgrenze, Budget, Cancel | `cd e2e && npx playwright test --project=system` |
+| System WP07 | echtes `queuectl` gegen den echten Stack (add über stdin, watch per SSE und Polling, list/status/steer/cancel, fehlende Berechtigung, 0644-Datei abgelehnt, Token aus der Umgebung, Tippfehler, `http://` zu fremdem Host, widerrufen), Webhook mit Node-HMAC, GitHub-Ping, `queuectl fire`, einmaliger Auslöser durch den Scheduler | `npx playwright test tests/system/triggers.spec.ts` |
 | E2E | Browser gegen echten Stack: Registrierung, Onboarding, Einreihen mit Limits, Live-Status, Details/Diff/Rückgängig/Bearbeiten, Rückfrage, Freigabe, Fix-Kette, Budget-UI, Reorder/Verwerfen/Wiederherstellen, Bestätigungsdialoge, Tastaturkürzel, Live-Region, Theme | `npx playwright test --project=desktop` |
 | E2E Mobile | iPhone 15 Pro hoch/quer mit simulierter **Dynamic Island**/Notch/Home-Indikator: nichts verdeckt, Tab-Bar und alle Bedienelemente ≥ 44pt, Inputs ≥ 16px (kein iOS-Zoom), kein horizontales Scrollen | `npx playwright test --project=iphone --project=iphone-landscape` |
 | Accessibility | axe-core (WCAG 2.0/2.1/2.2 A+AA) auf allen Hauptansichten, hell und dunkel, Desktop und iPhone; Screenshots nach `WP00_SCREENSHOTS_DIR` | `a11y.spec.ts`, `mobile-a11y.spec.ts` (Teil der Projekte oben) |
@@ -364,7 +479,7 @@ cd frontend && trunk serve                      # http://localhost:5173, /api wi
 ## Bekannte Grenzen
 
 - **Branches (WP04):** Jeder laufende Auftrag belegt eine vollständige Kopie der Projekt-Historie auf der Platte (bewusst ohne Hardlinks/Alternates, siehe „Branch pro Auftrag“). Mehr gleichzeitige Aufträge erzeugen mehr Konflikte (typisch an Registries, Routern, Lockfiles); jeder Konflikt kostet einen Korrektur-Auftrag. Erwartete Dateibereiche pro Auftrag (nur disjunkte parallel) gibt es nicht. Der Agent eines Korrektur-Auftrags muss Konfliktmarker selbst auflösen. Nach einer Freigabe (Schutz) und einem späteren erneuten Lauf desselben Auftrags (z. B. nach einer Rückfrage) prüft das Gate wieder ab dem ersten Ausgangsstand und kann dieselbe Freigabe erneut verlangen.
-- **Pull Requests (WP05):** Die API-Formate von GitHub sind aus der offiziellen OpenAPI-Beschreibung, die von GitLab aus deren Dokumentationsquellen und die von Gitea aus dem Swagger-Template 1.22 abgeleitet; getestet ist nur gegen eigene Fake-Server, nicht gegen die echten Dienste. Nicht aus Dokumentation belegt: die Review-Zustände von Gitea (`REQUEST_CHANGES`), Entwürfe bei Gitea über das Titel-Präfix `WIP:`, die Berechtigungswerte `owner` bei Gitea und das Verhalten von Gitea bei Basic-Auth mit Token als Passwort. Konflikte zwischen Pull Request und Ziel-Branch löst Queue nicht (Anzeige + Benachrichtigung). Rechte werden bei jeder Abfrage geprüft; wer nach seinem Kommentar das Schreibrecht verliert, dessen bereits verarbeiteter Kommentar bleibt verarbeitet. Bis zu Webhooks (WP07) beträgt die Reaktionszeit bis zu `PR_POLL_SECS`.
+- **Pull Requests (WP05):** Die API-Formate von GitHub sind aus der offiziellen OpenAPI-Beschreibung, die von GitLab aus deren Dokumentationsquellen und die von Gitea aus dem Swagger-Template 1.22 abgeleitet; getestet ist nur gegen eigene Fake-Server, nicht gegen die echten Dienste. Nicht aus Dokumentation belegt: die Review-Zustände von Gitea (`REQUEST_CHANGES`), Entwürfe bei Gitea über das Titel-Präfix `WIP:`, die Berechtigungswerte `owner` bei Gitea und das Verhalten von Gitea bei Basic-Auth mit Token als Passwort. Konflikte zwischen Pull Request und Ziel-Branch löst Queue nicht (Anzeige + Benachrichtigung). Rechte werden bei jeder Abfrage geprüft; wer nach seinem Kommentar das Schreibrecht verliert, dessen bereits verarbeiteter Kommentar bleibt verarbeitet. Ohne GitHub-Webhook (WP07, siehe „GitHub einrichten“) beträgt die Reaktionszeit bis zu `PR_POLL_SECS`; GitLab und Gitea werden nur abgefragt.
 - Das verbleibende Abo-Kontingent liefern die CLIs nicht exakt. Darum gibt es die Kombination aus eigenen Budgets, Erkennung echter Limits und beobachteten Werten.
 - Der Review-Agent ist per Prompt read-only, nicht technisch erzwungen. Seine Änderungen bleiben im Arbeitsverzeichnis des Auftrags; übernommen wird genau der geprüfte Commit.
 - Codex und Gemini kennen kein Kostenlimit, Codex kein Turn-Limit; ihr Token-Verbrauch kommt erst am Ende eines Laufs. Ein Lauf kann ein Kosten-/Token-Limit daher überschreiten, bevor es greift. Der Auftrag wird dann trotzdem `blocked` (wie beim Live-Abbruch): kein „erledigt“, kein Review, kein Fix, keine Folgeaufträge. Die Änderungen bleiben als Teil-Commit im Diff des Auftrags; „Wiederholen“ startet mit frischem Budget. Gleiches gilt, wenn Claudes Live-Zähler zu wenig meldet.
@@ -381,4 +496,4 @@ cd frontend && trunk serve                      # http://localhost:5173, /api wi
 - **Geheimnisse im Setup:** Das Setup führt Code aus dem Repository aus (z. B. `preinstall` beim `npm install`), und das Repository wird von früheren Agentenläufen verändert. Seit WP03 fragt Queue vor einem Setup mit Geheimnissen nach, wenn sich Setup-Dateien seit der letzten Freigabe geändert haben (Heuristik, siehe oben). Trotzdem: enge Setup-Allowlist und nur Tokens mit minimalen Rechten. Die Leck-Suche findet nur wörtliche Kopien (nicht base64 o. Ä.) und liest Dateien bis 8 MiB.
 - Das Setup läuft bei jedem Auftrag (mit warmem Cache), es gibt keinen Container-Snapshot nach dem Setup.
 - **Plan-Modus/Sitzungen (WP06):** Nur Claude Code ist für Plan-Modus und Fortsetzen live geprüft (2.1.322, nicht die gepinnte 2.1.319). Bei Codex, Gemini und opencode stammen Aufruf und Speicherort der Sitzung aus den Programmen bzw. dem Quelltext, ausgeführt wurde nichts; scheitert ein Fortsetzen ohne jeden Verbrauch, startet Queue einen neuen Lauf mit Übergabe, eine still neu begonnene Sitzung bemerkt Queue aber nicht (der Prompt enthält deshalb immer die Aufgabe). Mit Engine `none` (nur Entwicklung) kann ein Plan-Lauf außerhalb seiner Wegwerf-Kopie schreiben; Queue erkennt nur Änderungen in der Kopie. „Sofort zustellen“ unterbricht nur den Agenten selbst, nicht Setup, Verify oder Review. Nachrichten erreichen einen Lauf nicht mitten in einem Schritt, sondern an dessen Ende (oder per Unterbrechung).
-
+- **Automatisierung (WP07):** GitHub signiert keinen Zeitstempel; nach 90 Tagen (Aufbewahrung des Verlaufs) könnte eine abgefangene GitHub-Zustellung erneut wirken. Ungültig signierte Anfragen werden nicht gespeichert und nicht gezählt (jede kostet einen Datenbankzugriff) – eine Drosselung von `/api/hooks/` gehört in den Reverse-Proxy bzw. Tunnel. Webhook-Bodys über 1 MiB lehnt Queue ab (GitHub erlaubt bis 25 MB; sehr große Pushes erscheinen dann als fehlgeschlagene Zustellung bei GitHub). Vorlagen lassen Anbieter/Modell im UI weg (Projekt-/Nutzervorgabe), per API sind sie setzbar. Ein Token gilt für alle Projekte seiner Person (Rollen greifen), es gibt keine projektgebundenen Tokens. `X-Hub-Signature-256` und alle ausgewerteten Felder sind aus GitHubs OpenAPI/Doku belegt, aber nur gegen nachgebaute Zustellungen getestet; der Wert `"Bot"` von `sender.type` ist nicht belegt. Zeitpläne laufen mit Tick-Auflösung (`TRIGGER_TICK_SECS`, Standard 15 s). Ausgehende Webhooks (Benachrichtigung an andere Systeme) gibt es nicht (WP10). Die Tests laufen als root: Die Eigentümer-Prüfung der `queuectl`-Datei ist mit einer fremden UID nicht automatisiert geprüft.

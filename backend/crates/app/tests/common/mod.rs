@@ -162,6 +162,22 @@ impl Harness {
         }
     }
 
+    /// Client that sends `Authorization: Bearer <token>` (WP07) and no cookie.
+    pub fn bearer(&self, token: &str) -> Client {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        Client {
+            base: self.base.clone(),
+            http: reqwest::Client::builder()
+                .default_headers(h)
+                .build()
+                .unwrap(),
+        }
+    }
+
     /// Registers a user and returns a logged-in client. The provider is set to `mock`.
     pub async fn user(&self, email: &str) -> Client {
         let c = self.anon();
@@ -215,6 +231,27 @@ impl Client {
     }
     pub async fn delete(&self, path: &str) -> (u16, Value) {
         self.req(reqwest::Method::DELETE, path, None).await
+    }
+
+    /// Creates an API token (cookie session) and returns it.
+    pub async fn token(&self, scopes: &[&str]) -> String {
+        let (code, v) = self
+            .post(
+                "/api/tokens",
+                json!({"name": "test", "scopes": scopes, "expires_in_days": 30}),
+            )
+            .await;
+        assert_eq!(code, 200, "{v}");
+        v["token"].as_str().unwrap().to_string()
+    }
+
+    /// Only the status (the body is not read: works for SSE streams).
+    pub async fn status_of(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> u16 {
+        let mut r = self.http.request(method, format!("{}{path}", self.base));
+        if let Some(b) = body {
+            r = r.json(&b);
+        }
+        r.send().await.unwrap().status().as_u16()
     }
 
     pub async fn settings(&self, patch: Value) -> Value {

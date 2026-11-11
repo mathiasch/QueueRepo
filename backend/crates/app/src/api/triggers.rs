@@ -671,9 +671,16 @@ pub async fn update_trigger(
         managed(&st, id, u.id).await?;
     }
     let kind = t.kind();
-    let timing_changed = c.cron.is_some()
-        || c.timezone.is_some()
-        || c.run_at.is_some()
+    // Only a real change of the timing (or switching on) moves the next
+    // slot; resending the same values (the UI sends the whole form) does not.
+    let timing_changed = c
+        .cron
+        .as_deref()
+        .is_some_and(|x| Some(x.trim()) != t.cron.as_deref())
+        || c.timezone
+            .as_deref()
+            .is_some_and(|x| Some(x.trim()) != t.timezone.as_deref())
+        || c.run_at.is_some_and(|x| Some(x) != t.run_at)
         || (c.enabled == Some(true) && !t.enabled);
     let mut s = Spec {
         template_id: c.template_id.unwrap_or(t.template_id),

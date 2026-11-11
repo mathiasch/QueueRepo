@@ -20,7 +20,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [[ "${E2E_SKIP_BUILD:-}" != "1" ]]; then
-  (cd "$ROOT/backend" && cargo build --quiet --bin queued --bin queued-runner --example fake_git_host)
+  (cd "$ROOT/backend" && cargo build --quiet --bin queued --bin queued-runner --bin queuectl --example fake_git_host)
   (cd "$ROOT/frontend" && trunk build --release >/dev/null)
 fi
 psql "$ADMIN_URL" -qc "CREATE DATABASE $DB" >/dev/null
@@ -41,7 +41,7 @@ FAKE_PID=$!
 DATABASE_URL="$DB_URL" RUNNER_URL="http://127.0.0.1:$RUNNER_PORT" RUNNER_TOKEN="$TOKEN" \
 DATA_DIR="$WORK/app" FRONTEND_DIR="$ROOT/frontend/dist" BIND="127.0.0.1:$APP_PORT" \
 PUBLIC_URL="http://127.0.0.1:$APP_PORT" ENABLE_MOCK_PROVIDER=true TICK_SECS=1 RUST_LOG=warn \
-ALLOW_LOCAL_GIT_REMOTES=true ALLOW_PRIVATE_GIT_HOSTS=true PR_POLL_SECS=1 \
+ALLOW_LOCAL_GIT_REMOTES=true ALLOW_PRIVATE_GIT_HOSTS=true PR_POLL_SECS=1 TRIGGER_TICK_SECS=1 \
 TRANSIENT_BACKOFF_BASE_SECS=1 TRANSIENT_BACKOFF_MAX_SECS=2 TRANSIENT_MAX_RETRIES=2 \
   "$ROOT/backend/target/debug/queued" &
 APP_PID=$!

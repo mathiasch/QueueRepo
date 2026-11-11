@@ -135,9 +135,9 @@ fn generic(
     // Signed values are checked after the signature (no oracle for
     // unsigned guesses).
     let Ok(at) = ts.parse::<i64>() else {
-        return Err(
-            AppError::bad_request("X-Queue-Timestamp must be Unix seconds").into_response(),
-        );
+        return Err(refused(AppError::bad_request(
+            "X-Queue-Timestamp must be Unix seconds",
+        )));
     };
     if (chrono::Utc::now().timestamp() - at).abs() > WEBHOOK_TOLERANCE_SECS {
         return Err(unauthorized(
@@ -145,10 +145,9 @@ fn generic(
         ));
     }
     if !webhooks::valid_delivery(delivery) {
-        return Err(AppError::bad_request(
+        return Err(refused(AppError::bad_request(
             "X-Queue-Delivery: 1–100 characters A-Z a-z 0-9 . _ : -",
-        )
-        .into_response());
+        )));
     }
     Ok(Hook::Fire(Firing {
         source: Some(RunSource::Webhook),
@@ -179,21 +178,18 @@ async fn github(
         header(headers, "x-github-event"),
         header(headers, "x-github-delivery"),
     ) else {
-        return Ok(Err(AppError::bad_request(
+        return Ok(Err(refused(AppError::bad_request(
             "X-GitHub-Event and X-GitHub-Delivery required",
-        )
-        .into_response()));
+        ))));
     };
     if !webhooks::valid_delivery(delivery) || !webhooks::valid_delivery(event) {
-        return Ok(Err(
-            AppError::bad_request("invalid GitHub headers").into_response()
-        ));
+        return Ok(Err(refused(AppError::bad_request(
+            "invalid GitHub headers",
+        ))));
     }
     let content_type = header(headers, "content-type").unwrap_or("application/json");
     let Some(payload) = webhooks::github_payload(content_type, body) else {
-        return Ok(Err(
-            AppError::bad_request("payload is not JSON").into_response()
-        ));
+        return Ok(Err(refused(AppError::bad_request("payload is not JSON"))));
     };
     let filter = t.github_filter().unwrap_or_default();
     let project: crate::models::Project = sqlx::query_as("SELECT * FROM projects WHERE id=$1")

@@ -135,6 +135,25 @@ pub fn Composer() -> impl IntoView {
                 .map(|(id, _)| *id)
         })
     });
+    // WP07: templates of the chosen project ("Aus Vorlage").
+    let templates = RwSignal::new(Vec::<queued_api::triggers::TemplateView>::new());
+    let tpl_title = RwSignal::new(None::<String>);
+    Effect::new(move |_| {
+        // Another project: a chosen template no longer applies.
+        tpl_title.set(None);
+        let Some(pid) = project_id.get() else {
+            templates.set(vec![]);
+            return;
+        };
+        spawn_local(async move {
+            let list = api::get::<Vec<queued_api::triggers::TemplateView>>(&format!(
+                "/projects/{pid}/templates"
+            ))
+            .await
+            .unwrap_or_default();
+            templates.set(list);
+        });
+    });
     let project_plan_mode = Memo::new(move |_| {
         let pid = project_id.get();
         store
@@ -219,7 +238,7 @@ pub fn Composer() -> impl IntoView {
         busy.set(true);
         let body = CreateTask {
             project_id: pid,
-            title: None,
+            title: tpl_title.get_untracked(),
             prompt: text,
             context: context.get_untracked(),
             provider: parse_access(&access.get_untracked()).1,
@@ -241,6 +260,7 @@ pub fn Composer() -> impl IntoView {
                     front.set(false);
                     test_task.set(false);
                     plan_first.set(None);
+                    tpl_title.set(None);
                     limits.set(LimitForm::default());
                     store.announce(format!("„{}“ eingereiht", first_line(&t.title, 60)));
                     if let Some(el) = textarea.get_untracked() {
@@ -259,6 +279,7 @@ pub fn Composer() -> impl IntoView {
     let project_sel = uid("composer-project");
     let adv_id = uid("composer-advanced");
     let ctx_ids = FieldIds::new("ctx");
+    let tpl_ids = FieldIds::new("composer-tpl");
     let parent_ids = FieldIds::new("parent");
     let prov_ids = FieldIds::new("provider");
     let model_ids = FieldIds::new("model");
@@ -320,8 +341,33 @@ pub fn Composer() -> impl IntoView {
                 let (ctx_ids, parent_ids, prov_ids, model_ids) = (ctx_ids.clone(), parent_ids.clone(), prov_ids.clone(), model_ids.clone());
                 let (ctx_id, parent_id, prov_id, model_id) = (ctx_ids.id.clone(), parent_ids.id.clone(), prov_ids.id.clone(), model_ids.id.clone());
                 let (list_ref, list_id) = (models_list.clone(), models_list.clone());
+                let tpl_ids = tpl_ids.clone();
+                let tpl_id = tpl_ids.id.clone();
                 view! {
                     <div class="advanced" id=adv_id.clone()>
+                        {move || (!templates.with(Vec::is_empty)).then(|| {
+                            let (tpl_ids, tpl_id) = (tpl_ids.clone(), tpl_id.clone());
+                            view! {
+                                <Field ids=tpl_ids label="Aus Vorlage" hint="Füllt Beschreibung, Titel und „Erst planen“ aus einer Vorlage des Projekts.">
+                                    <select id=tpl_id class="select" data-testid="composer-template" on:change=move |ev| {
+                                        let v = event_target_value(&ev);
+                                        match templates.with_untracked(|l| l.iter().find(|t| t.id.to_string() == v).cloned()) {
+                                            Some(t) => {
+                                                prompt.set(t.prompt.clone());
+                                                set_pref("draft", &t.prompt);
+                                                tpl_title.set(Some(t.title.clone()));
+                                                if t.plan_mode.is_some() { plan_first.set(t.plan_mode); }
+                                            }
+                                            None => tpl_title.set(None),
+                                        }
+                                    }>
+                                        <option value="" selected=move || tpl_title.get().is_none()>"Keine Vorlage"</option>
+                                        {move || templates.get().into_iter().map(|t| view! { <option value=t.id.to_string()>{t.name}</option> }).collect_view()}
+                                    </select>
+                                </Field>
+                                {move || tpl_title.get().map(|t| view! { <p class="small" data-testid="composer-template-title">{format!("Titel aus Vorlage: {t}")}</p> })}
+                            }
+                        })}
                         <Field ids=ctx_ids label="Zusätzlicher Kontext" help=help::CONTEXT hint="Optional – wird dem Agenten mitgegeben.">
                             <textarea id=ctx_id class="textarea" rows="3" placeholder="Anforderungen, Links, Hinweise …" bind:value=context></textarea>
                         </Field>

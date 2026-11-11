@@ -81,6 +81,7 @@ pub fn SettingsPage() -> impl IntoView {
             }}
             <Budgets/>
             <Credentials/>
+            <super::tokens::TokensCard/>
             <super::providers::ConnectorsCard/>
             <super::providers::CostsCard/>
             <super::providers::PricesCard/>

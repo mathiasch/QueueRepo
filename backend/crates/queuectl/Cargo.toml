@@ -1,0 +1,27 @@
+[package]
+name = "queuectl"
+version.workspace = true
+edition.workspace = true
+description = "Command-line client for the queue API (personal API tokens)"
+
+[[bin]]
+name = "queuectl"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+queued-api = { path = "../api" }
+anyhow.workspace = true
+tokio = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+clap = { version = "4.6", features = ["derive", "env"] }
+
+[dev-dependencies]
+tempfile.workspace = true

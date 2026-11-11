@@ -447,9 +447,14 @@ fn sse_data(e: &ServerEvent) -> Event {
     Event::default().data(serde_json::to_string(e).unwrap_or_default())
 }
 
+/// Longest SSE connection of an API token (WP07): a revoked token loses
+/// its live stream at the latest after this; clients reconnect.
+const TOKEN_STREAM_MAX: std::time::Duration = std::time::Duration::from_secs(600);
+
 async fn events(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
+    tok: Option<axum::Extension<auth::TokenAuth>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let uid = u.id;
     let stream = BroadcastStream::new(st.bus.subscribe()).filter_map(move |m| match m {
@@ -458,5 +463,16 @@ async fn events(
         // Lagged: tell the client to refetch.
         Err(_) => Some(Ok(sse_data(&ServerEvent::Resync))),
     });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    // Token streams end at the token's expiry or after TOKEN_STREAM_MAX.
+    let stop: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = match tok {
+        Some(axum::Extension(t)) => {
+            let left = (t.expires_at - chrono::Utc::now())
+                .to_std()
+                .unwrap_or_default()
+                .min(TOKEN_STREAM_MAX);
+            Box::pin(tokio::time::sleep(left))
+        }
+        None => Box::pin(futures::future::pending()),
+    };
+    Sse::new(futures::StreamExt::take_until(stream, stop)).keep_alive(KeepAlive::default())
 }

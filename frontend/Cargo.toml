@@ -36,7 +36,7 @@ web-sys = { version = "0.3", features = [
   "Location", "MediaQueryList", "MessageEvent", "Navigator", "Notification", "NotificationPermission",
   "PushManager", "PushSubscription", "PushSubscriptionOptionsInit", "ServiceWorkerContainer",
   "ServiceWorkerRegistration", "Storage", "Url", "UrlSearchParams", "Window", "History", "ScrollIntoViewOptions",
-  "ScrollBehavior", "ScrollLogicalPosition", "FocusOptions", "NodeList",
+  "ScrollBehavior", "ScrollLogicalPosition", "FocusOptions", "NodeList", "Clipboard",
 ] }
 
 [profile.release]

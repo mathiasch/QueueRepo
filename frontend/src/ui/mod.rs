@@ -210,3 +210,49 @@ pub fn Meter(
         </div>
     }
 }
+
+/// Copies `text` to the clipboard (needs a secure context; the caller shows
+/// the text selectable as fallback).
+pub async fn copy_text(text: &str) -> bool {
+    let Some(w) = web_sys::window() else {
+        return false;
+    };
+    let p = w.navigator().clipboard().write_text(text);
+    wasm_bindgen_futures::JsFuture::from(p).await.is_ok()
+}
+
+/// A secret shown once: read-only, selectable, with a copy button.
+#[component]
+pub fn SecretBox(
+    #[prop(into)] label: String,
+    #[prop(into)] value: String,
+    #[prop(into)] testid: String,
+) -> impl IntoView {
+    let store = crate::store::use_store();
+    let id = uid("secret-box");
+    let v = value.clone();
+    view! {
+        <div class="field">
+            <div class="label"><label for=id.clone()>{label.clone()}</label></div>
+            <div class="row">
+                <input id=id class="input mono-input grow" readonly value=value data-testid=testid
+                    on:focus=move |ev| {
+                        use wasm_bindgen::JsCast;
+                        if let Some(i) = ev.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) {
+                            i.select();
+                        }
+                    }/>
+                <button type="button" class="btn" aria-label=format!("{label} kopieren") on:click=move |_| {
+                    let v = v.clone();
+                    leptos::task::spawn_local(async move {
+                        if copy_text(&v).await {
+                            store.toast("Kopiert");
+                        } else {
+                            store.announce("Kopieren nicht möglich – bitte markieren und selbst kopieren");
+                        }
+                    });
+                }><Icon icon=Ic::Copy class="sm"/>"Kopieren"</button>
+            </div>
+        </div>
+    }
+}

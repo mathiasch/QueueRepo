@@ -67,6 +67,7 @@ pub enum Ic {
     CloudUpload,
     Eye,
     Terminal,
+    Copy,
 }
 
 impl Ic {
@@ -199,6 +200,9 @@ impl Ic {
             }
             Ic::Eye => {
                 r#"<path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/>"#
+            }
+            Ic::Copy => {
+                r#"<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>"#
             }
             Ic::Terminal => {
                 r#"<polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/>"#

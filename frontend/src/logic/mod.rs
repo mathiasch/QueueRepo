@@ -16,3 +16,4 @@ pub mod progress;
 pub mod protection;
 pub mod shortcuts;
 pub mod task;
+pub mod triggers;

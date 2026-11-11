@@ -1,3 +1,4 @@
+pub mod automation;
 pub mod branch;
 pub mod composer;
 pub mod delivery;
@@ -15,3 +16,4 @@ pub mod queue;
 pub mod settings;
 pub mod shell;
 pub mod steer;
+pub mod tokens;
