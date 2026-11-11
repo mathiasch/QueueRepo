@@ -155,6 +155,17 @@ const RULES: &[Rule] = &[
         check: Check::Format,
     },
     Rule {
+        // WP07: own API tokens (`qk_`) and webhook secrets (`qwh_`):
+        // 43 base62 characters + 6 characters checksum.
+        id: "queue_key",
+        label: "Queue-Token",
+        prefix: 3,
+        high_confidence: true,
+        re: r"\b((?:qk|qwh)_[0-9A-Za-z]{49})\b",
+        group: 1,
+        check: Check::Format,
+    },
+    Rule {
         id: "jwt",
         label: "JSON Web Token",
         prefix: 3,
@@ -440,6 +451,11 @@ pub mod testdata {
         format!("{}{}", ["sk-", "ant-"].concat(), filler(seed, 40))
     }
 
+    /// Same shape as a Queue API token (`qk_` + 49 base62 characters).
+    pub fn queue_token(seed: u64) -> String {
+        format!("{}{}", ["q", "k_"].concat(), filler(seed, 49))
+    }
+
     pub fn generic(seed: u64) -> String {
         format!("{}9{}", filler(seed, 12), filler(seed + 1, 8))
     }
@@ -487,6 +503,32 @@ mod tests {
             fingerprint(k, "private_key", h[0].value(&pk)),
             fingerprint(k, "private_key", scan(&other)[0].value(&other))
         );
+    }
+
+    #[test]
+    fn queue_tokens_and_webhook_secrets_are_found() {
+        let t = queue_token(4);
+        let w = t.replacen("qk_", "qwh_", 1);
+        let text = format!(
+            "export QUEUE_TOKEN={t}\nsecret: {w}\nshort qk_abc and qk_{}",
+            "x".repeat(49)
+        );
+        let hits = scan(&text);
+        let found: Vec<_> = hits
+            .iter()
+            .filter(|h| h.rule == "queue_key")
+            .map(|h| h.value(&text).to_string())
+            .collect();
+        assert_eq!(
+            found,
+            vec![t.clone(), w.clone()],
+            "placeholders and short values are no hits"
+        );
+        assert!(scan_high_confidence(&text)
+            .iter()
+            .any(|h| h.rule == "queue_key"));
+        let r = redact(&text);
+        assert!(!r.contains(&t) && !r.contains(&w), "{r}");
     }
 
     #[test]

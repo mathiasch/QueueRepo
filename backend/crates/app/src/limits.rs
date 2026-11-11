@@ -221,6 +221,7 @@ pub(crate) mod tests {
             agent_session: None,
             session_from: None,
             steer_rounds: 0,
+            trigger_id: None,
         }
     }
 

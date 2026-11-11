@@ -4,13 +4,13 @@ use argon2::{
     Argon2,
 };
 use axum::{
-    extract::{FromRequestParts, Path, Query, State},
-    http::request::Parts,
+    extract::{FromRequestParts, MatchedPath, Path, Query, State},
+    http::{header::AUTHORIZATION, request::Parts, StatusCode},
     response::{IntoResponse, Redirect, Response},
     Form, Json,
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
-use queued_api::{LoginRequest, RegisterRequest};
+use queued_api::{tokens, LoginRequest, RegisterRequest};
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -26,13 +26,110 @@ use crate::{
 pub const COOKIE: &str = "qsid";
 const SESSION_DAYS: i64 = 30;
 
-/// Authenticated user extractor (session cookie).
+/// Authenticated user extractor: session cookie, or (WP07) a personal API
+/// token in `Authorization: Bearer qk_…`. With an `Authorization` header
+/// only the token counts (the cookie is ignored), and only on the routes of
+/// `queued_api::tokens::ROUTES` with the scope listed there. Every other
+/// route – account, settings, credentials, token management, … – answers
+/// 403 to a token. The token's request extension is [`TokenAuth`].
 pub struct AuthUser(pub User);
+
+/// Present in the request extensions when a token authenticated it.
+#[derive(Debug, Clone)]
+pub struct TokenAuth {
+    pub token_id: Uuid,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn token_error(status: StatusCode, msg: &str) -> AppError {
+    AppError(status, msg.into())
+}
+
+async fn token_user(parts: &mut Parts, st: &AppState, header: &str) -> Result<User, AppError> {
+    let unauthorized = |m: &str| token_error(StatusCode::UNAUTHORIZED, m);
+    let token = header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))
+        .map(str::trim)
+        .ok_or_else(|| unauthorized("Authorization must be `Bearer <token>`"))?;
+    // Route first: a forbidden route needs no database lookup.
+    let route = parts
+        .extensions
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_default();
+    let needed = tokens::required(parts.method.as_str(), &route).ok_or_else(|| {
+        token_error(
+            StatusCode::FORBIDDEN,
+            "this endpoint cannot be used with an API token",
+        )
+    })?;
+    if !tokens::well_formed(token, tokens::TOKEN_PREFIX) {
+        return Err(unauthorized("invalid token"));
+    }
+    let row: Option<(
+        Uuid,
+        Vec<String>,
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Uuid,
+        String,
+        String,
+        bool,
+    )> = sqlx::query_as(
+        "SELECT t.id, t.scopes, t.expires_at, t.revoked_at, u.id, u.email, u.name, u.is_admin
+             FROM api_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = $1",
+    )
+    .bind(sha256_hex(token))
+    .fetch_optional(&st.db)
+    .await?;
+    let (id, scopes, expires_at, revoked_at, uid, email, name, is_admin) =
+        row.ok_or_else(|| unauthorized("invalid token"))?;
+    if revoked_at.is_some() {
+        return Err(unauthorized("token revoked"));
+    }
+    if expires_at <= chrono::Utc::now() {
+        return Err(unauthorized("token expired"));
+    }
+    if let Some(scope) = needed {
+        if !scopes.iter().any(|s| s == scope.as_str()) {
+            return Err(token_error(
+                StatusCode::FORBIDDEN,
+                &format!("token lacks scope {}", scope.as_str()),
+            ));
+        }
+    }
+    // At most one write per minute and token.
+    sqlx::query(
+        "UPDATE api_tokens SET last_used_at=now()
+         WHERE id=$1 AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')",
+    )
+    .bind(id)
+    .execute(&st.db)
+    .await?;
+    parts.extensions.insert(TokenAuth {
+        token_id: id,
+        expires_at,
+    });
+    Ok(User {
+        id: uid,
+        email,
+        name,
+        is_admin,
+    })
+}
 
 impl FromRequestParts<AppState> for AuthUser {
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, Self::Rejection> {
+        if let Some(h) = parts.headers.get(AUTHORIZATION) {
+            let h = h
+                .to_str()
+                .map_err(|_| token_error(StatusCode::UNAUTHORIZED, "invalid token"))?
+                .to_string();
+            return Ok(AuthUser(token_user(parts, st, &h).await?));
+        }
         let jar = CookieJar::from_headers(&parts.headers);
         let token = jar
             .get(COOKIE)

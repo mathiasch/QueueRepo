@@ -27,6 +27,8 @@ pub struct AppState {
     pub batch_wake: Arc<Notify>,
     /// Wakes the pull request poller (WP05; webhooks of WP07 use it too).
     pub pr_wake: Arc<Notify>,
+    /// Wakes the trigger scheduler (WP07: a schedule was changed).
+    pub trigger_wake: Arc<Notify>,
     /// Cancellation handles of running tasks (with the generation of the run
     /// that registered it, see [`AppState::track`]).
     pub running: Arc<Mutex<HashMap<Uuid, (u64, CancellationToken)>>>,
@@ -59,6 +61,7 @@ impl AppState {
             wake: Arc::new(Notify::new()),
             batch_wake: Arc::new(Notify::new()),
             pr_wake: Arc::new(Notify::new()),
+            trigger_wake: Arc::new(Notify::new()),
             running: Arc::new(Mutex::new(HashMap::new())),
             run_gen: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             steers: Arc::new(std::sync::Mutex::new(HashMap::new())),

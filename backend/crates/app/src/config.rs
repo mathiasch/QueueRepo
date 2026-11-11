@@ -48,6 +48,9 @@ pub struct Config {
     /// Gitea/GitLab in the LAN; env `ALLOW_PRIVATE_GIT_HOSTS`, default off).
     /// Also allows plain `http://` API addresses there.
     pub allow_private_git_hosts: bool,
+    /// WP07: interval of the trigger scheduler (env `TRIGGER_TICK_SECS`,
+    /// default 15; 0 = no background loop, tests drive `triggers::tick`).
+    pub trigger_tick_secs: u64,
 }
 
 pub fn var(k: &str) -> Option<String> {
@@ -100,6 +103,7 @@ impl Config {
             allow_local_remotes: flag("ALLOW_LOCAL_GIT_REMOTES", false),
             pr_poll_secs: num::<u64>("PR_POLL_SECS", 60),
             allow_private_git_hosts: flag("ALLOW_PRIVATE_GIT_HOSTS", false),
+            trigger_tick_secs: num::<u64>("TRIGGER_TICK_SECS", 15),
             data_dir,
         })
     }
@@ -140,6 +144,7 @@ impl Config {
             pr_poll_secs: 1,
             // Fake git host servers listen on 127.0.0.1.
             allow_private_git_hosts: true,
+            trigger_tick_secs: 1,
         }
     }
 

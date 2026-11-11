@@ -20,6 +20,8 @@ pub mod gate;
 pub mod pr;
 mod providers;
 pub mod steer;
+pub mod tokens;
+pub mod triggers;
 pub use costs::*;
 pub use providers::*;
 
@@ -409,6 +411,9 @@ pub struct Task {
     /// Steering rounds (resumes for user messages) so far.
     #[serde(default)]
     pub steer_rounds: i32,
+    /// WP07: the trigger (schedule, webhook, GitHub, API) that created it.
+    #[serde(default)]
+    pub trigger_id: Option<Uuid>,
 }
 
 impl Task {
@@ -1061,6 +1066,7 @@ mod tests {
             "plan_meta",
             "agent_session",
             "session_from",
+            "trigger_id",
         ] {
             full[k] = Value::Null;
         }
@@ -1070,7 +1076,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&t).unwrap(),
             full,
-            "rows from before WP04/WP05/WP06 still parse"
+            "rows from before WP04/WP05/WP06/WP07 still parse"
         );
         assert_eq!(serde_json::from_value::<Task>(full).unwrap(), t);
         // Before WP04: diff from the first snapshot, always on the target.

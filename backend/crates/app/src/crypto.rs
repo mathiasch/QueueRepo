@@ -41,6 +41,13 @@ pub fn sha256_hex(s: &str) -> String {
     d.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+pub fn sha256_hex_bytes(b: &[u8]) -> String {
+    Sha256::digest(b)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 pub fn sha256_b64url(s: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(s.as_bytes()))
 }

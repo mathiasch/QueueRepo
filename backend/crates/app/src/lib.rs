@@ -32,6 +32,8 @@ pub mod runner;
 pub mod runner_client;
 pub mod state;
 pub mod steer;
+pub mod triggers;
+pub mod webhooks;
 pub mod worker;
 
 use anyhow::Context;
@@ -60,6 +62,10 @@ pub async fn start_worker(st: &state::AppState) -> anyhow::Result<()> {
     // 0 = tests drive the pull request poller themselves.
     if st.cfg.pr_poll_secs > 0 {
         tokio::spawn(pr::run(st.clone()));
+    }
+    // 0 = tests drive the trigger scheduler themselves.
+    if st.cfg.trigger_tick_secs > 0 {
+        tokio::spawn(triggers::run(st.clone()));
     }
     Ok(())
 }

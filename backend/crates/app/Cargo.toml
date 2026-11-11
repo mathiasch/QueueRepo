@@ -40,6 +40,9 @@ url = "2"
 time = "0.3"
 regex = "1"
 web-push = { version = "0.10", default-features = false }
+# WP07: IANA time zones of schedules, HMAC of webhooks.
+chrono-tz = "0.10"
+hmac = "0.12"
 
 [dev-dependencies]
 queued-runner = { path = "../runner" }

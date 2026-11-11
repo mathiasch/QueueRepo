@@ -2,12 +2,15 @@ mod credentials;
 mod environment;
 mod evals;
 mod gate;
+mod hooks;
 pub mod limits;
-mod projects;
+pub(crate) mod projects;
 mod providers;
 mod pulls;
 mod steer;
 mod tasks;
+mod tokens;
+mod triggers;
 
 use std::convert::Infallible;
 
@@ -168,6 +171,40 @@ pub fn router(st: AppState) -> Router {
         .route("/pulls/{id}/poll", post(pulls::poll_now))
         .route("/pulls/{id}/auto-fix", post(pulls::auto_fix))
         .route("/pulls/{id}/extra-round", post(pulls::extra_round))
+        // WP07: API tokens (cookie only), templates, triggers, webhooks.
+        .route("/tokens", get(tokens::list).post(tokens::create))
+        .route("/tokens/{id}", delete(tokens::remove))
+        .route("/tokens/{id}/revoke", post(tokens::revoke))
+        .route("/whoami", get(tokens::whoami))
+        .route(
+            "/projects/{id}/templates",
+            get(triggers::list_templates).post(triggers::create_template),
+        )
+        .route(
+            "/templates/{id}",
+            axum::routing::patch(triggers::update_template).delete(triggers::delete_template),
+        )
+        .route(
+            "/projects/{id}/triggers",
+            get(triggers::list_triggers).post(triggers::create_trigger),
+        )
+        .route("/triggers/preview", post(triggers::preview))
+        .route("/timezones", get(triggers::timezones))
+        .route(
+            "/triggers/{id}",
+            get(triggers::get_trigger)
+                .patch(triggers::update_trigger)
+                .delete(triggers::delete_trigger),
+        )
+        .route("/triggers/{id}/runs", get(triggers::runs))
+        .route("/triggers/{id}/secret", post(triggers::renew_secret))
+        .route("/triggers/{id}/fire", post(triggers::fire))
+        .route(
+            "/hooks/{id}",
+            post(hooks::receive).layer(DefaultBodyLimit::max(
+                queued_api::triggers::WEBHOOK_MAX_BODY,
+            )),
+        )
         // Unknown API paths get a JSON 404 instead of the SPA's index.html.
         .fallback(|| async { AppError::not_found() });
 
