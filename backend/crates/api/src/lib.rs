@@ -18,6 +18,7 @@ pub mod diff;
 pub mod env;
 pub mod gate;
 pub mod intake;
+pub mod memory;
 pub mod pr;
 mod providers;
 pub mod steer;
@@ -415,6 +416,19 @@ pub struct Task {
     /// WP07: the trigger (schedule, webhook, GitHub, API) that created it.
     #[serde(default)]
     pub trigger_id: Option<Uuid>,
+    /// WP09: revision of the project state the run started with.
+    #[serde(default)]
+    pub state_rev: Option<i32>,
+    /// WP09 OnEmpty: why this proposal was queued or needs approval
+    /// ([`memory::Screening`]).
+    #[serde(default)]
+    pub dedupe: Option<Value>,
+    /// WP09 OnEmpty task: screening report of all proposals.
+    #[serde(default)]
+    pub proposals: Option<Value>,
+    /// WP09: changes were reverted (`git revert`).
+    #[serde(default)]
+    pub reverted_at: Option<DateTime<Utc>>,
 }
 
 impl Task {
@@ -525,6 +539,9 @@ pub struct TaskDetail {
     /// External object the task came from (WP08).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intake: Option<intake::IntakeLinkView>,
+    /// WP09: attachments (own; a fix task also lists those it inherits).
+    #[serde(default)]
+    pub attachments: Vec<memory::AttachmentView>,
 }
 
 /// `GET /api/tasks/{id}/diff`.
@@ -591,6 +608,9 @@ pub struct CreateTask {
     /// WP06: plan first (`None` = the project's default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_mode: Option<bool>,
+    /// WP09: draft attachments (uploaded before) that belong to the task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachment_ids: Vec<Uuid>,
     #[serde(flatten)]
     pub limits: TaskLimitFields,
 }
@@ -888,6 +908,28 @@ pub struct Settings {
     pub ntfy_url: Option<String>,
     #[serde(default)]
     pub last_onempty_at: Option<DateTime<Utc>>,
+    /// WP09: OnEmpty dedupe – drop proposals at least this similar.
+    #[serde(default = "default_dedupe_threshold")]
+    pub dedupe_threshold: f32,
+    /// WP09: proposals at least this similar need an approval.
+    #[serde(default = "default_dedupe_review")]
+    pub dedupe_review_threshold: f32,
+    /// WP09: finished tasks of the last N days are compared.
+    #[serde(default = "default_dedupe_days")]
+    pub dedupe_window_days: i32,
+    /// WP09: second opinion by a model before proposals are queued.
+    #[serde(default)]
+    pub critic_llm: bool,
+}
+
+fn default_dedupe_threshold() -> f32 {
+    0.6
+}
+fn default_dedupe_review() -> f32 {
+    0.35
+}
+fn default_dedupe_days() -> i32 {
+    90
 }
 
 /// `PUT /api/settings` (the server clamps the numbers).
@@ -901,6 +943,15 @@ pub struct SettingsUpdate {
     pub max_auto_tasks: i32,
     pub max_fix_attempts: i32,
     pub ntfy_url: Option<String>,
+    /// WP09 (absent = unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_threshold: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_review_threshold: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_window_days: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critic_llm: Option<bool>,
 }
 
 impl From<&Settings> for SettingsUpdate {
@@ -914,6 +965,10 @@ impl From<&Settings> for SettingsUpdate {
             max_auto_tasks: s.max_auto_tasks,
             max_fix_attempts: s.max_fix_attempts,
             ntfy_url: s.ntfy_url.clone(),
+            dedupe_threshold: Some(s.dedupe_threshold),
+            dedupe_review_threshold: Some(s.dedupe_review_threshold),
+            dedupe_window_days: Some(s.dedupe_window_days),
+            critic_llm: Some(s.critic_llm),
         }
     }
 }
@@ -1071,6 +1126,10 @@ mod tests {
             "agent_session",
             "session_from",
             "trigger_id",
+            "state_rev",
+            "dedupe",
+            "proposals",
+            "reverted_at",
         ] {
             full[k] = Value::Null;
         }
@@ -1158,6 +1217,7 @@ mod tests {
             front: true,
             allow_test_changes: false,
             plan_mode: None,
+            attachment_ids: vec![],
             limits: TaskLimitFields {
                 max_runtime_secs: Some(Some(90)),
                 ..Default::default()
@@ -1226,6 +1286,23 @@ mod tests {
             "onempty_enabled": false, "onempty_actions": ["review"], "onempty_cooldown_minutes": 300,
             "max_auto_tasks": 2, "max_fix_attempts": 2, "ntfy_url": null, "last_onempty_at": null});
         let s: Settings = serde_json::from_value(v.clone()).unwrap();
+        let u: SettingsUpdate = serde_json::from_value(v.clone()).unwrap();
+        // WP09 fields: an older client leaves them out = unchanged; the
+        // settings of an older server get the defaults.
+        assert_eq!((u.dedupe_threshold, u.critic_llm), (None, None));
+        assert_eq!(
+            (
+                s.dedupe_threshold,
+                s.dedupe_review_threshold,
+                s.dedupe_window_days
+            ),
+            (0.6, 0.35, 90)
+        );
+        let mut v = v;
+        v["dedupe_threshold"] = json!(0.6);
+        v["dedupe_review_threshold"] = json!(0.35);
+        v["dedupe_window_days"] = json!(90);
+        v["critic_llm"] = json!(false);
         let u: SettingsUpdate = serde_json::from_value(v).unwrap();
         assert_eq!(SettingsUpdate::from(&s), u);
         assert_eq!(

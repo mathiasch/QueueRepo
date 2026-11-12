@@ -19,6 +19,8 @@ use crate::store::use_store;
 use crate::theme::{get_pref, set_pref};
 use crate::ui::{uid, Field, FieldIds, HelpTip, Ic, Icon};
 
+use super::attachments::{AttachmentChips, AttachmentPicker};
+
 thread_local! {
     static FOCUS_HANDLED: Cell<u32> = const { Cell::new(0) };
 }
@@ -114,6 +116,8 @@ pub fn Composer() -> impl IntoView {
     let busy = RwSignal::new(false);
     let limits = RwSignal::new(LimitForm::default());
     let limit_errors = RwSignal::new(vec![]);
+    // WP09: drafts uploaded before the task exists (bound to the project).
+    let attachments = RwSignal::new(Vec::<queued_api::memory::AttachmentView>::new());
     let chosen = RwSignal::new(get_pref("project").unwrap_or_default());
     let textarea: NodeRef<html::Textarea> = NodeRef::new();
     let section: NodeRef<html::Section> = NodeRef::new();
@@ -248,6 +252,7 @@ pub fn Composer() -> impl IntoView {
             front: front.get_untracked(),
             allow_test_changes: test_task.get_untracked(),
             plan_mode: plan_first.get_untracked(),
+            attachment_ids: attachments.with_untracked(|a| a.iter().map(|x| x.id).collect()),
             limits: lim.create_fields(),
         };
         spawn_local(async move {
@@ -262,6 +267,7 @@ pub fn Composer() -> impl IntoView {
                     plan_first.set(None);
                     tpl_title.set(None);
                     limits.set(LimitForm::default());
+                    attachments.set(vec![]);
                     store.announce(format!("„{}“ eingereiht", first_line(&t.title, 60)));
                     if let Some(el) = textarea.get_untracked() {
                         let _ = el.focus();
@@ -337,6 +343,8 @@ pub fn Composer() -> impl IntoView {
                     }
                 }
             ></textarea>
+            <AttachmentChips items=attachments/>
+            <AttachmentPicker project=project_id items=attachments/>
             {move || advanced.get().then(|| {
                 let (ctx_ids, parent_ids, prov_ids, model_ids) = (ctx_ids.clone(), parent_ids.clone(), prov_ids.clone(), model_ids.clone());
                 let (ctx_id, parent_id, prov_id, model_id) = (ctx_ids.id.clone(), parent_ids.id.clone(), prov_ids.id.clone(), model_ids.id.clone());
@@ -437,6 +445,11 @@ pub fn Composer() -> impl IntoView {
                         let v = event_target_value(&ev);
                         set_pref("project", &v);
                         chosen.set(v);
+                        // Drafts belong to the project they were uploaded to.
+                        if !attachments.with_untracked(Vec::is_empty) {
+                            attachments.set(vec![]);
+                            store.announce("Anhänge entfernt: sie gehören zum vorher gewählten Projekt");
+                        }
                     }
                 >
                     {move || editable.get().into_iter().map(|(id, name)| view! { <option value=id.to_string()>{name}</option> }).collect_view()}

@@ -60,6 +60,7 @@ pub fn step_label(step: &str) -> &'static str {
         "execute" => "Umsetzung",
         "review" => "Prüfung",
         "analyze" => "Analyse",
+        "critic" => "Prüfung",
         _ => "Schritt",
     }
 }

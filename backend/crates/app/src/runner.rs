@@ -790,6 +790,13 @@ async fn run_inner(
     };
     let (mut session, mut resumed, mut claimed) = (first.session, first.resumed, first.claimed);
     let mut next_prompt = first.prompt;
+    // WP09: the project state goes into the workspace once per task run
+    // (later steering rounds keep the agent's own edits of the file).
+    let mut state_files = if task.kind == "onempty" {
+        vec![]
+    } else {
+        crate::project_state::for_run(st, task).await?
+    };
     let mut clear_result = false;
     let mut fell_back = false;
     let out = loop {
@@ -817,6 +824,7 @@ async fn run_inner(
                 workspace: None,
                 steer: steer_tok,
                 clear_result,
+                queue_files: std::mem::take(&mut state_files),
             },
             cancel,
         )
@@ -868,6 +876,13 @@ async fn run_inner(
             .await?;
         let (c, note) = load_contract(out.structured.as_ref(), file.as_deref());
         event(st, task, "contract", &note).await;
+        // WP09: rules proposal and project state of the run (checked by
+        // the runner; "done" only counts for a successful run).
+        crate::knowledge::collect(st, task).await;
+        if task.kind != "onempty" {
+            let ok = c.as_ref().and_then(|c| c.status.as_deref()) == Some("done");
+            crate::project_state::check_after_run(st, task, ok).await;
+        }
         c
     } else {
         None
@@ -993,10 +1008,11 @@ async fn build_prompt(
     .bind(project.id)
     .fetch_all(&st.db)
     .await?;
-    Ok(prompt::onempty(
-        project,
-        &settings.onempty_actions,
-        &history,
+    let reverted = crate::dedupe::reverted_titles(st, project.id).await?;
+    Ok(format!(
+        "{}{}",
+        crate::knowledge::prefix(st, project.id).await,
+        prompt::onempty(project, &settings.onempty_actions, &history, &reverted)
     ))
 }
 
@@ -1270,6 +1286,7 @@ async fn finish_done(
     )
     .await?;
     event(st, task, "status", "Erledigt").await;
+    crate::project_state::apply_on_done(st, task).await;
     let created = create_followups(st, task, settings, follow_ups).await?;
     if created == 0 && task.kind != "onempty" {
         notify(
@@ -1371,6 +1388,14 @@ impl Committer<'_> {
     /// working tree; a commit is copied to the task branch of the main
     /// repository at once (WP04).
     async fn commit(&self, suffix: &str) -> anyhow::Result<queued_common::CommitOutcome> {
+        // WP09: the task's gate base – agent commits after it that touched
+        // `.queue/` are squashed into this commit (without `.queue/`).
+        let base: Option<String> =
+            sqlx::query_scalar("SELECT snapshot_before FROM tasks WHERE id=$1")
+                .bind(self.task.id)
+                .fetch_optional(&self.st.db)
+                .await?
+                .flatten();
         let out = self
             .st
             .runner
@@ -1380,8 +1405,18 @@ impl Committer<'_> {
                 self.author_name,
                 self.author_email,
                 self.allow,
+                base.as_deref(),
             )
             .await?;
+        if out.squashed {
+            event(
+                self.st,
+                self.task,
+                "gate",
+                "Eigene Commits des Agenten enthielten Dateien aus .queue/ (Anhänge/Steuerdateien) – zu einem Commit ohne diese Dateien zusammengefasst",
+            )
+            .await;
+        }
         if out.blocked.is_empty() {
             merge::sync(self.st, self.project_id, self.task.id, &out.sha).await?;
         }
@@ -1771,6 +1806,31 @@ struct RunSpec<'a> {
     steer: Option<CancellationToken>,
     /// Remove a previous run's `.queue/result.json` first (steering rounds).
     clear_result: bool,
+    /// WP09: extra files placed in `.queue/` before the start (the project
+    /// state for the task's first agent run).
+    queue_files: Vec<(String, String)>,
+}
+
+/// WP09: places the task's attachments in `.queue/attachments/` of `ws`.
+async fn provide_attachments(st: &AppState, task: &Task, ws: &str) -> Result<(), RunError> {
+    let files = crate::attachments::files_for_run(st, task.id).await?;
+    st.runner
+        .put_attachments(ws, &files)
+        .await
+        .map_err(RunError::Infra)?;
+    if !files.is_empty() {
+        event(
+            st,
+            task,
+            "status",
+            &format!(
+                "{} Anhang/Anhänge in .queue/attachments/ bereitgestellt",
+                files.len()
+            ),
+        )
+        .await;
+    }
+    Ok(())
 }
 
 async fn agent_run(
@@ -1861,6 +1921,13 @@ async fn agent_run(
         ),
     )
     .await;
+    // WP09: the task's attachments, fresh before every run (also restores
+    // originals the agent changed before the review sees them).
+    let ws = spec
+        .workspace
+        .clone()
+        .unwrap_or_else(|| crate::runner_client::task_ws(task.id));
+    provide_attachments(st, task, &ws).await?;
     // Project variables first: the invocation's own variables win.
     let mut run_env = spec.env.vars();
     run_env.extend(inv.env.iter().cloned());
@@ -1893,6 +1960,7 @@ async fn agent_run(
                 // A steering round must not be judged by the previous run's contract.
                 q.push(("result.json".into(), String::new()));
             }
+            q.extend(spec.queue_files.iter().cloned());
             q
         },
         read_only: spec.read_only,
@@ -2508,7 +2576,11 @@ async fn run_review(
             provider: &acc.provider,
             model: model.as_deref(),
             cred: &acc.cred,
-            prompt: prompt::review(task, rc.summary, &secrets::redact(&diff), rc.approved),
+            prompt: format!(
+                "{}{}",
+                crate::knowledge::prefix(st, task.project_id).await,
+                prompt::review(task, rc.summary, &secrets::redact(&diff), rc.approved)
+            ),
             kind: RunKind::Review,
             label: "review",
             limits: lim,
@@ -2522,6 +2594,7 @@ async fn run_review(
             workspace: None,
             steer: None,
             clear_result: false,
+            queue_files: vec![],
         },
         cancel,
     )
@@ -2691,7 +2764,12 @@ async fn step_connector(
 /// Stable prefix of single-shot prompts (cacheable).
 async fn stable_prefix(st: &AppState, project: &Project) -> String {
     let files = st.runner.files(project.id).await.unwrap_or_default();
-    prompt::single_shot_system(project, &files)
+    // WP09: approved project rules first (stable between calls → cached).
+    format!(
+        "{}{}",
+        crate::knowledge::prefix(st, project.id).await,
+        prompt::single_shot_system(project, &files)
+    )
 }
 
 /// Plan before / analysis instead of the agent loop. Returns whether the
@@ -2741,7 +2819,8 @@ async fn defer_single(
         prompt::plan_request(task, parent.as_ref())
     } else {
         let history = onempty_history(st, project).await?;
-        prompt::analyze_request(&settings.onempty_actions, &history)
+        let reverted = crate::dedupe::reverted_titles(st, project.id).await?;
+        prompt::analyze_request(&settings.onempty_actions, &history, &reverted)
     };
     let mode = route.mode;
     let _ = usage;
@@ -3011,8 +3090,26 @@ async fn create_followups(
     if items.is_empty() {
         return Ok(0);
     }
+    // WP09: OnEmpty proposals pass dedupe and the critic first.
+    let screenings: Option<Vec<queued_api::memory::Screening>> = if parent.kind == "onempty" {
+        let mut sc = crate::dedupe::screen(st, parent.project_id, settings, &items).await?;
+        if settings.critic_llm {
+            llm_critic(st, parent, &items, &mut sc).await;
+        }
+        Some(sc)
+    } else {
+        None
+    };
+    let keep: Vec<bool> = match &screenings {
+        Some(sc) => sc
+            .iter()
+            .map(|x| x.verdict != queued_api::memory::Verdict::Dropped)
+            .collect(),
+        None => vec![true; items.len()],
+    };
+    let kept = keep.iter().filter(|k| **k).count();
     let depth = parent.depth + 1;
-    let needs_approval = items.len() as i32 > settings.max_auto_tasks || depth > MAX_AUTO_DEPTH;
+    let needs_approval = kept as i32 > settings.max_auto_tasks || depth > MAX_AUTO_DEPTH;
     // OnEmpty proposals run on the project's agent-loop access; other
     // follow-ups inherit the parent's access.
     let (provider, connector_id, model) = if parent.kind == "onempty" {
@@ -3048,7 +3145,14 @@ async fn create_followups(
         },
         None => provider,
     };
-    for f in &items {
+    let mut screenings = screenings;
+    for (i, f) in items.iter().enumerate() {
+        if !keep[i] {
+            continue;
+        }
+        let review = screenings
+            .as_ref()
+            .is_some_and(|sc| sc[i].verdict == queued_api::memory::Verdict::Review);
         let title = if f.title.trim().is_empty() {
             f.prompt
                 .lines()
@@ -3058,7 +3162,7 @@ async fn create_followups(
         } else {
             f.title.clone()
         };
-        queue::insert_task(
+        let created = queue::insert_task(
             st,
             NewTask {
                 user_id: parent.user_id,
@@ -3070,7 +3174,7 @@ async fn create_followups(
                 context: String::new(),
                 provider: provider.clone(),
                 model: model.clone(),
-                status: if needs_approval {
+                status: if needs_approval || review {
                     status::PENDING_APPROVAL
                 } else {
                     status::QUEUED
@@ -3090,11 +3194,75 @@ async fn create_followups(
             },
         )
         .await?;
+        if let Some(sc) = screenings.as_mut() {
+            sc[i].task_id = Some(created.id);
+            sqlx::query("UPDATE tasks SET dedupe=$2 WHERE id=$1")
+                .bind(created.id)
+                .bind(serde_json::to_value(&sc[i]).unwrap_or_default())
+                .execute(&st.db)
+                .await?;
+            queue::emit_task(st, created.id).await;
+        }
     }
-    let n = items.len();
+    let mut dropped_list = String::new();
+    if let Some(sc) = &screenings {
+        sqlx::query("UPDATE tasks SET proposals=$2 WHERE id=$1")
+            .bind(parent.id)
+            .bind(serde_json::to_value(sc).unwrap_or_default())
+            .execute(&st.db)
+            .await?;
+        let dropped: Vec<String> = sc
+            .iter()
+            .filter(|x| x.verdict == queued_api::memory::Verdict::Dropped)
+            .map(|x| format!("• {} – {}", x.title, x.reasons.join("; ")))
+            .collect();
+        event(
+            st,
+            parent,
+            "status",
+            &format!(
+                "Vorschläge geprüft: {} eingeplant, {} zur Freigabe, {} verworfen",
+                sc.iter()
+                    .filter(|x| x.verdict == queued_api::memory::Verdict::Accepted)
+                    .count(),
+                sc.iter()
+                    .filter(|x| x.verdict == queued_api::memory::Verdict::Review)
+                    .count(),
+                dropped.len()
+            ),
+        )
+        .await;
+        if !dropped.is_empty() {
+            dropped_list = format!("\nVerworfen:\n{}", dropped.join("\n"));
+        }
+    }
+    let n = kept;
+    if n == 0 {
+        if !dropped_list.is_empty() {
+            notify(
+                st,
+                parent.user_id,
+                Note {
+                    kind: "followups",
+                    title: "Leerlauf-Vorschläge verworfen".into(),
+                    body: dropped_list.trim().to_string(),
+                    task_id: Some(parent.id),
+                    push: false,
+                },
+            )
+            .await;
+        }
+        return Ok(0);
+    }
+    let any_review = screenings.as_ref().is_some_and(|sc| {
+        sc.iter()
+            .any(|x| x.verdict == queued_api::memory::Verdict::Review)
+    });
     let list: String = items
         .iter()
-        .map(|f| {
+        .zip(&keep)
+        .filter(|(_, k)| **k)
+        .map(|(f, _)| {
             format!(
                 "• {}",
                 if f.title.is_empty() {
@@ -3105,8 +3273,9 @@ async fn create_followups(
             )
         })
         .collect::<Vec<_>>()
-        .join("\n");
-    if needs_approval {
+        .join("\n")
+        + &dropped_list;
+    if needs_approval || any_review {
         notify(
             st,
             parent.user_id,
@@ -3134,6 +3303,135 @@ async fn create_followups(
         .await;
     }
     Ok(n)
+}
+
+/// WP09: optional second opinion by a model on OnEmpty proposals, through
+/// the direct access of the project's analysis step (costs as step
+/// `critic`). It can only make verdicts stricter; any failure leaves the
+/// rule-based verdicts as they are (and says so in the log).
+async fn llm_critic(
+    st: &AppState,
+    parent: &Task,
+    items: &[FollowUp],
+    sc: &mut [queued_api::memory::Screening],
+) {
+    use queued_api::memory::Verdict;
+    let open: Vec<usize> = (0..sc.len())
+        .filter(|i| sc[*i].verdict != Verdict::Dropped)
+        .collect();
+    if open.is_empty() {
+        return;
+    }
+    let skip = |why: String| async move {
+        event(
+            st,
+            parent,
+            "status",
+            &format!("Prüfung durch ein Modell übersprungen: {why} – es gelten die Regeln"),
+        )
+        .await;
+    };
+    let project: Project = match sqlx::query_as("SELECT * FROM projects WHERE id=$1")
+        .bind(parent.project_id)
+        .fetch_one(&st.db)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return skip(format!("Projekt nicht lesbar ({e})")).await,
+    };
+    let Some(routing) = project.routing() else {
+        return skip("kein Zugang für Einzelschritte im Projekt eingestellt".into()).await;
+    };
+    let (c, model) = match step_connector(
+        st,
+        parent,
+        &project,
+        &routing.analyze,
+        routing.execute.target.as_ref(),
+    )
+    .await
+    {
+        Ok(Ok(x)) => x,
+        Ok(Err(why)) => return skip(why).await,
+        Err(e) => return skip(format!("{e:#}")).await,
+    };
+    let Some((wire, base)) = c.wire() else {
+        return skip(format!("{} kann keine direkten Aufrufe", c.label)).await;
+    };
+    let ep = llm::Endpoint {
+        wire,
+        base,
+        kind: c.kind.clone(),
+        secret: c.secret.clone(),
+        guard: st.cfg.llm_guard(),
+    };
+    let candidates: Vec<prompt::CriticItem> = open
+        .iter()
+        .map(|i| prompt::CriticItem {
+            index: *i,
+            title: sc[*i].title.clone(),
+            prompt: items[*i].prompt.clone(),
+            similar: sc[*i].similar.as_ref().map(|s| {
+                format!(
+                    "{} ({} %, {})",
+                    s.title,
+                    (s.score * 100.0).round(),
+                    s.status
+                )
+            }),
+        })
+        .collect();
+    let req = llm::Request {
+        model: model.clone(),
+        system: stable_prefix(st, &project).await,
+        user: prompt::critic_request(&candidates, &prompt::nonce()),
+        max_tokens: 2_000,
+        cache_long: false,
+    };
+    let http = llm::client(&ep.guard);
+    let resp = match llm::call(&http, &ep, &req).await {
+        Ok(r) => r,
+        Err(e) => return skip(format!("{e}")).await,
+    };
+    let cat = pricing::current(st).await;
+    let ctx = PriceCtx {
+        tier: Tier::Standard,
+        region_mult: c
+            .region_rule()
+            .and_then(|id| pricing::region(&cat, id))
+            .map_or(1.0, |r| r.multiplier),
+        long_ttl: false,
+    };
+    let mut m = Meter::new(&cat, Some(&model), ctx, "critic", Some(c.label.clone()));
+    m.on_delta(&resp.usage);
+    let cost = m.finish(&resp.usage);
+    if let Err(e) = record_cost(st, parent, &c.harness, Some(c.id), &cost).await {
+        tracing::warn!("critic cost not recorded: {e}");
+    }
+    let Some(ans) = llm::extract_json::<prompt::CriticAnswer>(&resp.text) else {
+        return skip("Antwort des Modells war kein gültiges JSON".into()).await;
+    };
+    for v in ans.verdicts {
+        let Some(i) = open.iter().copied().find(|i| *i == v.index) else {
+            continue;
+        };
+        let verdict = match v.verdict.as_str() {
+            "drop" => Verdict::Dropped,
+            "review" => Verdict::Review,
+            _ => Verdict::Accepted,
+        };
+        let s = &mut sc[i];
+        s.critic = "rules+model".into();
+        let reason: String = v.reason.chars().take(300).collect();
+        if crate::dedupe::stricter(s.verdict, verdict) != s.verdict {
+            s.verdict = verdict;
+            s.reasons
+                .push(format!("Modell ({}): {}", model, reason.trim()));
+        } else if !reason.trim().is_empty() {
+            s.reasons
+                .push(format!("Modell ({}): {}", model, reason.trim()));
+        }
+    }
 }
 
 async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Result<()> {

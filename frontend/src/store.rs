@@ -306,6 +306,17 @@ impl Store {
         );
     }
 
+    /// Error toast with a plain (already German) message.
+    pub fn toast_error_text(self, title: impl Into<String>, msg: &str) {
+        self.toast_full(
+            title.into(),
+            Some(msg.to_string()),
+            ToastTone::Error,
+            None,
+            None,
+        );
+    }
+
     pub fn toast_action(self, title: impl Into<String>, action: ToastAction) {
         self.toast_full(title.into(), None, ToastTone::Info, None, Some(action));
     }

@@ -36,6 +36,8 @@ pub struct Config {
     pub tick_secs: u64,
     /// Poll interval of single-shot/batch jobs (env `BATCH_POLL_SECS`).
     pub batch_poll_secs: u64,
+    /// WP09: attachment storage per user (bytes, `ATTACHMENT_QUOTA_MB`).
+    pub attachment_quota_bytes: i64,
     /// App-side model calls may go to loopback/private networks
     /// (`ALLOW_PRIVATE_LLM_ENDPOINTS`, default off – SSRF guard).
     pub allow_private_llm_endpoints: bool,
@@ -118,6 +120,13 @@ impl Config {
             oidc: oidc::load_providers(&http).await,
             tick_secs: num("TICK_SECS", 15),
             batch_poll_secs: num::<u64>("BATCH_POLL_SECS", 60).max(1),
+            attachment_quota_bytes: num::<i64>(
+                "ATTACHMENT_QUOTA_MB",
+                queued_api::memory::DEFAULT_ATTACHMENT_QUOTA_MB as i64,
+            )
+            .max(1)
+                * 1024
+                * 1024,
             allow_private_llm_endpoints: flag("ALLOW_PRIVATE_LLM_ENDPOINTS", false),
             allow_local_remotes: flag("ALLOW_LOCAL_GIT_REMOTES", false),
             pr_poll_secs: num::<u64>("PR_POLL_SECS", 60),
@@ -163,6 +172,9 @@ impl Config {
             oidc: vec![],
             tick_secs: 1,
             batch_poll_secs: 1,
+            attachment_quota_bytes: queued_api::memory::DEFAULT_ATTACHMENT_QUOTA_MB as i64
+                * 1024
+                * 1024,
             // Fake provider servers listen on 127.0.0.1.
             allow_private_llm_endpoints: true,
             allow_local_remotes: true,

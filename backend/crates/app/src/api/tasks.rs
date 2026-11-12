@@ -92,8 +92,9 @@ pub async fn create(
             .take(80)
             .collect()
     });
-    let task = queue::insert_task(
-        &st,
+    let mut tx = st.db.begin().await?;
+    let task = queue::insert_task_in(
+        &mut tx,
         NewTask {
             user_id: u.id,
             project_id: c.project_id,
@@ -124,6 +125,12 @@ pub async fn create(
         },
     )
     .await?;
+    // WP09: the composer's draft attachments belong to the task before
+    // anyone (the scheduler) sees it.
+    super::attachments::attach_drafts(&mut tx, &c.attachment_ids, task.id, c.project_id, u.id)
+        .await?;
+    tx.commit().await?;
+    queue::announce(&st, &task);
     Ok(Json(task))
 }
 
@@ -146,11 +153,13 @@ pub async fn get(
     .await?;
     let pull_request = super::pulls::of_task(&st, &t).await?;
     let intake = crate::intake::link_view(&st, t.id).await?;
+    let attachments = super::attachments::views_for_task(&st, &t, u.id).await?;
     Ok(Json(TaskDetail {
         task: t,
         events,
         pull_request,
         intake,
+        attachments,
     }))
 }
 
@@ -563,6 +572,11 @@ pub async fn revert(
             _ => runner_err(e),
         }
     })?;
+    // WP09: a reverted task is a negative example for OnEmpty proposals.
+    sqlx::query("UPDATE tasks SET reverted_at=now() WHERE id=$1")
+        .bind(t.id)
+        .execute(&st.db)
+        .await?;
     queue::event(
         &st,
         &t,

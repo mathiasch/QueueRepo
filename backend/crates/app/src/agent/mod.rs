@@ -478,6 +478,20 @@ pub fn invocation_with(
 /// (`enableHooks: settings.hooksConfig.enabled`, `toolDiscoveryCommand`,
 /// `mcpServerCommand`), `findEnvFile` (`advanced.ignoreLocalEnv`).
 pub const GEMINI_SYSTEM_SETTINGS: &str = r#"{"hooksConfig":{"enabled":false},"tools":{"discoveryCommand":"","callCommand":""},"mcp":{"serverCommand":""},"advanced":{"ignoreLocalEnv":true}}"#;
+
+/// WP09: Gemini reads `GEMINI.md` from the (trusted) workspace and its
+/// sub-directories as instructions – always, also with Queue's
+/// restrictions (0.67.0 `getEnvironmentMemoryPaths`/`loadJitSubdirectoryMemory`
+/// with `context.fileName`). The system settings point the file name to an
+/// unguessable name per run, so no repository file is loaded; approved
+/// project rules reach Gemini through the prompt.
+pub fn gemini_system_settings() -> String {
+    let mut v: Value = serde_json::from_str(GEMINI_SYSTEM_SETTINGS).expect("valid settings");
+    v["context"] = serde_json::json!({
+        "fileName": format!("QUEUE-NO-CONTEXT-{}.md", uuid::Uuid::new_v4().simple())
+    });
+    v.to_string()
+}
 pub const GEMINI_SYSTEM_SETTINGS_FILE: &str = ".gemini/queue-system-settings.json";
 
 /// WP03: keep the CLI from running configuration out of the repository
@@ -494,10 +508,8 @@ pub fn restrict_repo_config(inv: &mut Invocation, provider: &str) {
             .args
             .extend(["--setting-sources", "user", "--strict-mcp-config"].map(String::from)),
         "gemini" => {
-            inv.home_files.push((
-                GEMINI_SYSTEM_SETTINGS_FILE.into(),
-                GEMINI_SYSTEM_SETTINGS.into(),
-            ));
+            inv.home_files
+                .push((GEMINI_SYSTEM_SETTINGS_FILE.into(), gemini_system_settings()));
             inv.home_env.push((
                 "GEMINI_CLI_SYSTEM_SETTINGS_PATH".into(),
                 GEMINI_SYSTEM_SETTINGS_FILE.into(),
@@ -510,10 +522,21 @@ pub fn restrict_repo_config(inv: &mut Invocation, provider: &str) {
             ]);
         }
         // Disables project `opencode.json(c)`, `.opencode/` (plugins, agents,
-        // commands) and project AGENTS.md (`ConfigPaths`, 1.19.5).
+        // commands) and project AGENTS.md/CLAUDE.md/CONTEXT.md (`ConfigPaths`
+        // and the instruction `globUp`, 1.19.5).
         "opencode" => inv
             .env
             .push(("OPENCODE_DISABLE_PROJECT_CONFIG".into(), "1".into())),
+        // WP09: Codex reads AGENTS.md/AGENTS.override.md of the repository
+        // as instructions regardless of trust; `project_doc_max_bytes=0`
+        // turns that off (config key in the 0.167.0 binary; root-level `-c`
+        // so it applies before `exec`/`resume`; not executed).
+        "codex" => {
+            inv.args.splice(
+                0..0,
+                ["-c".to_string(), "project_doc_max_bytes=0".to_string()],
+            );
+        }
         _ => {}
     }
 }
@@ -921,8 +944,28 @@ mod tests {
             .env
             .contains(&("OPENCODE_DISABLE_PROJECT_CONFIG".into(), "1".into())));
 
+        // WP09: no repository instruction files – Gemini's context file
+        // name is unguessable per run, Codex reads no AGENTS.md.
+        let ctx = settings["context"]["fileName"].as_str().unwrap();
+        assert!(
+            ctx.starts_with("QUEUE-NO-CONTEXT-") && ctx.len() > 40,
+            "{ctx}"
+        );
+        let ctx2 = g2
+            .home_files
+            .iter()
+            .find(|(p, _)| p == GEMINI_SYSTEM_SETTINGS_FILE)
+            .map(|(_, c)| serde_json::from_str::<Value>(c).unwrap())
+            .unwrap();
+        assert_ne!(ctx2["context"]["fileName"].as_str().unwrap(), ctx);
         let (before, x) = inv("codex", "api_key");
-        assert_eq!(x.args, before, "codex never trusts the workspace by itself");
+        assert_eq!(&x.args[..2], &["-c", "project_doc_max_bytes=0"]);
+        assert_eq!(
+            &x.args[2..],
+            &before[..],
+            "otherwise unchanged (codex never trusts the workspace by itself)"
+        );
+        assert_eq!(x.args[2], "exec");
         assert_eq!(always_loaded_config("gemini"), &[".gemini/.env"]);
         assert!(always_loaded_config("claude").is_empty());
     }

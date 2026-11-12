@@ -172,6 +172,7 @@ pub async fn add(api: &Api, a: AddArgs) -> Result<Task> {
         front: false,
         allow_test_changes: false,
         plan_mode: a.plan,
+        attachment_ids: vec![],
         limits: TaskLimitFields {
             max_cost_usd: a.max_cost.map(Some),
             ..Default::default()

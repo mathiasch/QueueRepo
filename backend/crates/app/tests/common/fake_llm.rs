@@ -83,7 +83,20 @@ pub async fn start_fake() -> Fake {
 
 /// Model answer depending on the prompt (plan / review / analysis).
 pub fn answer(s: &FakeState, text: &str) -> String {
-    if text.contains("strict code reviewer") {
+    if text.contains("strict critic of an autonomous coding queue") {
+        // WP09 critic: the first proposal is dropped, the rest kept.
+        let first = text
+            .split("index ")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(0);
+        json!({"verdicts": [
+            {"index": first, "verdict": "drop", "reason": "Fake critic: not valuable"},
+            {"index": first + 1, "verdict": "keep", "reason": "fine"}
+        ]})
+        .to_string()
+    } else if text.contains("strict code reviewer") {
         if s.review_approved.load(Ordering::SeqCst) {
             r#"Sure: {"approved": true, "issues": []}"#.into()
         } else {
@@ -96,7 +109,9 @@ pub fn answer(s: &FakeState, text: &str) -> String {
         "FAKE PLAN: 1. read the code 2. change it 3. run the tests".into()
     } else if text.contains("queue of this project is empty") {
         json!({"status":"done","summary":"analysed","handoff":"","questions":[],
-               "follow_up_tasks":[{"title":"Fake A","prompt":"do A"},{"title":"Fake B","prompt":"do B"}]})
+               "follow_up_tasks":[
+                   {"title":"Fake A","prompt":"Implement feature A of the backlog with unit tests and a changelog entry."},
+                   {"title":"Fake B","prompt":"Write the user documentation for feature B, including every dialog."}]})
             .to_string()
     } else {
         "ok".into()

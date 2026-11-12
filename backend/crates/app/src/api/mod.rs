@@ -1,9 +1,11 @@
+mod attachments;
 mod credentials;
 mod environment;
 mod evals;
 mod gate;
 mod hooks;
 mod intake;
+mod knowledge;
 pub mod limits;
 pub(crate) mod projects;
 mod providers;
@@ -138,6 +140,37 @@ pub fn router(st: AppState) -> Router {
         .route("/tasks/{id}/approve", post(tasks::approve))
         .route("/tasks/{id}/answer", post(steer::answer))
         .route("/tasks/{id}/move", post(tasks::move_task))
+        // WP09: attachments, project rules, project state.
+        .route(
+            "/projects/{id}/attachments",
+            post(attachments::upload).layer(DefaultBodyLimit::max(
+                queued_api::memory::MAX_ATTACHMENT_BYTES + 64 * 1024,
+            )),
+        )
+        .route("/attachments/quota", get(attachments::quota))
+        .route(
+            "/attachments/{id}",
+            get(attachments::download).delete(attachments::remove),
+        )
+        .route("/tasks/{id}/attachments", get(attachments::of_task))
+        .route(
+            "/projects/{id}/knowledge",
+            get(knowledge::get).put(knowledge::save),
+        )
+        .route("/projects/{id}/knowledge/import", post(knowledge::import))
+        .route("/projects/{id}/knowledge/export", post(knowledge::export))
+        .route(
+            "/projects/{id}/knowledge/{kid}/approve",
+            post(knowledge::approve),
+        )
+        .route(
+            "/projects/{id}/knowledge/{kid}/reject",
+            post(knowledge::reject),
+        )
+        .route(
+            "/projects/{id}/state",
+            get(knowledge::get_state).put(knowledge::put_state),
+        )
         .route("/tasks/{id}/diff", get(tasks::diff))
         .route("/tasks/{id}/revert", post(tasks::revert))
         .route("/tasks/{id}/plan/approve", post(steer::plan_approve))
@@ -323,7 +356,24 @@ async fn put_settings(
         .into_iter()
         .filter(|a| ONEMPTY_ACTIONS.contains(&a.as_str()))
         .collect();
-    queue::load_settings(&st, u.id).await?;
+    let cur = queue::load_settings(&st, u.id).await?;
+    let threshold = s.dedupe_threshold.unwrap_or(cur.dedupe_threshold);
+    let review = s
+        .dedupe_review_threshold
+        .unwrap_or(cur.dedupe_review_threshold);
+    let days = s.dedupe_window_days.unwrap_or(cur.dedupe_window_days);
+    queued_api::memory::validate_dedupe(threshold, review, days).map_err(AppError::bad_request)?;
+    sqlx::query(
+        "UPDATE user_settings SET dedupe_threshold=$2, dedupe_review_threshold=$3, dedupe_window_days=$4, critic_llm=$5
+          WHERE user_id=$1",
+    )
+    .bind(u.id)
+    .bind(threshold)
+    .bind(review)
+    .bind(days)
+    .bind(s.critic_llm.unwrap_or(cur.critic_llm))
+    .execute(&st.db)
+    .await?;
     sqlx::query(
         "UPDATE user_settings SET parallelism=$2, default_provider=$3, onempty_enabled=$4, onempty_actions=$5,
                 onempty_cooldown_minutes=$6, max_auto_tasks=$7, max_fix_attempts=$8, ntfy_url=$9 WHERE user_id=$1",

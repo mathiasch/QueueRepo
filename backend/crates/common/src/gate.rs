@@ -138,6 +138,10 @@ pub struct CommitOutcome {
     /// Release only: the held changes conflict with later commits.
     #[serde(default)]
     pub conflict: bool,
+    /// WP09: the agent's own commits touched `.queue/` and were squashed
+    /// into this commit (without `.queue/`).
+    #[serde(default)]
+    pub squashed: bool,
 }
 
 /// Approved state of a set of files (`refs/queue/baseline/<name>`).
@@ -245,8 +249,13 @@ pub const DEFAULT_PROTECTED: [&str; 14] = [
 ];
 
 /// Agent CLI configuration that can run code or redirect credentials when
-/// loaded from the repository.
-pub const AGENT_CONFIG_PATHS: [&str; 7] = [
+/// loaded from the repository, and (WP09) the instruction files the CLIs
+/// read as system-level guidance when the repository configuration is
+/// trusted: Claude `CLAUDE.md`/`CLAUDE.local.md`/`AGENTS.md` (+ `.claude/`),
+/// Codex `AGENTS.md`/`AGENTS.override.md`, Gemini `GEMINI.md` (also in
+/// sub-directories), opencode `AGENTS.md`/`CLAUDE.md`/`CONTEXT.md`. A base
+/// name without `/` matches in every directory (fail-safe).
+pub const AGENT_CONFIG_PATHS: [&str; 13] = [
     ".claude/",
     ".mcp.json",
     ".gemini/",
@@ -254,7 +263,17 @@ pub const AGENT_CONFIG_PATHS: [&str; 7] = [
     "opencode.jsonc",
     ".opencode/",
     ".codex/",
+    "AGENTS.md",
+    "AGENTS.override.md",
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    "GEMINI.md",
+    "CONTEXT.md",
 ];
+
+/// WP09: the instruction files among [`AGENT_CONFIG_PATHS`] (written by the
+/// knowledge export).
+pub const INSTRUCTION_FILES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", "GEMINI.md"];
 
 #[cfg(feature = "scan")]
 pub use analysis::*;
@@ -782,6 +801,40 @@ mod tests {
             ]
         );
         assert!(watched_findings(&parse_diff(&d), &[]).is_empty());
+    }
+
+    /// WP09: instruction files the CLIs read under trusted repository
+    /// configuration are watched in every directory.
+    #[test]
+    fn watched_instruction_files() {
+        let d = diff_of(&[
+            ("AGENTS.md", "m", &["new rule"], &["old rule"]),
+            ("CLAUDE.md", "a", &["@AGENTS.md"], &[]),
+            ("pkg/sub/GEMINI.md", "a", &["x"], &[]),
+            ("CLAUDE.local.md", "a", &["x"], &[]),
+            ("AGENTS.override.md", "a", &["x"], &[]),
+            ("CONTEXT.md", "a", &["x"], &[]),
+            ("docs/agents.md", "a", &["not an instruction file"], &[]),
+        ]);
+        let w: Vec<String> = AGENT_CONFIG_PATHS.iter().map(|s| s.to_string()).collect();
+        let paths: Vec<String> = watched_findings(&parse_diff(&d), &w)
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "AGENTS.md",
+                "CLAUDE.md",
+                "pkg/sub/GEMINI.md",
+                "CLAUDE.local.md",
+                "AGENTS.override.md",
+                "CONTEXT.md"
+            ]
+        );
+        for f in INSTRUCTION_FILES {
+            assert!(AGENT_CONFIG_PATHS.contains(&f));
+        }
     }
 
     #[test]

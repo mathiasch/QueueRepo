@@ -445,6 +445,25 @@ impl Repo {
         } else {
             self.tree_of(&tip).await?
         };
+        // WP09: `.queue/` (attachments, contract files) never reaches the
+        // target branch – fail-closed even though every commit path of the
+        // runner already strips it.
+        let queue_of = |t: String| async move {
+            self.git(&["ls-tree", "-d", "--object-only", &t, "--", ".queue"])
+                .await
+                .map(|o| o.trim().to_string())
+        };
+        if queue_of(tree.clone()).await? != queue_of(target.clone()).await? {
+            res.new_findings.push(gate::GateFinding {
+                kind: gate::FindingKind::ProtectedChanged,
+                path: ".queue/".into(),
+                line: None,
+                detail: "Steuer- und Anhangsdateien der Queue dürfen nicht übernommen werden"
+                    .into(),
+                fingerprint: None,
+            });
+            return Ok(res);
+        }
         if tree == self.tree_of(&target).await? {
             // Nothing left to bring in (e.g. merged before a crash of the
             // app): no empty commit on the target branch.

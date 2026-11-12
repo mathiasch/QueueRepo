@@ -42,6 +42,7 @@ pub fn TaskDrawer(id: Uuid) -> impl IntoView {
     let fetched = RwSignal::new(None::<Task>);
     let pull = RwSignal::new(None::<queued_api::pr::PullRequestView>);
     let intake = RwSignal::new(None::<queued_api::intake::IntakeLinkView>);
+    let attachments = RwSignal::new(Vec::<queued_api::memory::AttachmentView>::new());
     let events = RwSignal::new(Vec::<TaskEvent>::new());
     let loaded = RwSignal::new(false);
     let diff = RwSignal::new(None::<String>);
@@ -60,6 +61,7 @@ pub fn TaskDrawer(id: Uuid) -> impl IntoView {
                     fetched.set(Some(d.task));
                     pull.set(d.pull_request);
                     intake.set(d.intake);
+                    attachments.set(d.attachments);
                     events.update(|evs| {
                         let live = std::mem::take(evs);
                         *evs = d.events;
@@ -176,6 +178,16 @@ pub fn TaskDrawer(id: Uuid) -> impl IntoView {
                             None => task.get().map(|t| view! { <Details t=t/> }.into_any()),
                         }}
                         // Outside `Details`: it keeps its own state and refreshes itself.
+                        {move || task.with(|t| t.as_ref().map(|t| (t.project_id, t.user_id))).map(|(pid, owner)| {
+                            // Adding is possible while the task does not run (the server checks rights).
+                            let can_add = Signal::derive(move || {
+                                let editable = task.with(|t| t.as_ref().is_some_and(|t| matches!(t.status.as_str(), "queued" | "pending_approval" | "waiting_input" | "held" | "failed" | "blocked")));
+                                let me = store.me.with(|m| m.id) == owner;
+                                let owner_role = store.projects.with(|ps| ps.iter().any(|p| p.id == pid && p.role == queued_api::ProjectRole::Owner));
+                                editable && (me || owner_role)
+                            });
+                            view! { <super::attachments::TaskAttachments project=pid task=id items=attachments can_add=can_add/> }
+                        })}
                         {move || intake.get().map(|l| view! { <super::integrations::IntakeBlock link=l/> })}
                         {move || pull.get().map(|p| view! { <super::pr::PrBlock pr=p/> })}
                         <super::steer::MessagesBlock id=id task=task events=events/>
@@ -463,6 +475,7 @@ fn Details(t: Task) -> impl IntoView {
             view! { <GatePanel id=id gate=g/> }.into_any()
         })}
         <super::branch::BranchBlock t=t.clone()/>
+        <super::memory::DedupeBlock t=t.clone()/>
         {(!questions.is_empty()).then(|| view! { <DrawerQuestions id=id questions=questions.clone() waiting=status == TaskStatus::WaitingInput/> })}
         {abort.map(|(text, tone)| view! {
             <div data-testid="abort-reason">

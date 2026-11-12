@@ -203,14 +203,25 @@ async fn inner(
         .plan_feedback
         .as_deref()
         .filter(|n| !n.trim().is_empty());
-    let prompt = prompt::plan_mode(
-        task,
-        project,
-        parent.as_ref(),
-        revision.and(task.plan.as_deref()),
-        revision,
-        &prompt::messages_section(&items, &nonce),
-        &nonce,
+    // WP09: approved project rules first; attachments listed with the
+    // messages (they are in the plan copy's `.queue/attachments/`).
+    let extra = format!(
+        "{}{}",
+        crate::attachments::prompt_section(&crate::attachments::for_task(st, task.id).await?),
+        prompt::messages_section(&items, &nonce)
+    );
+    let prompt = format!(
+        "{}{}",
+        crate::knowledge::prefix(st, project.id).await,
+        prompt::plan_mode(
+            task,
+            project,
+            parent.as_ref(),
+            revision.and(task.plan.as_deref()),
+            revision,
+            &extra,
+            &nonce,
+        )
     );
     let meter = meter_for(st, acc, task.model.as_deref(), "plan").await;
     let out = agent_run(
@@ -234,6 +245,7 @@ async fn inner(
             workspace: Some(crate::runner_client::task_ws(pid)),
             steer: None,
             clear_result: false,
+            queue_files: vec![],
         },
         cancel,
     )

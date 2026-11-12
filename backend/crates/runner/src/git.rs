@@ -30,6 +30,17 @@ pub async fn write_queue_file(workspace: &Path, name: &str, content: &str) -> Re
         queued_common::valid_queue_file_name(name),
         "invalid queue file name"
     );
+    let dir = real_queue_dir(workspace).await?;
+    let path = dir.join(name);
+    remove_entry(&path).await?;
+    create_file(&path, content.as_bytes())
+        .await
+        .with_context(|| format!("create .queue/{name}"))
+}
+
+/// `<workspace>/.queue` as a real directory: a symlink or file the agent
+/// put there is removed first (never followed).
+async fn real_queue_dir(workspace: &Path) -> Result<PathBuf> {
     let dir = workspace.join(QUEUE_DIR);
     match tokio::fs::symlink_metadata(&dir).await {
         Ok(m) if m.file_type().is_dir() => {}
@@ -39,24 +50,81 @@ pub async fn write_queue_file(workspace: &Path, name: &str, content: &str) -> Re
         }
         Err(_) => tokio::fs::create_dir(&dir).await?,
     }
-    let path = dir.join(name);
-    match tokio::fs::symlink_metadata(&path).await {
-        Ok(m) if m.file_type().is_dir() => tokio::fs::remove_dir_all(&path).await?,
-        Ok(_) => tokio::fs::remove_file(&path).await?,
+    Ok(dir)
+}
+
+/// Removes whatever is at `path` without following a symlink (a symlinked
+/// directory is unlinked, a real directory removed recursively – std's
+/// `remove_dir_all` does not follow symlinks inside).
+async fn remove_entry(path: &Path) -> Result<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(m) if m.file_type().is_dir() => tokio::fs::remove_dir_all(path).await?,
+        Ok(_) => tokio::fs::remove_file(path).await?,
         Err(_) => {}
     }
+    Ok(())
+}
+
+/// Creates a new file exclusively (fails on anything already there).
+async fn create_file(path: &Path, content: &[u8]) -> Result<()> {
     let mut f = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path)
-        .await
-        .with_context(|| format!("create .queue/{name}"))?;
+        .open(path)
+        .await?;
     use tokio::io::AsyncWriteExt;
-    f.write_all(content.as_bytes()).await?;
+    f.write_all(content).await?;
     // tokio writes in the background: without flush the agent may start
     // before the content is on disk.
     f.flush().await?;
     Ok(())
+}
+
+/// WP09: replaces `<workspace>/.queue/attachments/` with `files` (name,
+/// bytes). Same hardening as the contract files: `.queue` and
+/// `attachments` are replaced if they are symlinks/files, the old
+/// directory is removed without following links, every file is created
+/// exclusively in a directory the runner just created. Names are checked
+/// ([`queued_common::valid_attachment_name`]), duplicates, count and total
+/// size are rejected.
+pub async fn provide_attachments(workspace: &Path, files: &[(String, Vec<u8>)]) -> Result<()> {
+    use queued_common::{ATTACHMENTS_DIR, MAX_ATTACHMENTS_PER_TASK, MAX_ATTACHMENT_BYTES_PER_TASK};
+    anyhow::ensure!(
+        files.len() <= MAX_ATTACHMENTS_PER_TASK,
+        "too many attachments"
+    );
+    anyhow::ensure!(
+        files.iter().map(|(_, d)| d.len()).sum::<usize>() <= MAX_ATTACHMENT_BYTES_PER_TASK,
+        "attachments too large"
+    );
+    let mut names = std::collections::HashSet::new();
+    for (n, _) in files {
+        anyhow::ensure!(
+            queued_common::valid_attachment_name(n) && names.insert(n.as_str()),
+            "invalid attachment name"
+        );
+    }
+    let dir = real_queue_dir(workspace).await?.join(ATTACHMENTS_DIR);
+    remove_entry(&dir).await?;
+    if files.is_empty() {
+        return Ok(());
+    }
+    tokio::fs::create_dir(&dir).await?;
+    for (n, data) in files {
+        create_file(&dir.join(n), data)
+            .await
+            .with_context(|| format!("create .queue/attachments/{n}"))?;
+    }
+    Ok(())
+}
+
+/// Reading a file the agent may have written in `.queue/`.
+#[derive(Debug, PartialEq)]
+pub enum QueueRead {
+    Absent,
+    /// Larger than allowed (size in bytes).
+    TooLarge(u64),
+    Text(String),
 }
 
 const DEFAULT_GITIGNORE: &str = "node_modules/\ntarget/\n.venv/\nvenv/\n__pycache__/\ndist/\nbuild/\n.next/\n.DS_Store\n*.log\n.env\n";
@@ -237,6 +305,39 @@ impl Repo {
         run_git_env(&self.dir, &[], args, None, envs).await
     }
 
+    /// WP09: `git add -A` without `.queue/` (contract files, state,
+    /// attachments). Neither a `.gitignore` negation (`!.queue/`) nor an
+    /// exclude line the agent removed gets them into the index; a `.queue/`
+    /// the agent committed itself is removed from the next tree. Returns
+    /// whether the index now differs from HEAD.
+    pub(crate) async fn stage_all(&self) -> Result<bool> {
+        self.stage_all_env(&[]).await
+    }
+
+    /// [`Repo::stage_all`] with extra environment (temporary index).
+    pub(crate) async fn stage_all_env(&self, envs: &[(&str, &str)]) -> Result<bool> {
+        self.ensure_exclude().await?;
+        self.git_env(&["add", "-A"], envs).await?;
+        self.git_env(
+            &[
+                "rm",
+                "-r",
+                "-q",
+                "--cached",
+                "--ignore-unmatch",
+                "--",
+                QUEUE_DIR,
+            ],
+            envs,
+        )
+        .await?;
+        let staged = self
+            .git_env(&["diff", "--cached", "--name-only", "--no-renames"], envs)
+            .await
+            .unwrap_or_default();
+        Ok(!staged.trim().is_empty())
+    }
+
     /// Makes the agent-controlled `.git` safe for host-side git calls:
     /// `.git` and its top-level entries must be real directories/files
     /// (a symlinked `.git`/`objects`/`refs` would make the runner work on
@@ -409,7 +510,7 @@ impl Repo {
             if !self.dir.join(".gitignore").exists() {
                 tokio::fs::write(self.dir.join(".gitignore"), DEFAULT_GITIGNORE).await?;
             }
-            self.git(&["add", "-A"]).await?;
+            self.stage_all().await?;
             self.git(&["commit", "-q", "--allow-empty", "-m", "Initial commit"])
                 .await?;
         }
@@ -451,8 +552,7 @@ impl Repo {
         {
             self.prune().await?;
         }
-        if self.is_dirty().await? {
-            self.git(&["add", "-A"]).await?;
+        if self.is_dirty().await? && self.stage_all().await? {
             let findings = self.staged_secrets(key, allow).await?;
             if findings.is_empty() {
                 self.git(&[
@@ -536,8 +636,7 @@ impl Repo {
         allow: &[String],
         allow_large: bool,
     ) -> Result<CommitOutcome> {
-        if self.is_dirty().await? {
-            self.git(&["add", "-A"]).await?;
+        if self.is_dirty().await? && self.stage_all().await? {
             let mut blocked = self.staged_secrets(key, allow).await?;
             if allow_large {
                 blocked.retain(|f| f.kind != FindingKind::TooLarge);
@@ -547,7 +646,7 @@ impl Repo {
                 return Ok(CommitOutcome {
                     sha: self.head().await?,
                     blocked,
-                    conflict: false,
+                    ..Default::default()
                 });
             }
         }
@@ -565,8 +664,7 @@ impl Repo {
         author_name: &str,
         author_email: &str,
     ) -> Result<String> {
-        if self.is_dirty().await? {
-            self.git(&["add", "-A"]).await?;
+        if self.is_dirty().await? && self.stage_all().await? {
             let author = format!(
                 "{} <{}>",
                 author_name.replace(['<', '>'], ""),
@@ -628,8 +726,7 @@ impl Repo {
         {
             bail!("nothing to revert");
         }
-        if self.is_dirty().await? {
-            self.git(&["add", "-A"]).await?;
+        if self.is_dirty().await? && self.stage_all().await? {
             self.git(&[
                 "commit",
                 "-q",
@@ -905,7 +1002,7 @@ impl Repo {
         let env = [("GIT_INDEX_FILE", idx_s.as_str())];
         let res = async {
             self.git_env(&["read-tree", "HEAD"], &env).await?;
-            self.git_env(&["add", "-A"], &env).await?;
+            self.stage_all_env(&env).await?;
             Ok::<String, anyhow::Error>(
                 self.git_env(&["write-tree"], &env)
                     .await?
@@ -1059,8 +1156,8 @@ impl Repo {
             let _ = self.git(&["clean", "-fdq"]).await;
             return Ok(CommitOutcome {
                 sha: self.head().await?,
-                blocked: vec![],
                 conflict: true,
+                ..Default::default()
             });
         }
         let out = self
@@ -1225,20 +1322,237 @@ impl Repo {
     /// followed – otherwise any host file readable by the runner would be
     /// handed to the app – and oversized files are ignored.
     pub async fn queue_file(&self, name: &str) -> Result<Option<String>> {
-        if !matches!(name, "result.json" | "review.json") {
+        // WP09: `knowledge.md` = an agent's proposal for the project rules.
+        if !matches!(name, "result.json" | "review.json" | "knowledge.md") {
             bail!("unknown queue file");
         }
+        Ok(match self.read_queue(name, MAX_QUEUE_FILE).await? {
+            QueueRead::Text(t) => Some(t),
+            _ => None,
+        })
+    }
+
+    /// Reads `.queue/<name>` without following symlinks (`.queue` itself
+    /// or the file), only regular files up to `max` bytes, UTF-8 only.
+    pub async fn read_queue(&self, name: &str, max: u64) -> Result<QueueRead> {
+        anyhow::ensure!(
+            queued_common::valid_queue_file_name(name),
+            "invalid queue file name"
+        );
         let dir = self.dir.join(QUEUE_DIR);
         let is_real_dir = tokio::fs::symlink_metadata(&dir)
             .await
             .is_ok_and(|m| m.file_type().is_dir());
         let path = dir.join(name);
-        match tokio::fs::symlink_metadata(&path).await {
-            Ok(m) if is_real_dir && m.file_type().is_file() && m.len() <= MAX_QUEUE_FILE => {
-                Ok(tokio::fs::read_to_string(&path).await.ok())
+        Ok(match tokio::fs::symlink_metadata(&path).await {
+            Ok(m) if is_real_dir && m.file_type().is_file() => {
+                if m.len() > max {
+                    QueueRead::TooLarge(m.len())
+                } else {
+                    match tokio::fs::read_to_string(&path).await {
+                        Ok(t) => QueueRead::Text(t),
+                        Err(_) => QueueRead::Absent,
+                    }
+                }
             }
-            _ => Ok(None),
+            _ => QueueRead::Absent,
+        })
+    }
+
+    /// WP09: checks the agent's `.queue/state.json` (schema, previous state,
+    /// working tree) – see [`queued_common::state`].
+    pub async fn check_state(
+        &self,
+        req: &queued_common::StateCheckRequest,
+    ) -> Result<queued_common::StateCheckResult> {
+        use queued_common::state;
+        let text = match self
+            .read_queue("state.json", state::MAX_STATE_BYTES as u64)
+            .await?
+        {
+            QueueRead::Absent => {
+                return Ok(queued_common::StateCheckResult::default());
+            }
+            QueueRead::TooLarge(n) => {
+                return Ok(queued_common::StateCheckResult {
+                    present: true,
+                    rejected: Some(format!(
+                        "Zustand ist zu groß ({n} Bytes, höchstens {})",
+                        state::MAX_STATE_BYTES
+                    )),
+                    ..Default::default()
+                })
+            }
+            QueueRead::Text(t) => t,
+        };
+        let next = match state::parse(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(queued_common::StateCheckResult {
+                    present: true,
+                    rejected: Some(e),
+                    ..Default::default()
+                })
+            }
+        };
+        let mut ok = std::collections::HashSet::new();
+        for f in next.features.iter().flat_map(|f| f.files.iter()) {
+            if state::valid_file_ref(f) && self.tree_entry_exists(f).await {
+                ok.insert(f.clone());
+            }
         }
+        let ctx = state::RunContext {
+            allow_done: req.allow_done,
+            now: req.now.clone(),
+            task: req.task.clone(),
+        };
+        let r = state::reconcile(&req.previous, next, &ctx, &|p| ok.contains(p));
+        Ok(queued_common::StateCheckResult {
+            present: true,
+            changed: r.changed,
+            state: Some(r.state),
+            repairs: r.repairs,
+            rejected: None,
+        })
+    }
+
+    /// A relative path names a regular file or directory of the working
+    /// tree, reached without any symlink (each component checked with
+    /// `lstat`, so a link cannot point the check outside the tree).
+    async fn tree_entry_exists(&self, rel: &str) -> bool {
+        let mut cur = self.dir.clone();
+        let parts: Vec<&str> = rel.split('/').collect();
+        for (i, part) in parts.iter().enumerate() {
+            cur.push(part);
+            match tokio::fs::symlink_metadata(&cur).await {
+                Ok(m) if m.file_type().is_dir() => {}
+                Ok(m) if m.file_type().is_file() && i + 1 == parts.len() => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// WP09: writes the approved project rules as `AGENTS.md` (with the
+    /// managed marker) and the bridges `CLAUDE.md`/`GEMINI.md`
+    /// (`@AGENTS.md`) and commits exactly these files after a secret scan.
+    /// A bridge is only written when the file is absent or already a Queue
+    /// bridge; a hand-written file or a symlink stays untouched. A symlinked
+    /// `AGENTS.md` is replaced (never written through). Call on a clean main
+    /// repository (after `begin`).
+    pub async fn export_knowledge(
+        &self,
+        req: &queued_common::KnowledgeExport,
+        key: &[u8],
+    ) -> Result<queued_common::KnowledgeExportResult> {
+        use queued_common::{BRIDGE_CONTENT, MANAGED_MARKER};
+        anyhow::ensure!(req.content.len() <= 64 * 1024, "content too large");
+        let agents = format!(
+            "{MANAGED_MARKER}: Projekt-Regeln Version {} – Änderungen bitte in Queue (Projekt → Wissen) -->\n\n{}\n",
+            req.version,
+            req.content.trim_end()
+        );
+        let mut out = queued_common::KnowledgeExportResult::default();
+        let mut files: Vec<(&str, String)> = vec![("AGENTS.md", agents)];
+        for bridge in ["CLAUDE.md", "GEMINI.md"] {
+            let p = self.dir.join(bridge);
+            match tokio::fs::symlink_metadata(&p).await {
+                Err(_) => files.push((bridge, BRIDGE_CONTENT.to_string())),
+                Ok(m) if m.file_type().is_file() => {
+                    let cur = tokio::fs::read_to_string(&p).await.unwrap_or_default();
+                    if cur.starts_with(MANAGED_MARKER) {
+                        files.push((bridge, BRIDGE_CONTENT.to_string()));
+                    } else {
+                        out.skipped.push(bridge.to_string());
+                    }
+                }
+                Ok(_) => out.skipped.push(bridge.to_string()),
+            }
+        }
+        let tracked = self
+            .git(&["ls-files", "--", "AGENTS.md", "CLAUDE.md", "GEMINI.md"])
+            .await?;
+        for (name, content) in &files {
+            let p = self.dir.join(name);
+            remove_entry(&p).await?;
+            create_file(&p, content.as_bytes()).await?;
+        }
+        let names: Vec<&str> = files.iter().map(|(n, _)| *n).collect();
+        let mut add = vec!["add", "--"];
+        add.extend(&names);
+        self.git(&add).await?;
+        let blocked = self.staged_secrets(key, &req.allow).await?;
+        if !blocked.is_empty() {
+            self.git(&["reset", "-q"]).await?;
+            for n in &names {
+                if tracked.lines().any(|l| l.trim() == *n) {
+                    self.git(&["checkout", "-q", "HEAD", "--", n]).await?;
+                } else {
+                    remove_entry(&self.dir.join(n)).await?;
+                }
+            }
+            out.blocked = blocked;
+            out.sha = self.head().await?;
+            return Ok(out);
+        }
+        let staged = self.git(&["diff", "--cached", "--name-only"]).await?;
+        out.written = staged
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if !out.written.is_empty() {
+            let author = format!(
+                "{} <{}>",
+                req.author_name.replace(['<', '>'], ""),
+                req.author_email.replace(['<', '>'], "")
+            );
+            self.git(&[
+                "commit",
+                "-q",
+                "--no-verify",
+                "--author",
+                &author,
+                "-m",
+                &format!(
+                    "Projekt-Regeln (AGENTS.md) Version {} aus Queue\n\nQueue-Knowledge: v{}",
+                    req.version, req.version
+                ),
+            ])
+            .await?;
+        }
+        out.sha = self.head().await?;
+        Ok(out)
+    }
+
+    /// WP09: agent commits `base..HEAD` that touched `.queue/` are folded
+    /// back into the index (`reset --soft base`), so the following commit
+    /// holds the agent's changes without `.queue/` and no commit with
+    /// attachments or contract files remains in the branch history.
+    pub async fn squash_queue_commits(&self, base: &str) -> Result<bool> {
+        check_rev(base)?;
+        let base = self
+            .git(&["rev-parse", "--verify", "-q", &format!("{base}^{{commit}}")])
+            .await?
+            .trim()
+            .to_string();
+        if base == self.head().await? {
+            return Ok(false);
+        }
+        let touched = self
+            .git(&[
+                "log",
+                "--format=%H",
+                &format!("{base}..HEAD"),
+                "--",
+                QUEUE_DIR,
+            ])
+            .await?;
+        if touched.trim().is_empty() {
+            return Ok(false);
+        }
+        self.git(&["reset", "-q", "--soft", &base]).await?;
+        Ok(true)
     }
 
     pub async fn delete(&self) -> Result<()> {

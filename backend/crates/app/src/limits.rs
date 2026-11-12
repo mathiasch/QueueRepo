@@ -222,6 +222,10 @@ pub(crate) mod tests {
             session_from: None,
             steer_rounds: 0,
             trigger_id: None,
+            state_rev: None,
+            dedupe: None,
+            proposals: None,
+            reverted_at: None,
         }
     }
 

@@ -10,6 +10,7 @@ pub mod glob;
 pub mod net;
 #[cfg(feature = "scan")]
 pub mod secrets;
+pub mod state;
 pub use gate::{CommitOutcome, FindingKind, GateFinding};
 pub use net::{EgressPolicy, EgressVerdict, NetMode};
 
@@ -75,6 +76,12 @@ pub struct CommitRequest {
     /// A human approved changes too large to scan completely.
     #[serde(default)]
     pub allow_large: bool,
+    /// WP09: the task's gate base. When commits `squash_base..HEAD` (made
+    /// by the agent itself) touch `.queue/`, they are squashed into this
+    /// commit without `.queue/` – attachments and contract files never
+    /// reach history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub squash_base: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,6 +523,91 @@ pub fn valid_queue_file_name(s: &str) -> bool {
         && chars
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
+
+/// WP09: directory below `.queue/` with the task's attachments.
+pub const ATTACHMENTS_DIR: &str = "attachments";
+/// Most attachment files per task (also enforced by the runner).
+pub const MAX_ATTACHMENTS_PER_TASK: usize = 10;
+/// Most bytes of all attachments of one task.
+pub const MAX_ATTACHMENT_BYTES_PER_TASK: usize = 25 * 1024 * 1024;
+
+/// Name of an attachment in `.queue/attachments/`:
+/// `^[a-z0-9][a-z0-9._-]{0,79}$` without `..`.
+pub fn valid_attachment_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit())
+        && s.len() <= 80
+        && !s.contains("..")
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+}
+
+/// One file of `PUT /v1/workspaces/{id}/attachments`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AttachmentFile {
+    pub name: String,
+    /// Standard base64.
+    pub data: String,
+}
+
+/// `PUT /v1/workspaces/{id}/attachments`: replaces `.queue/attachments/`
+/// (an empty list removes it).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProvideAttachments {
+    pub files: Vec<AttachmentFile>,
+}
+
+/// `POST /v1/workspaces/{id}/state/check`: validate the agent's
+/// `.queue/state.json` against the state the run started with and the tree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StateCheckRequest {
+    pub previous: state::ProjectState,
+    pub allow_done: bool,
+    pub now: String,
+    pub task: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StateCheckResult {
+    /// The agent left a state file.
+    pub present: bool,
+    /// Accepted (possibly repaired) state; `None` = rejected or absent.
+    pub state: Option<state::ProjectState>,
+    pub repairs: Vec<String>,
+    /// Why the whole file was rejected (German).
+    pub rejected: Option<String>,
+    /// The accepted state differs from the previous one.
+    pub changed: bool,
+}
+
+/// `POST /v1/workspaces/{id}/knowledge/export`: write the managed rules as
+/// `AGENTS.md` plus `CLAUDE.md`/`GEMINI.md` bridges and commit (main repo).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KnowledgeExport {
+    pub content: String,
+    pub version: i32,
+    pub author_name: String,
+    pub author_email: String,
+    /// Approved secret fingerprints of the project.
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct KnowledgeExportResult {
+    pub sha: String,
+    /// Files written (repository paths).
+    pub written: Vec<String>,
+    /// Bridges not written because a hand-written file exists.
+    pub skipped: Vec<String>,
+    /// Secret findings that blocked the commit (nothing written).
+    pub blocked: Vec<gate::GateFinding>,
+}
+
+/// Marker line of files Queue manages in the repository (`AGENTS.md`).
+pub const MANAGED_MARKER: &str = "<!-- Verwaltet von Queue";
+/// Content of a `CLAUDE.md`/`GEMINI.md` bridge to `AGENTS.md`.
+pub const BRIDGE_CONTENT: &str = "<!-- Verwaltet von Queue: Brücke zu AGENTS.md -->\n@AGENTS.md\n";
 
 /// One CLI found (or not) in the agent sandbox (`GET /v1/cli-status`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

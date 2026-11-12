@@ -116,6 +116,10 @@ pub async fn run(st: AppState) {
             if let Err(e) = runner::merge::sweep(&st).await {
                 tracing::warn!("working tree sweep failed: {e:#}");
             }
+            // WP09: composer drafts nobody turned into a task.
+            if let Err(e) = crate::attachments::sweep_drafts(&st).await {
+                tracing::warn!("attachment draft sweep failed: {e:#}");
+            }
         }
         tokio::select! {
             _ = st.wake.notified() => {}

@@ -34,6 +34,14 @@
 //! parallel tasks do not conflict) – what reached the agent.
 //! MOCK_REWRITE / MOCK_PREPEND: once answered (MOCK_ASK), the run line
 //! replaces the file / goes on top (changes the diff under inline comments).
+//! WP09: MOCKRULE* tokens (from the project rules) are recorded in `SEEN.md`
+//! too; MOCK_SEE_ATTACHMENTS (sha256 of `.queue/attachments/*` into
+//! `SEEN-attachments.txt`), MOCK_COMMIT_ATTACHMENT (un-ignores `.queue/`,
+//! empties the exclude file and commits `.queue/` itself),
+//! MOCK_STATE_B64:<b64> / MOCK_KNOWLEDGE_B64:<b64> (write the decoded text
+//! to `.queue/state.json` / `.queue/knowledge.md`), MOCK_RESULT_B64:<b64>
+//! (the decoded JSON is the result contract), MOCK_ONEMPTY_B64:<b64> (the
+//! same, only in OnEmpty maintenance runs – e.g. in the project goal).
 use serde_json::Value;
 
 use super::{
@@ -74,7 +82,7 @@ mkdir -p .queue
 L=MOCK_LOG.md
 case "$P" in *MOCK_FILE:*) L=$(printf '%s\n' "$P" | sed -n 's/.*MOCK_FILE:\([A-Za-z0-9_.-]*\).*/\1/p' | head -n 1);; esac
 S=SEEN.md; [ "$L" != MOCK_LOG.md ] && S="SEEN-$L"
-T=$(printf '%s\n' "$P" | grep -o 'MOCK\(MSG\|PLAN\|NOTE\|COMMENT\)[A-Za-z0-9_-]*' | sort -u | tr '\n' ' ')
+T=$(printf '%s\n' "$P" | grep -o 'MOCK\(MSG\|PLAN\|NOTE\|COMMENT\|RULE\)[A-Za-z0-9_-]*' | sort -u | tr '\n' ' ')
 [ -n "$T" ] && echo "run ${QUEUE_RESUME:+resume }$T" >> "$S"
 if [ -n "$QUEUE_RESUME" ]; then
   echo '{"type":"text","text":"mock agent: resumed session '"$SID"' after '"$N"' earlier prompts"}'
@@ -152,6 +160,22 @@ esac
 case "$P" in
   *MOCK_SOLUTION_B64:*) printf '%s\n' "$P" | sed -n 's/.*MOCK_SOLUTION_B64:\([A-Za-z0-9+/=]*\).*/\1/p' | head -n 1 | base64 -d | sh
     echo '{"type":"tool","text":"eval: applied reference solution"}';;
+esac
+b64arg() { printf '%s\n' "$P" | sed -n "s/.*$1:\([A-Za-z0-9+/=]*\).*/\1/p" | head -n 1 | base64 -d; }
+case "$P" in
+  *MOCK_SEE_ATTACHMENTS*) if [ -d .queue/attachments ]; then (cd .queue/attachments && sha256sum * 2>/dev/null) > SEEN-attachments.txt; else echo none > SEEN-attachments.txt; fi;;
+esac
+case "$P" in
+  *MOCK_COMMIT_ATTACHMENT*) printf '!.queue/\n!.queue/**\n' >> .gitignore; : > .git/info/exclude
+    echo "work with attachment" >> "$L"; git add -f -A .queue "$L" .gitignore
+    git -c user.name=a -c user.email=a@x commit -q -m "agent commits its attachments"
+    echo '{"type":"tool","text":"git commit (with .queue/)"}';;
+esac
+case "$P" in *MOCK_STATE_B64:*) b64arg MOCK_STATE_B64 > .queue/state.json;; esac
+case "$P" in *MOCK_KNOWLEDGE_B64:*) b64arg MOCK_KNOWLEDGE_B64 > .queue/knowledge.md;; esac
+case "$P" in
+  *"Maintenance run (the task queue is empty)"*MOCK_ONEMPTY_B64:*) b64arg MOCK_ONEMPTY_B64 > .queue/result.json; echo '{"type":"final","text":"finished"}'; exit 0;;
+  *MOCK_RESULT_B64:*) b64arg MOCK_RESULT_B64 > .queue/result.json; echo '{"type":"final","text":"finished"}'; exit 0;;
 esac
 case "$P" in
   *MOCK_LIMIT*) echo '{"type":"error","text":"Claude AI usage limit reached|'$(( $(date +%s) + 120 ))'"}'; exit 1;;

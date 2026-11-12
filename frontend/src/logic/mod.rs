@@ -12,6 +12,7 @@ pub mod format;
 pub mod intake;
 pub mod labels;
 pub mod limits;
+pub mod memory;
 pub mod pr;
 pub mod progress;
 pub mod protection;

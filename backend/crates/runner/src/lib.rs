@@ -7,6 +7,8 @@ pub mod sessions;
 pub mod setup;
 pub mod snapshot;
 pub mod tasks;
+#[cfg(test)]
+mod wp09_tests;
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
@@ -214,6 +216,13 @@ pub fn router(st: RunnerState) -> Router {
         )
         .route("/workspaces/{id}/log", get(log))
         .route("/workspaces/{id}/queue/{name}", get(queue_file))
+        // WP09: attachments (base64 in JSON: 25 MiB of files ≈ 34 MiB).
+        .route(
+            "/workspaces/{id}/attachments",
+            axum::routing::put(put_attachments).layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
+        )
+        .route("/workspaces/{id}/state/check", post(state_check))
+        .route("/workspaces/{id}/knowledge/export", post(knowledge_export))
         .route("/exec", post(exec_start))
         .route("/exec/{name}/cancel", post(exec_cancel))
         .route("/cli-status", get(cli_status))
@@ -308,8 +317,12 @@ async fn commit(
     let repo = existing(&st, &id)?;
     let l = st.lock(&id).await;
     let _g = l.lock().await;
-    Ok(Json(
-        repo.commit_scanned(
+    let squashed = match req.squash_base.as_deref() {
+        Some(base) => repo.squash_queue_commits(base).await?,
+        None => false,
+    };
+    let mut out = repo
+        .commit_scanned(
             &req.message,
             &req.author_name,
             &req.author_email,
@@ -317,8 +330,9 @@ async fn commit(
             &req.allow,
             req.allow_large,
         )
-        .await?,
-    ))
+        .await?;
+    out.squashed = squashed;
+    Ok(Json(out))
 }
 
 async fn inspect(
@@ -669,6 +683,66 @@ async fn queue_file(
     Ok(Json(QueueFile {
         content: existing(&st, &id)?.queue_file(&name).await?,
     }))
+}
+
+/// WP09: replaces `.queue/attachments/` of a workspace (never while a
+/// process runs in it: the agent could swap directories under the runner).
+async fn put_attachments(
+    State(st): State<RunnerState>,
+    Path(id): Path<String>,
+    Json(req): Json<ProvideAttachments>,
+) -> R<Json<serde_json::Value>> {
+    use base64::Engine as _;
+    let repo = existing(&st, &id)?;
+    let l = st.lock(&id).await;
+    let _g = l.lock().await;
+    if st.workspace_busy(&id).await {
+        return Err(ApiErr(
+            StatusCode::CONFLICT,
+            "a process runs in this workspace".into(),
+        ));
+    }
+    let mut files = Vec::with_capacity(req.files.len());
+    for f in req.files {
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(f.data.as_bytes())
+            .map_err(|_| ApiErr(StatusCode::BAD_REQUEST, "invalid base64".into()))?;
+        files.push((f.name, data));
+    }
+    git::provide_attachments(&repo.dir, &files)
+        .await
+        .map_err(|e| ApiErr(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({"ok": true, "files": files.len()})))
+}
+
+/// WP09: validates the agent's `.queue/state.json`.
+async fn state_check(
+    State(st): State<RunnerState>,
+    Path(id): Path<String>,
+    Json(req): Json<StateCheckRequest>,
+) -> R<Json<StateCheckResult>> {
+    let repo = existing(&st, &id)?;
+    let l = st.lock(&id).await;
+    let _g = l.lock().await;
+    Ok(Json(repo.check_state(&req).await?))
+}
+
+/// WP09: managed `AGENTS.md` + bridges into the main repository.
+async fn knowledge_export(
+    State(st): State<RunnerState>,
+    Path(id): Path<String>,
+    Json(req): Json<KnowledgeExport>,
+) -> R<Json<KnowledgeExportResult>> {
+    if is_task_workspace(&id) {
+        return Err(ApiErr(
+            StatusCode::BAD_REQUEST,
+            "only the main repository".into(),
+        ));
+    }
+    let repo = existing(&st, &id)?;
+    let l = st.lock(&id).await;
+    let _g = l.lock().await;
+    Ok(Json(repo.export_knowledge(&req, st.scan_key()).await?))
 }
 
 /// Streams NDJSON frames. If the client disconnects, the run is cancelled.

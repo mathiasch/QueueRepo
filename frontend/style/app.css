@@ -799,3 +799,32 @@ ol.list { list-style: none; padding: 0; margin: 0; }
 /* Nine project tabs no longer fit next to each other on smaller desktops:
    with a mouse there is no swipe, so wrap instead of hiding tabs. */
 @media (hover: hover) and (pointer: fine) { .tablist { flex-wrap: wrap; overflow-x: visible; } }
+
+/* --------------------------------------------------- WP09: Anhänge, Wissen, Zustand */
+.attach-picker { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
+.attach-list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.attach-list:empty { display: none; }
+.attach-item {
+  display: flex; align-items: center; gap: var(--sp-2); min-width: 0; max-width: 100%;
+  padding: 4px 4px 4px 6px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-2);
+}
+.attach-thumb { width: 44px; height: 44px; flex: none; border-radius: var(--r-sm); object-fit: cover; background: var(--surface); }
+.attach-thumb.icon { display: grid; place-items: center; color: var(--text-muted); }
+.attach-text { display: flex; flex-direction: column; min-width: 0; max-width: 16rem; }
+.attach-name { font-weight: 600; font-size: var(--fs-sm); color: var(--text); }
+.proposal-list, .version-list, .feature-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
+.proposal, .feature {
+  display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3);
+  border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); min-width: 0;
+}
+.feature-head { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-2); }
+.rules-diff {
+  margin: 0; padding: var(--sp-2) var(--sp-3); max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+  font: 12.5px/1.5 var(--mono, ui-monospace, monospace); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-md);
+}
+.rules-diff .d-add, .rules-diff .d-del { display: block; }
+.select.sm-select { width: auto; min-width: 9rem; }
+@media (max-width: 640px) {
+  .attach-text { max-width: calc(100vw - 9rem); }
+  .attach-picker .btn { flex: 1 1 auto; }
+}

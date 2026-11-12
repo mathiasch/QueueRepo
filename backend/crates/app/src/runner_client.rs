@@ -131,6 +131,7 @@ impl RunnerClient {
         author_name: &str,
         author_email: &str,
         allow: &[String],
+        squash_base: Option<&str>,
     ) -> Result<CommitOutcome> {
         let req = CommitRequest {
             message: message.into(),
@@ -138,6 +139,7 @@ impl RunnerClient {
             author_email: author_email.into(),
             allow: allow.to_vec(),
             allow_large: false,
+            squash_base: squash_base.map(String::from),
         };
         self.post(self.url(ws, "/commit"), &req).await
     }
@@ -390,6 +392,52 @@ impl RunnerClient {
             .get::<QueueFile>(self.url(ws, &format!("/queue/{name}")))
             .await?
             .content)
+    }
+
+    /// WP09: replaces `.queue/attachments/` of a workspace.
+    pub async fn put_attachments(
+        &self,
+        ws: impl std::fmt::Display,
+        files: &[(String, Vec<u8>)],
+    ) -> Result<()> {
+        use base64::Engine as _;
+        let req = queued_common::ProvideAttachments {
+            files: files
+                .iter()
+                .map(|(n, d)| queued_common::AttachmentFile {
+                    name: n.clone(),
+                    data: base64::engine::general_purpose::STANDARD.encode(d),
+                })
+                .collect(),
+        };
+        let r = self
+            .http
+            .put(self.url(ws, "/attachments"))
+            .bearer_auth(&self.token)
+            .json(&req)
+            .send()
+            .await
+            .context("runner unreachable")?;
+        Self::check(r).await?;
+        Ok(())
+    }
+
+    /// WP09: check of the agent's `.queue/state.json`.
+    pub async fn state_check(
+        &self,
+        ws: impl std::fmt::Display,
+        req: &queued_common::StateCheckRequest,
+    ) -> Result<queued_common::StateCheckResult> {
+        self.post(self.url(ws, "/state/check"), req).await
+    }
+
+    /// WP09: managed `AGENTS.md` + bridges into the main repository.
+    pub async fn knowledge_export(
+        &self,
+        ws: impl std::fmt::Display,
+        req: &queued_common::KnowledgeExport,
+    ) -> Result<queued_common::KnowledgeExportResult> {
+        self.post(self.url(ws, "/knowledge/export"), req).await
     }
 
     /// Streams frames into `tx` until the run ends. Returns the final frame.

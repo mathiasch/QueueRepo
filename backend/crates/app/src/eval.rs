@@ -204,6 +204,7 @@ pub async fn start(
                 "queue-eval",
                 "eval@localhost",
                 &[],
+                None,
             )
             .await?;
         anyhow::ensure!(

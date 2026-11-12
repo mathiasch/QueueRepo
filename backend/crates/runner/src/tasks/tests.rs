@@ -774,3 +774,47 @@ async fn pull_request_follow_up_starts_on_the_remote_branch() {
         .unwrap_err();
     assert!(format!("{err:#}").contains("nicht abrufbar"), "{err:#}");
 }
+
+/// WP09: a task tip that contains `.queue/` (the agent committed an
+/// attachment past every runner commit path) is never merged.
+#[tokio::test]
+async fn merge_refuses_a_tip_with_queue_files() {
+    let (t, main) = main_repo().await;
+    let base = main.head().await.unwrap();
+    let a = Repo::new(t.path(), A);
+    main.prepare_task(&a, A, &req(BRANCH_A), KEY).await.unwrap();
+    std::fs::create_dir_all(a.dir.join(".queue/attachments")).unwrap();
+    std::fs::write(a.dir.join(".queue/attachments/01-photo.jpg"), "jpeg").unwrap();
+    std::fs::write(a.dir.join("app.txt"), "one\nTWO\nthree\n").unwrap();
+    agent_git(&a.dir, &["add", "-f", "-A", ".queue", "app.txt"]);
+    agent_git(&a.dir, &["commit", "-qm", "agent commits the attachment"]);
+    let tip = a.head().await.unwrap();
+    let r = main
+        .merge_prepare(&a, A, &merge_req(BRANCH_A, &base, &tip), KEY)
+        .await
+        .unwrap();
+    assert!(r.commit.is_none());
+    assert_eq!(r.new_findings.len(), 1, "{:?}", r.new_findings);
+    assert_eq!(r.new_findings[0].path, ".queue/");
+    assert_eq!(main.head().await.unwrap(), base, "target untouched");
+    // Through the runner's commit path the same change merges without it.
+    let task_base = agent_git(&a.dir, &["rev-parse", "HEAD~1"]);
+    assert!(a.squash_queue_commits(&task_base).await.unwrap());
+    let o = a
+        .commit_checked("task", "Alice", "a@x", KEY, &[])
+        .await
+        .unwrap();
+    assert!(o.blocked.is_empty());
+    let r = main
+        .merge_prepare(&a, A, &merge_req(BRANCH_A, &base, &o.sha), KEY)
+        .await
+        .unwrap();
+    assert!(r.new_findings.is_empty(), "{:?}", r.new_findings);
+    let c = r.commit.unwrap();
+    let files = main
+        .git(&["ls-tree", "-r", "--name-only", &c])
+        .await
+        .unwrap();
+    assert!(!files.contains(".queue"), "{files}");
+    assert!(files.contains("app.txt"));
+}

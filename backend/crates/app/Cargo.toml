@@ -43,6 +43,8 @@ web-push = { version = "0.10", default-features = false }
 # WP07: IANA time zones of schedules, HMAC of webhooks.
 chrono-tz = "0.10"
 hmac = "0.12"
+# WP09: re-encoding of uploaded images (strips EXIF/GPS), pure Rust codecs.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [dev-dependencies]
 queued-runner = { path = "../runner" }

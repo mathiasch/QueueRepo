@@ -80,8 +80,19 @@ pub(super) async fn fresh_prompt(
     if let Some(p) = progress {
         extra.push_str(&p);
     }
+    // WP09: attachments and the project state (as data) after the task;
+    // the approved project rules as the stable prefix before it.
+    extra.push_str(&crate::attachments::prompt_section(
+        &crate::attachments::for_task(st, task.id).await?,
+    ));
+    let (_, state) = crate::project_state::current(st, task.project_id).await?;
+    extra.push_str(&crate::project_state::prompt_section(&state, &nonce));
     let parent = parent_of(st, task).await?;
-    Ok(prompt::task_with(task, project, parent.as_ref(), &extra))
+    Ok(format!(
+        "{}{}",
+        crate::knowledge::prefix(st, project.id).await,
+        prompt::task_with(task, project, parent.as_ref(), &extra)
+    ))
 }
 
 /// The first agent run of the task.

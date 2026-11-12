@@ -49,6 +49,13 @@ async function seed(page: Page) {
   await page.request.post(`/api/projects/${pid}/integrations`, {
     data: { kind: "github", name: "Website-Repo", tenant: `tsv/web-${randomUUID().slice(0, 6)}`, config: { label: "queue", mention: "@queue" } },
   });
+  // WP09: project rules and a project state.
+  await page.request.put(`/api/projects/${pid}/knowledge`, { data: { content: "- Texte in einfacher Sprache\n- Bilder immer mit Alternativtext", base_version: null } });
+  await page.request.put(`/api/projects/${pid}/state`, { data: { base_rev: 0, state: { version: 1, features: [
+    { id: "startseite", title: "Startseite mit Terminen", status: "done", passes: true, files: ["MOCK_LOG.md"] },
+    { id: "kontaktformular", title: "Kontaktformular", status: "in_progress", notes: "Datenbank noch offen" },
+    { id: "galerie", title: "Galerie für Mobilgeräte", status: "todo" },
+  ], progress: [{ text: "Startseite fertig und geprüft" }] } } });
   return { pid, slow };
 }
 
@@ -157,6 +164,17 @@ export async function tour(page: Page, info: TestInfo, device: string, full: boo
     await expect(page.getByText("--strict-mcp-config", { exact: false })).toBeVisible();
     await expectAccessible(page, `project protection (${scheme})`);
     await shot(page, out, `${device}-${scheme}-project-protection`, device === "desktop");
+    // WP09: project rules (with the CLI table) and the project state.
+    await page.getByRole("tab", { name: "Wissen" }).click();
+    await expect(page.getByTestId("rules-status")).toContainText("Version 1");
+    await page.getByText("Was liest welcher Agent?").click();
+    await expect(page.getByTestId("cli-instructions")).toBeVisible();
+    await expectAccessible(page, `project rules (${scheme})`);
+    await shot(page, out, `${device}-${scheme}-project-knowledge`, device === "desktop");
+    await page.getByRole("tab", { name: "Zustand" }).click();
+    await expect(page.getByTestId("state-feature")).toHaveCount(3);
+    await expectAccessible(page, `project state (${scheme})`);
+    await shot(page, out, `${device}-${scheme}-project-state`, device === "desktop");
     // WP07: templates, triggers and the history of a fired one.
     await page.getByRole("tab", { name: "Automatisierung" }).click();
     await expect(page.getByTestId("trigger-row")).toHaveCount(2);

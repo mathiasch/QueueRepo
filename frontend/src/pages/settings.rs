@@ -16,11 +16,12 @@ use crate::logic::labels::{
     credential_help, credential_is_json, credential_kind_label, help, provider_label,
     ONEMPTY_ACTIONS,
 };
+use crate::logic::memory::{parse_percent, percent};
 use crate::nav::set_title;
 use crate::store::{tz, use_store, Store};
 use crate::theme::{self, Theme};
 use crate::ui::dialog::Confirm;
-use crate::ui::{Field, FieldIds, Ic, Icon, Meter};
+use crate::ui::{Field, FieldIds, HelpTip, Ic, Icon, Meter};
 
 #[component]
 pub(crate) fn Card(
@@ -104,6 +105,11 @@ fn GeneralSettings(s: Settings) -> impl IntoView {
     let actions = RwSignal::new(s.onempty_actions.clone());
     let cooldown = RwSignal::new(s.onempty_cooldown_minutes.to_string());
     let ntfy = RwSignal::new(s.ntfy_url.clone().unwrap_or_default());
+    // WP09: dedupe/critic of OnEmpty proposals.
+    let dup = RwSignal::new(percent(s.dedupe_threshold));
+    let review = RwSignal::new(percent(s.dedupe_review_threshold));
+    let window = RwSignal::new(s.dedupe_window_days.to_string());
+    let critic = RwSignal::new(s.critic_llm);
     let error = RwSignal::new(None::<String>);
     let last = s.last_onempty_at;
 
@@ -124,8 +130,20 @@ fn GeneralSettings(s: Settings) -> impl IntoView {
                 max_auto_tasks: num(auto, "Automatische Freigabe")?,
                 max_fix_attempts: num(fixes, "Reparaturversuche")?,
                 ntfy_url: Some(ntfy.get_untracked().trim().to_string()).filter(|u| !u.is_empty()),
+                dedupe_threshold: Some(parse_percent(&dup.get_untracked(), "Duplikat ab")?),
+                dedupe_review_threshold: Some(parse_percent(&review.get_untracked(), "Prüfen ab")?),
+                dedupe_window_days: Some(num(window, "Vergleichszeitraum")?),
+                critic_llm: Some(critic.get_untracked()),
             })
-        })();
+        })()
+        .and_then(|b| {
+            queued_api::memory::validate_dedupe(
+                b.dedupe_threshold.unwrap_or(0.6),
+                b.dedupe_review_threshold.unwrap_or(0.35),
+                b.dedupe_window_days.unwrap_or(90),
+            )
+            .map(|_| b)
+        });
         let body = match body {
             Ok(b) => b,
             Err(e) => {
@@ -142,6 +160,9 @@ fn GeneralSettings(s: Settings) -> impl IntoView {
                     fixes.set(s.max_fix_attempts.to_string());
                     auto.set(s.max_auto_tasks.to_string());
                     cooldown.set(s.onempty_cooldown_minutes.to_string());
+                    dup.set(percent(s.dedupe_threshold));
+                    review.set(percent(s.dedupe_review_threshold));
+                    window.set(s.dedupe_window_days.to_string());
                     store.settings.set(Some(s));
                     store.toast("Einstellungen gespeichert");
                 }
@@ -212,6 +233,18 @@ fn GeneralSettings(s: Settings) -> impl IntoView {
                 </fieldset>
                 {number(cooldown, "Höchstens alle … Minuten", "300 = einmal pro 5-Stunden-Fenster. Läuft nur, wenn nichts auf dich wartet und das Budget reicht.", "", "5", "10080")}
                 {last.map(|l| view! { <p class="small muted">{move || format!("Zuletzt: {}", fmt_relative(l, store.now.get(), &tz()))}</p> })}
+                <fieldset class="stack" style="border:0; padding:0; margin:0" data-testid="dedupe-settings">
+                    <legend class="small row" style="font-weight:600; margin-bottom: var(--sp-2)">"Doppelte Vorschläge vermeiden" <HelpTip topic="Prüfung der Vorschläge" text=queued_api::memory::DEDUPE_HELP align="align-start"/></legend>
+                    <div class="grid-3">
+                        {number(dup, "Duplikat ab (%)", "So ähnlich zu einem vorhandenen Auftrag: verwerfen", "", "5", "100")}
+                        {number(review, "Prüfen ab (%)", "So ähnlich: nur mit deiner Freigabe", "", "5", "100")}
+                        {number(window, "Vergleichszeitraum (Tage)", "Erledigte Aufträge so weit zurück", "", "1", "3650")}
+                    </div>
+                    <label class="check">
+                        <input type="checkbox" data-testid="critic-llm" prop:checked=move || critic.get() on:change=move |ev| critic.set(event_target_checked(&ev))/>
+                        <span class="check-text">"Zusätzlich von einem Modell prüfen lassen"<small>"Nutzt den direkten Zugang des Analyse-Schritts im Projekt (kostet etwas, steht bei den Kosten als „Prüfung“). Das Modell kann nur strenger urteilen."</small></span>
+                    </label>
+                </fieldset>
             })}
             {save_bar("Speichern")}
         </Card>
