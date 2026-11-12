@@ -38,10 +38,16 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 
 /// Constant-time check of a `sha256=<hex>` header over `parts`.
 pub fn verify(secret: &[u8], parts: &[&[u8]], header: &str) -> bool {
-    let Some(hex) = header.trim().strip_prefix("sha256=") else {
-        return false;
-    };
-    let Some(given) = unhex(hex) else {
+    match header.trim().strip_prefix("sha256=") {
+        Some(hex) => verify_hex(secret, parts, hex),
+        None => false,
+    }
+}
+
+/// Constant-time check of a bare hex HMAC-SHA256 over `parts` (Linear
+/// `Linear-Signature`, Slack `v0=<hex>` after the prefix).
+pub fn verify_hex(secret: &[u8], parts: &[&[u8]], hex: &str) -> bool {
+    let Some(given) = unhex(hex.trim()) else {
         return false;
     };
     let mut m = HmacSha256::new_from_slice(secret).expect("HMAC takes any key length");
@@ -155,7 +161,7 @@ pub enum Verdict {
 /// Sender is a bot: `sender.type == "Bot"` (value unverified, the schema
 /// only says string) or a login ending in `[bot]` (GitHub's documented
 /// app logins, e.g. `copilot-swe-agent[bot]`).
-fn is_bot(p: &Value) -> bool {
+pub fn is_bot(p: &Value) -> bool {
     s(p, &["sender", "type"]) == Some("Bot")
         || s(p, &["sender", "login"]).is_some_and(|l| l.ends_with("[bot]"))
 }

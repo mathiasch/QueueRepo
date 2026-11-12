@@ -274,10 +274,14 @@ async fn question_is_answered_and_task_resumes(pool: PgPool) {
         200
     );
     let d = a.wait_status(&t, &["done"]).await;
-    assert!(d["task"]["context"]
-        .as_str()
-        .unwrap()
-        .contains("A: Postgres"));
+    // WP08 (fix of WP06-N8): the answer is a message in its own block, no
+    // longer raw text in the context.
+    let ctx = d["task"]["context"].as_str().unwrap();
+    assert!(ctx.contains("Q: Postgres or SQLite?") && ctx.contains("A: see the messages"));
+    assert!(!ctx.contains("A: Postgres"));
+    let (_, m) = a.get(&format!("/api/tasks/{t}/messages")).await;
+    assert_eq!(m["messages"][0]["body"], "Postgres");
+    assert_eq!(m["messages"][0]["state"], "delivered");
 }
 
 #[sqlx::test(migrator = "queued::MIGRATOR")]

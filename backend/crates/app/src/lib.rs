@@ -16,6 +16,7 @@ pub mod estimate;
 pub mod eval;
 pub mod gateway;
 pub mod githost;
+pub mod intake;
 pub mod limits;
 pub mod llm;
 pub mod models;
@@ -66,6 +67,10 @@ pub async fn start_worker(st: &state::AppState) -> anyhow::Result<()> {
     // 0 = tests drive the trigger scheduler themselves.
     if st.cfg.trigger_tick_secs > 0 {
         tokio::spawn(triggers::run(st.clone()));
+    }
+    // 0 = tests drive the intake outbox themselves.
+    if st.cfg.intake_tick_secs > 0 {
+        tokio::spawn(intake::run(st.clone()));
     }
     Ok(())
 }

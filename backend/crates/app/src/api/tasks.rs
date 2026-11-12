@@ -3,7 +3,7 @@ use axum::{
     Json,
 };
 use queued_api::{
-    Answer, ApproveAllResult, CreateTask, DiffView, MoveTask, TaskDetail, UpdateTask, MOVE_BOTTOM,
+    ApproveAllResult, CreateTask, DiffView, MoveTask, TaskDetail, UpdateTask, MOVE_BOTTOM,
     MOVE_DOWN, MOVE_TOP, MOVE_UP,
 };
 use serde_json::{json, Value};
@@ -145,10 +145,12 @@ pub async fn get(
     .fetch_all(&st.db)
     .await?;
     let pull_request = super::pulls::of_task(&st, &t).await?;
+    let intake = crate::intake::link_view(&st, t.id).await?;
     Ok(Json(TaskDetail {
         task: t,
         events,
         pull_request,
+        intake,
     }))
 }
 
@@ -425,40 +427,6 @@ pub async fn approve_all(
     Ok(Json(ApproveAllResult {
         approved: ids.len(),
     }))
-}
-
-pub async fn answer(
-    State(st): State<AppState>,
-    AuthUser(u): AuthUser,
-    Path(id): Path<Uuid>,
-    Json(a): Json<Answer>,
-) -> ApiResult<Json<Value>> {
-    let t = own_task(&st, id, u.id).await?;
-    if t.status != status::WAITING_INPUT {
-        return Err(AppError::conflict("task is not waiting for input"));
-    }
-    let questions: Vec<String> = t
-        .questions
-        .and_then(|q| serde_json::from_value(q).ok())
-        .unwrap_or_default();
-    let mut ctx = String::from("\n\n## Answers from user\n");
-    for q in &questions {
-        ctx.push_str(&format!("Q: {q}\n"));
-    }
-    ctx.push_str(&format!("A: {}\n", a.answer.trim()));
-    sqlx::query(
-        "UPDATE tasks SET status='queued', questions=NULL, context = context || $2, updated_at=now(),
-                position = (SELECT COALESCE(MIN(position), 0) - 1 FROM tasks WHERE user_id=$3 AND status='queued')
-         WHERE id=$1",
-    )
-    .bind(id)
-    .bind(ctx)
-    .bind(u.id)
-    .execute(&st.db)
-    .await?;
-    queue::emit_task(&st, id).await;
-    st.wake.notify_one();
-    Ok(Json(json!({"ok": true})))
 }
 
 pub async fn move_task(

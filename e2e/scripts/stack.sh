@@ -8,19 +8,20 @@ ADMIN_URL="${E2E_DATABASE_ADMIN_URL:-postgres://queued:queued@localhost:5432/pos
 APP_PORT="${E2E_APP_PORT:-18080}"
 RUNNER_PORT="${E2E_RUNNER_PORT:-18090}"
 FAKE_HOST_PORT="${E2E_FAKE_HOST_PORT:-18095}"
+FAKE_INTAKE_PORT="${E2E_FAKE_INTAKE_PORT:-18096}"
 DB="queued_e2e_$(date +%s)_$$"
 WORK="$(mktemp -d)"
 TOKEN="e2e-runner-token-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
 cleanup() {
-  kill "${RUNNER_PID:-}" "${APP_PID:-}" "${FAKE_PID:-}" 2>/dev/null || true
+  kill "${RUNNER_PID:-}" "${APP_PID:-}" "${FAKE_PID:-}" "${INTAKE_PID:-}" 2>/dev/null || true
   psql "$ADMIN_URL" -qc "DROP DATABASE IF EXISTS $DB WITH (FORCE)" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
 
 if [[ "${E2E_SKIP_BUILD:-}" != "1" ]]; then
-  (cd "$ROOT/backend" && cargo build --quiet --bin queued --bin queued-runner --bin queuectl --example fake_git_host)
+  (cd "$ROOT/backend" && cargo build --quiet --bin queued --bin queued-runner --bin queuectl --example fake_git_host --example fake_intake)
   (cd "$ROOT/frontend" && trunk build --release >/dev/null)
 fi
 psql "$ADMIN_URL" -qc "CREATE DATABASE $DB" >/dev/null
@@ -38,13 +39,20 @@ RUNNER_PID=$!
 FAKE_GIT_HOST_BIND="127.0.0.1:$FAKE_HOST_PORT" "$ROOT/backend/target/debug/examples/fake_git_host" &
 FAKE_PID=$!
 
+# WP08: fake GitHub/Slack/Linear/Jira APIs for status updates.
+FAKE_INTAKE_BIND="127.0.0.1:$FAKE_INTAKE_PORT" "$ROOT/backend/target/debug/examples/fake_intake" &
+INTAKE_PID=$!
+FAKE_INTAKE="http://127.0.0.1:$FAKE_INTAKE_PORT"
+
 DATABASE_URL="$DB_URL" RUNNER_URL="http://127.0.0.1:$RUNNER_PORT" RUNNER_TOKEN="$TOKEN" \
 DATA_DIR="$WORK/app" FRONTEND_DIR="$ROOT/frontend/dist" BIND="127.0.0.1:$APP_PORT" \
 PUBLIC_URL="http://127.0.0.1:$APP_PORT" ENABLE_MOCK_PROVIDER=true TICK_SECS=1 RUST_LOG=warn \
 ALLOW_LOCAL_GIT_REMOTES=true ALLOW_PRIVATE_GIT_HOSTS=true PR_POLL_SECS=1 TRIGGER_TICK_SECS=1 \
+INTAKE_TICK_SECS=1 INTAKE_GITHUB_API_URL="$FAKE_INTAKE" INTAKE_SLACK_API_URL="$FAKE_INTAKE" \
+INTAKE_LINEAR_API_URL="$FAKE_INTAKE/graphql" INTAKE_JIRA_API_URL="$FAKE_INTAKE" \
 TRANSIENT_BACKOFF_BASE_SECS=1 TRANSIENT_BACKOFF_MAX_SECS=2 TRANSIENT_MAX_RETRIES=2 \
   "$ROOT/backend/target/debug/queued" &
 APP_PID=$!
 
 echo "stack: app :$APP_PORT runner :$RUNNER_PORT db $DB"
-wait -n "$RUNNER_PID" "$APP_PID" "$FAKE_PID"
+wait -n "$RUNNER_PID" "$APP_PID" "$FAKE_PID" "$INTAKE_PID"

@@ -3,11 +3,12 @@ mod environment;
 mod evals;
 mod gate;
 mod hooks;
+mod intake;
 pub mod limits;
 pub(crate) mod projects;
 mod providers;
 mod pulls;
-mod steer;
+pub(crate) mod steer;
 mod tasks;
 mod tokens;
 mod triggers;
@@ -135,7 +136,7 @@ pub fn router(st: AppState) -> Router {
         .route("/tasks/{id}/cancel", post(tasks::cancel))
         .route("/tasks/{id}/retry", post(tasks::retry))
         .route("/tasks/{id}/approve", post(tasks::approve))
-        .route("/tasks/{id}/answer", post(tasks::answer))
+        .route("/tasks/{id}/answer", post(steer::answer))
         .route("/tasks/{id}/move", post(tasks::move_task))
         .route("/tasks/{id}/diff", get(tasks::diff))
         .route("/tasks/{id}/revert", post(tasks::revert))
@@ -204,6 +205,35 @@ pub fn router(st: AppState) -> Router {
             post(hooks::receive).layer(DefaultBodyLimit::max(
                 queued_api::triggers::WEBHOOK_MAX_BODY,
             )),
+        )
+        // WP08: intake integrations (management cookie only, receive public).
+        .route(
+            "/projects/{id}/integrations",
+            get(intake::list).post(intake::create),
+        )
+        .route(
+            "/integrations/{id}",
+            get(intake::get)
+                .patch(intake::update)
+                .delete(intake::remove),
+        )
+        .route("/integrations/{id}/secret", post(intake::renew_secret))
+        .route("/integrations/{id}/events", get(intake::events))
+        .route(
+            "/integrations/{id}/identities",
+            get(intake::identities).post(intake::add_identity),
+        )
+        .route(
+            "/integrations/{id}/identities/{iid}",
+            delete(intake::remove_identity),
+        )
+        .route(
+            "/integrations/{id}/identities/{iid}/confirm",
+            post(intake::confirm_identity),
+        )
+        .route(
+            "/intake/{id}",
+            post(intake::receive).layer(DefaultBodyLimit::max(queued_api::intake::MAX_BODY)),
         )
         // Unknown API paths get a JSON 404 instead of the SPA's index.html.
         .fallback(|| async { AppError::not_found() });

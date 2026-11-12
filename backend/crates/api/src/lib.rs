@@ -17,6 +17,7 @@ mod costs;
 pub mod diff;
 pub mod env;
 pub mod gate;
+pub mod intake;
 pub mod pr;
 mod providers;
 pub mod steer;
@@ -521,6 +522,9 @@ pub struct TaskDetail {
     /// Pull request opened for this task or worked on by it (WP05).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<pr::PullRequestView>,
+    /// External object the task came from (WP08).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intake: Option<intake::IntakeLinkView>,
 }
 
 /// `GET /api/tasks/{id}/diff`.

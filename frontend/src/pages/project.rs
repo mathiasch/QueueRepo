@@ -36,11 +36,12 @@ enum Tab {
     Environment,
     Protection,
     Automation,
+    Integrations,
     Members,
 }
 
 impl Tab {
-    const ALL: [Tab; 9] = [
+    const ALL: [Tab; 10] = [
         Tab::Files,
         Tab::Git,
         Tab::Tasks,
@@ -49,6 +50,7 @@ impl Tab {
         Tab::Environment,
         Tab::Protection,
         Tab::Automation,
+        Tab::Integrations,
         Tab::Members,
     ];
     fn key(self) -> &'static str {
@@ -61,6 +63,7 @@ impl Tab {
             Tab::Environment => "environment",
             Tab::Protection => "protection",
             Tab::Automation => "automation",
+            Tab::Integrations => "integrations",
             Tab::Members => "members",
         }
     }
@@ -74,6 +77,7 @@ impl Tab {
             Tab::Environment => "Umgebung",
             Tab::Protection => "Schutz",
             Tab::Automation => "Automatisierung",
+            Tab::Integrations => "Anbindungen",
             Tab::Members => "Mitglieder",
         }
     }
@@ -87,6 +91,7 @@ impl Tab {
             Tab::Environment => Ic::Terminal,
             Tab::Protection => Ic::Shield,
             Tab::Automation => Ic::Zap,
+            Tab::Integrations => Ic::Link,
             Tab::Members => Ic::Users,
         }
     }
@@ -221,6 +226,7 @@ pub fn ProjectPage() -> impl IntoView {
                             Tab::Environment => view! { <super::environment::ProjectEnvironment p=p/> }.into_any(),
                             Tab::Protection => view! { <super::protection::ProjectProtection p=p/> }.into_any(),
                             Tab::Automation => view! { <super::automation::ProjectAutomation p=p/> }.into_any(),
+                            Tab::Integrations => view! { <super::integrations::ProjectIntegrations p=p/> }.into_any(),
                             Tab::Members => view! { <Members id=pid is_owner=p.role == ProjectRole::Owner me=store.me.get_untracked().id/> }.into_any(),
                         }
                     }}

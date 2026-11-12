@@ -187,6 +187,10 @@ async fn view_of(st: &AppState, m: &MsgRow, user: Uuid, owner: bool) -> TaskMess
         created_at: m.created_at,
         delivered_at: m.delivered_at,
         can_withdraw: state == MessageState::Queued && (owner || m.author_id == Some(user)),
+        via: m
+            .via
+            .as_deref()
+            .and_then(queued_api::intake::IntakeKind::parse),
     }
 }
 
@@ -222,6 +226,16 @@ pub async fn send(
     Ok(Json(view_of(&st, &msg, u.id, r == Role::Owner).await))
 }
 
+/// A message queued inside a transaction; [`announce_message`] after the commit.
+pub(crate) struct Queued {
+    pub msg: MsgRow,
+    /// The task waited for an answer: the message is the answer.
+    pub answered: bool,
+    urgent: bool,
+    now: bool,
+    source: MessageSource,
+}
+
 /// Queues a message for an active task (shared by messages and comments).
 async fn post_message(
     st: &AppState,
@@ -232,13 +246,32 @@ async fn post_message(
     now: bool,
     comments: &[Uuid],
 ) -> ApiResult<MsgRow> {
+    let mut tx = st.db.begin().await?;
+    let q = queue_message(&mut tx, t, user, body, source, now, comments, None).await?;
+    tx.commit().await?;
+    announce_message(st, t, user, &q).await;
+    Ok(q.msg)
+}
+
+/// Queues a message inside the caller's transaction (WP06 messages, WP08
+/// replies from an integration: `via`). Takes the task row lock, so it
+/// serialises with the scheduler's claim.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn queue_message(
+    tx: &mut sqlx::PgConnection,
+    t: &Task,
+    user: Uuid,
+    body: &str,
+    source: MessageSource,
+    now: bool,
+    comments: &[Uuid],
+    via: Option<&str>,
+) -> ApiResult<Queued> {
     if !ACTIVE.contains(&t.status.as_str()) {
         return Err(AppError::conflict(
             "Der Auftrag ist beendet – nutze „Weiter mit …“",
         ));
     }
-    let mut tx = st.db.begin().await?;
-    // Serialises with the scheduler's claim (the row lock).
     let current: Option<String> =
         sqlx::query_scalar("SELECT status FROM tasks WHERE id=$1 FOR UPDATE")
             .bind(t.id)
@@ -262,7 +295,7 @@ async fn post_message(
         )));
     }
     let urgent = now && current == status::RUNNING && t.steer_rounds < MAX_STEER_ROUNDS;
-    let msg = steer::insert(&mut tx, t.id, user, body, source, urgent).await?;
+    let msg = steer::insert(&mut *tx, t.id, user, body, source, urgent, via).await?;
     // Bundled comments in the same transaction: the agent never sees the
     // message without them.
     if !comments.is_empty() {
@@ -276,14 +309,18 @@ async fn post_message(
         .execute(&mut *tx)
         .await?;
     }
-    // A task waiting for an answer: the message is the answer.
+    // A task waiting for an answer: the message is the answer. The answer
+    // itself reaches the agent only as the message (own block, limited).
     let answered = current == status::WAITING_INPUT;
     if answered {
-        let questions: Vec<String> = t
-            .questions
-            .clone()
-            .and_then(|q| serde_json::from_value(q).ok())
-            .unwrap_or_default();
+        let questions: Vec<String> = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT questions FROM tasks WHERE id=$1",
+        )
+        .bind(t.id)
+        .fetch_one(&mut *tx)
+        .await?
+        .and_then(|q| serde_json::from_value(q).ok())
+        .unwrap_or_default();
         let mut ctx = String::from("\n\n## Answers from user\n");
         for q in &questions {
             ctx.push_str(&format!("Q: {}\n", q.chars().take(500).collect::<String>()));
@@ -300,17 +337,34 @@ async fn post_message(
         .execute(&mut *tx)
         .await?;
     }
-    tx.commit().await?;
+    Ok(Queued {
+        msg,
+        answered,
+        urgent,
+        now,
+        source,
+    })
+}
+
+/// After the commit of [`queue_message`]: log, live update, wake.
+pub(crate) async fn announce_message(st: &AppState, t: &Task, user: Uuid, q: &Queued) {
     let who = name(st, user).await;
-    let what = match source {
+    let what = match q.source {
         MessageSource::Comments => "Kommentare",
         MessageSource::Message => "Nachricht",
     };
-    let mut text = format!("{what} von {who} – wartet auf Zustellung");
-    if answered {
-        text = format!("{what} von {who} beantwortet die Rückfrage – der Auftrag geht weiter");
-    } else if now {
-        if urgent && st.steer_now(t.id) {
+    let via = q
+        .msg
+        .via
+        .as_deref()
+        .and_then(queued_api::intake::IntakeKind::parse)
+        .map(|k| format!(" über {}", k.short()))
+        .unwrap_or_default();
+    let mut text = format!("{what} von {who}{via} – wartet auf Zustellung");
+    if q.answered {
+        text = format!("{what} von {who}{via} beantwortet die Rückfrage – der Auftrag geht weiter");
+    } else if q.now {
+        if q.urgent && st.steer_now(t.id) {
             text = format!("{what} von {who} – der Agent wird unterbrochen und bekommt sie sofort");
         } else {
             text.push_str(" (der Agent arbeitet gerade nicht an einem Schritt, der sich unterbrechen lässt – sie wird beim nächsten Halt zugestellt)");
@@ -319,7 +373,24 @@ async fn post_message(
     steer::log(st, t, &text).await;
     queue::emit_task(st, t.id).await;
     st.wake.notify_one();
-    Ok(msg)
+}
+
+/// `POST /api/tasks/{id}/answer` (Bestand, WP06-N8 behoben in WP08): the
+/// answer is a message – length limit, own block in the prompt – instead
+/// of raw text appended to the context.
+pub async fn answer(
+    State(st): State<AppState>,
+    AuthUser(u): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(a): Json<queued_api::Answer>,
+) -> ApiResult<Json<Value>> {
+    let (t, _) = steerable(&st, id, u.id).await?;
+    if t.status != status::WAITING_INPUT {
+        return Err(AppError::conflict("task is not waiting for input"));
+    }
+    let body = validate_text("Die Antwort", &a.answer, MAX_MESSAGE_CHARS).map_err(bad)?;
+    post_message(&st, &t, u.id, &body, MessageSource::Message, false, &[]).await?;
+    Ok(Json(json!({"ok": true})))
 }
 
 /// `DELETE /api/tasks/{id}/messages/{mid}`: withdraw before delivery.

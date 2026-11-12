@@ -51,6 +51,25 @@ pub struct Config {
     /// WP07: interval of the trigger scheduler (env `TRIGGER_TICK_SECS`,
     /// default 15; 0 = no background loop, tests drive `triggers::tick`).
     pub trigger_tick_secs: u64,
+    /// WP08: interval of the intake outbox loop (env `INTAKE_TICK_SECS`,
+    /// default 5; 0 = no background loop, tests drive `intake::tick`).
+    pub intake_tick_secs: u64,
+    /// WP08: API base addresses of the integrations (defaults: the official
+    /// APIs; env `INTAKE_{GITHUB,SLACK,LINEAR}_API_URL`). Only for tests and
+    /// proxies – the calls still go through the SSRF guard.
+    pub intake_github_api: String,
+    pub intake_slack_api: String,
+    pub intake_linear_api: String,
+    /// WP08: replaces the Jira site address for API calls (env
+    /// `INTAKE_JIRA_API_URL`; tests only, the site stays the tenant).
+    pub intake_jira_api: Option<String>,
+}
+
+fn api_url(k: &str, default: &str) -> String {
+    var(k)
+        .unwrap_or_else(|| default.into())
+        .trim_end_matches('/')
+        .to_string()
 }
 
 pub fn var(k: &str) -> Option<String> {
@@ -104,6 +123,12 @@ impl Config {
             pr_poll_secs: num::<u64>("PR_POLL_SECS", 60),
             allow_private_git_hosts: flag("ALLOW_PRIVATE_GIT_HOSTS", false),
             trigger_tick_secs: num::<u64>("TRIGGER_TICK_SECS", 15),
+            intake_tick_secs: num::<u64>("INTAKE_TICK_SECS", 5),
+            intake_github_api: api_url("INTAKE_GITHUB_API_URL", "https://api.github.com"),
+            intake_slack_api: api_url("INTAKE_SLACK_API_URL", "https://slack.com/api"),
+            intake_linear_api: api_url("INTAKE_LINEAR_API_URL", "https://api.linear.app/graphql"),
+            intake_jira_api: var("INTAKE_JIRA_API_URL")
+                .map(|u| u.trim_end_matches('/').to_string()),
             data_dir,
         })
     }
@@ -145,6 +170,12 @@ impl Config {
             // Fake git host servers listen on 127.0.0.1.
             allow_private_git_hosts: true,
             trigger_tick_secs: 1,
+            // Tests drive the intake loop themselves.
+            intake_tick_secs: 0,
+            intake_github_api: "https://api.github.com".into(),
+            intake_slack_api: "https://slack.com/api".into(),
+            intake_linear_api: "https://api.linear.app/graphql".into(),
+            intake_jira_api: None,
         }
     }
 

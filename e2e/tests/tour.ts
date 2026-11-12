@@ -4,6 +4,7 @@
  * the WP00 report.
  */
 import { expect, type Page, type TestInfo } from "@playwright/test";
+import { createHmac, randomUUID } from "node:crypto";
 import { apiProject, expectAccessible, navLink, shot, uiRegister, waitTask } from "./helpers";
 
 async function seed(page: Page) {
@@ -31,6 +32,23 @@ async function seed(page: Page) {
   // Fired by hand: the task waits behind the long-running one (history shows "erstellt").
   expect((await page.request.post(`/api/triggers/${hook.trigger.id}/fire`, { data: {} })).status()).toBe(201);
   await page.request.post("/api/tokens", { data: { name: "Laptop", scopes: ["projects:read", "tasks:read", "tasks:write"], expires_in_days: 90 } });
+  // WP08: Slack (with a mapped person and one refused message) and GitHub Issues.
+  const team = `T${randomUUID().replace(/-/g, "").slice(0, 10).toUpperCase()}`;
+  const slackSecret = "tour-slack-signing-secret";
+  const slack = await (await page.request.post(`/api/projects/${pid}/integrations`, {
+    data: { kind: "slack", name: "Vereins-Slack", tenant: team, secret: slackSecret, token: "xoxb-tour-0000" },
+  })).json();
+  const me = (await (await page.request.get("/api/auth/me")).json()).id;
+  await page.request.post(`/api/integrations/${slack.integration.id}/identities`, { data: { external_id: "U0ADA", external_name: "ada", user_id: me } });
+  const ev = JSON.stringify({ type: "event_callback", team_id: team, event_id: "Ev1", event: { type: "app_mention", user: "U0GAST", text: "<@UBOT> Bitte den Kalender reparieren", ts: "1700000000.000100", channel: "C0TSV" } });
+  const ts = String(Math.floor(Date.now() / 1000));
+  await page.request.post(`/api/intake/${slack.integration.id}`, {
+    headers: { "content-type": "application/json", "x-slack-request-timestamp": ts, "x-slack-signature": `v0=${createHmac("sha256", slackSecret).update(`v0:${ts}:${ev}`).digest("hex")}` },
+    data: ev,
+  });
+  await page.request.post(`/api/projects/${pid}/integrations`, {
+    data: { kind: "github", name: "Website-Repo", tenant: `tsv/web-${randomUUID().slice(0, 6)}`, config: { label: "queue", mention: "@queue" } },
+  });
   return { pid, slow };
 }
 
@@ -147,6 +165,16 @@ export async function tour(page: Page, info: TestInfo, device: string, full: boo
     await expect(hookRow.getByTestId("run-row")).toHaveCount(1);
     await expectAccessible(page, `project automation (${scheme})`);
     await shot(page, out, `${device}-${scheme}-project-automation`, device === "desktop");
+    // WP08: integrations with people and the history of a refused message.
+    await page.getByRole("tab", { name: "Anbindungen" }).click();
+    await expect(page.getByTestId("integration-row")).toHaveCount(2);
+    const slackRow = page.getByTestId("integration-row").filter({ hasText: "Vereins-Slack" });
+    await slackRow.getByTestId("integration-people").locator("summary").click();
+    await expect(slackRow.getByTestId("identity-row")).toHaveCount(1);
+    await slackRow.getByTestId("integration-history").locator("summary").click();
+    await expect(slackRow.getByTestId("intake-event")).toHaveCount(1);
+    await expectAccessible(page, `project integrations (${scheme})`);
+    await shot(page, out, `${device}-${scheme}-project-integrations`, device === "desktop");
     await page.getByRole("tab", { name: "Mitglieder" }).click();
     await expect(page.locator(".member")).toHaveCount(1);
     await expectAccessible(page, `project members (${scheme})`);

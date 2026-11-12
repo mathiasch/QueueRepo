@@ -380,6 +380,9 @@ pub struct TaskMessageView {
     pub delivered_at: Option<DateTime<Utc>>,
     /// The caller may withdraw it now.
     pub can_withdraw: bool,
+    /// Came in from an integration (WP08: Slack thread, issue comment, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<crate::intake::IntakeKind>,
 }
 
 /// `GET /api/tasks/{id}/messages`: the list and what the caller may do.

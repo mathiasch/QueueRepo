@@ -5,6 +5,7 @@ pub mod delivery;
 pub mod drawer;
 pub mod environment;
 pub mod inbox;
+pub mod integrations;
 pub mod login;
 pub mod onboarding;
 pub mod pr;

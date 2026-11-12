@@ -219,9 +219,7 @@ pub fn validate_tenant(kind: IntakeKind, raw: &str) -> Result<String, String> {
         }
         IntakeKind::Linear => match Uuid::parse_str(t) {
             Ok(u) => Ok(u.hyphenated().to_string()),
-            Err(_) => {
-                Err("Die Organisations-ID ist eine lange ID mit Bindestrichen (UUID)".into())
-            }
+            Err(_) => Err("Die Organisations-ID ist eine lange ID mit Bindestrichen (UUID)".into()),
         },
         IntakeKind::Jira => {
             let t = t.trim_end_matches('/');
@@ -238,7 +236,10 @@ pub fn validate_tenant(kind: IntakeKind, raw: &str) -> Result<String, String> {
             if ok {
                 Ok(format!("https://{}", host.to_ascii_lowercase()))
             } else {
-                Err("Bitte nur die Adresse der Site angeben, z. B. https://acme.atlassian.net".into())
+                Err(
+                    "Bitte nur die Adresse der Site angeben, z. B. https://acme.atlassian.net"
+                        .into(),
+                )
             }
         }
     }
@@ -304,10 +305,15 @@ pub fn validate_config(kind: IntakeKind, c: &IntakeConfig) -> Result<IntakeConfi
         .transpose()?;
     if matches!(kind, IntakeKind::Github | IntakeKind::Jira) && label.is_none() && mention.is_none()
     {
-        return Err("Bitte ein Label oder eine Erwähnung angeben – sonst würde jedes Issue zum Auftrag".into());
+        return Err(
+            "Bitte ein Label oder eine Erwähnung angeben – sonst würde jedes Issue zum Auftrag"
+                .into(),
+        );
     }
     if kind == IntakeKind::Jira && mention.is_some() && label.is_none() {
-        return Err("Für Jira bitte ein Label angeben (die Erwähnung gilt nur für Kommentare)".into());
+        return Err(
+            "Für Jira bitte ein Label angeben (die Erwähnung gilt nur für Kommentare)".into(),
+        );
     }
     Ok(IntakeConfig {
         // Slack and Linear have their own trigger (mention, delegation).
@@ -630,7 +636,14 @@ pub struct IdentityView {
 pub struct Identities {
     pub identities: Vec<IdentityView>,
     /// Members the caller may map (owner: every editor; others: themselves).
-    pub mappable: Vec<crate::ProjectMemberRef>,
+    pub mappable: Vec<MemberRef>,
+}
+
+/// A project member that can be mapped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemberRef {
+    pub user_id: Uuid,
+    pub name: String,
 }
 
 /// `POST /api/integrations/{id}/identities`.
@@ -655,6 +668,8 @@ pub struct IntakeLinkView {
     pub url: Option<String>,
     /// State of the last update sent outside.
     pub last_update: Option<String>,
+    /// Updates are switched on (a token is stored).
+    pub updates: bool,
 }
 
 /// Only http(s) links (shown as links in the UI).
@@ -871,7 +886,9 @@ mod tests {
         };
         for k in IntakeKind::ALL {
             let steps = setup_steps(k, "https://q.example/api/intake/x", &cfg);
-            assert!(steps.iter().any(|s| s.contains("https://q.example/api/intake/x")));
+            assert!(steps
+                .iter()
+                .any(|s| s.contains("https://q.example/api/intake/x")));
             assert!(steps.iter().all(|s| !s.is_empty()));
         }
     }

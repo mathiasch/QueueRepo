@@ -33,6 +33,8 @@ pub struct MsgRow {
     pub created_at: DateTime<Utc>,
     pub delivered_at: Option<DateTime<Utc>>,
     pub withdrawn_at: Option<DateTime<Utc>>,
+    /// Integration the message came in through (WP08), `None` = Queue.
+    pub via: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -87,9 +89,10 @@ pub async fn insert(
     body: &str,
     source: MessageSource,
     urgent: bool,
+    via: Option<&str>,
 ) -> sqlx::Result<MsgRow> {
     sqlx::query_as(
-        "INSERT INTO task_messages (id, task_id, author_id, body, source, urgent) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *",
+        "INSERT INTO task_messages (id, task_id, author_id, body, source, urgent, via) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
     )
     .bind(Uuid::new_v4())
     .bind(task)
@@ -97,6 +100,7 @@ pub async fn insert(
     .bind(body)
     .bind(source.as_str())
     .bind(urgent)
+    .bind(via)
     .fetch_one(conn)
     .await
 }
@@ -200,9 +204,17 @@ pub async fn items(st: &AppState, msgs: &[MsgRow]) -> sqlx::Result<Vec<MessageIt
                 });
             }
         }
+        let mut author = user_name(st, m.author_id).await;
+        if let Some(k) = m
+            .via
+            .as_deref()
+            .and_then(queued_api::intake::IntakeKind::parse)
+        {
+            author.push_str(&format!(" (via {})", k.short()));
+        }
         out.push(MessageItem {
             at: m.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
-            author: user_name(st, m.author_id).await,
+            author,
             body: m.body.clone(),
             comments,
         });
@@ -334,7 +346,16 @@ pub async fn continuation(
         let body = comment_note
             .map(str::to_string)
             .unwrap_or_else(|| format!("{} Kommentar(e) zu den Änderungen", comments.len()));
-        let m = insert(tx, task.id, user, &body, MessageSource::Comments, false).await?;
+        let m = insert(
+            tx,
+            task.id,
+            user,
+            &body,
+            MessageSource::Comments,
+            false,
+            None,
+        )
+        .await?;
         sqlx::query(
             "UPDATE diff_comments SET state='sent', sent_at=now(), message_id=$2, sent_task=$3, updated_at=now()
              WHERE id = ANY($1) AND state='draft'",

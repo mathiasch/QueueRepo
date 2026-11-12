@@ -384,4 +384,5 @@ pub fn status_of(ts: &[Value], title_contains: &str) -> Vec<String> {
         .collect()
 }
 pub mod fake_git_host;
+pub mod fake_intake;
 pub mod fake_llm;

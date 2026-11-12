@@ -9,6 +9,7 @@ pub mod diff;
 pub mod env;
 pub mod errors;
 pub mod format;
+pub mod intake;
 pub mod labels;
 pub mod limits;
 pub mod pr;

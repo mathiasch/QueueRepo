@@ -384,6 +384,7 @@ pub fn MessagesBlock(
                                             <span class="muted">{when}</span>
                                             {(m.source == queued_api::steer::MessageSource::Comments).then(|| view! { <span class="tag">"Kommentare"</span> })}
                                             {m.urgent.then(|| view! { <span class="tag">"sofort"</span> })}
+                                            {m.via.map(|k| view! { <span class="tag tone-info" data-testid="message-via">{format!("über {}", k.short())}</span> })}
                                             <span class=format!("tag {}", state_tone(m))>{state}</span>
                                         </div>
                                         <p class="message-body">{m.body.clone()}</p>
