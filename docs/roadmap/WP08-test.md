@@ -36,11 +36,11 @@ Dazu: `github_opt_in_for_unmapped_people_needs_repository_rights` (Opt-in: `NONE
 |---|---|---|---|---|---|---|---|---|
 | Vorlauf (vor den letzten Fixes) | ok | ok | **rot: 499/500** – `api::question_is_answered_and_task_resumes` prüfte das alte Verhalten von B1 | **rot** (meine unformatierten Zwischenstände, über die Pfad-Abhängigkeit mitgeprüft) | ok / ok | 56/56 | ok | **94/94** (7,4 min) |
 | Abnahme 1 (finaler Stand) | ok | ok | **500/500** | ok | ok / ok | **56/56** | ok | **94/94** (6,7 min) |
-| Abnahme 2 (finaler Stand, direkt danach) | ABNAHME2_BEFMT | ABNAHME2_BECLIPPY | ABNAHME2_BETEST | ABNAHME2_FEFMT | ABNAHME2_FECLIPPY | ABNAHME2_FETEST | ABNAHME2_TRUNK | ABNAHME2_E2E |
+| Abnahme 2 (finaler Stand, ohne Codeänderung seit Abnahme 1) | ok | ok | **500/500** | ok | ok / ok | **56/56** | ok | **94/94** (5,8 min) |
 
 Backend-Tests je Binary (finaler Stand): app lib **158** (+16), `api` 19, `branches` 9, `cli_contract` 26, `edge_cases` 11, `environments` 8, `failures` 19, `gate` 9, **`intake` 8 (neu)**, `parser_robustness` 6, `plan_steering` 13, `providers` 16, `pull_requests` 9, `tokens` 4, `triggers` 5, queued-api **48** (+6), queued-common 36, queued-runner 90, queuectl 6 = **500** (vor WP08: 470). Frontend **56** (vor WP08: 54). Playwright **94** (vor WP08: 86; neu: 4 System, 2 Desktop, 1 × 2 iPhone; Tour erweitert).
 
-Zwischen Abnahme 1 und 2 wurde nichts geändert. Abnahme 1 wurde einmal nach ~1 min abgebrochen und neu gestartet, weil ich eine fehlende Testprüfung (Token nie im Text der Rückmeldungen) ergänzt habe; gezählt sind nur die beiden vollständigen Läufe danach.
+Zwischen Abnahme 1 und 2 wurde kein Code geändert (nur `WP08-test.md`/`WP08-review.md`; geprüft per `git diff` gegen den Snapshot, von dem Abnahme 1 lief). Ein erster Start von Abnahme 2 wurde extern abgebrochen (Sitzungsunterbrechung); Abnahme 2 wurde danach vollständig neu ausgeführt. Abnahme 1 wurde einmal nach ~1 min abgebrochen und neu gestartet, weil ich eine fehlende Testprüfung (Token nie im Text der Rückmeldungen) ergänzt habe; gezählt sind nur die beiden vollständigen Läufe danach.
 
 Während der Entwicklung rot und behoben (Details `WP08-review.md`): Testerwartung zum Ablehnungstext, `MOCK_SLOW` blockierte den Requeue-Test (Parallelität 1), Summen-Assertion zeitabhängig (ersetzt durch Prüfung je Issue), UI-Selektor „Repository“ nicht exakt (traf auch die Checkbox), **Personen-Bereich klappte zu** (B8, echter Fehler), **Benachrichtigungs-Spam ohne Token** (B7, aus dem E2E-Log).
 
