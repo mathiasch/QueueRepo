@@ -797,6 +797,9 @@ async fn run_inner(
     } else {
         crate::project_state::for_run(st, task).await?
     };
+    // A rules proposal counts only from this task run (a stale file of an
+    // earlier run would come back after the owner rejected it).
+    state_files.push(("knowledge.md".into(), String::new()));
     let mut clear_result = false;
     let mut fell_back = false;
     let out = loop {

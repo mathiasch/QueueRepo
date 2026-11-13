@@ -39,6 +39,9 @@ test("an API token is shown exactly once and can be revoked", async ({ page }) =
   expect((await call()).status()).toBe(200);
   await page.getByTestId("token-row").getByRole("button", { name: "Token Laptop widerrufen" }).click();
   await page.getByRole("alertdialog").getByRole("button", { name: "Widerrufen" }).click();
+  // The row's own button is labelled "Widerrufen" too: wait until it is gone
+  // (the revocation finished), not only for the text (race, seen under load).
+  await expect(page.getByTestId("token-row").getByRole("button", { name: "Token Laptop widerrufen" })).toHaveCount(0);
   await expect(page.getByTestId("token-row")).toContainText("Widerrufen");
   expect((await call()).status()).toBe(401);
   await expectAccessible(page, "revoked token");

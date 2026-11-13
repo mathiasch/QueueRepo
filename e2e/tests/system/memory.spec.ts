@@ -10,7 +10,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { apiProject, apiUser, waitTask } from "../helpers";
 
-const fixture = (n: string) => readFileSync(join(__dirname, "..", "..", "fixtures", n));
+const fixture = (n: string) => readFileSync(join(process.cwd(), "fixtures", n));
 const b64 = (s: string) => Buffer.from(s).toString("base64");
 
 test("attachments: forgery refused, EXIF/GPS removed, provided to the agent, never committed", async ({ request }) => {
@@ -121,6 +121,10 @@ test("OnEmpty dedupe drops the duplicate and explains why", async ({ request }) 
   expect(report[0].reasons[0]).toMatch(/^Duplikat: \d+ % ähnlich zu „Add unit tests for the CSV parser“/);
   const ts: any[] = await (await request.get("/api/tasks")).json();
   expect(ts.filter((t) => t.project_id === pid && t.title === "Add unit tests for CSV parser")).toHaveLength(0);
-  expect(ts.find((t) => t.project_id === pid && t.title === "Document the HTTP API")?.dedupe?.verdict).toBe("accepted");
+  // By id: the list leaves out tasks in the merge queue (status "merging").
+  const created = (await (await request.get(`/api/tasks/${report[1].task_id}`)).json()).task;
+  expect(created.title).toBe("Document the HTTP API");
+  expect(created.dedupe.verdict).toBe("accepted");
+  expect(report[0].task_id ?? null).toBeNull();
   await request.put("/api/settings", { data: { ...s, onempty_enabled: false } });
 });

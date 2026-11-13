@@ -626,6 +626,8 @@ details.block[open] > summary .chev { transform: rotate(90deg); }
   .tab .tab-label { flex: none; }
   .tab .badge { position: absolute; top: 2px; left: calc(50% + 6px); }
   .main { padding: var(--sp-4) max(14px, var(--sar)) calc(max(6px, var(--sab)) + 92px) max(14px, var(--sal)); gap: var(--sp-5); }
+  /* WP09: focus moves and scrollIntoView stop above the tab bar (WCAG 2.4.11). */
+  html { scroll-padding-bottom: calc(max(6px, var(--sab)) + 80px); }
   h1 { font-size: 23px; }
   .toasts { left: max(16px, var(--sal)); right: max(16px, var(--sar)); width: auto; bottom: calc(max(6px, var(--sab)) + 76px); }
   .drawer { width: 100vw; border-left: 0; }

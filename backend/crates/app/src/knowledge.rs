@@ -69,6 +69,19 @@ pub async fn propose_from_agent(
     if current.as_ref().is_some_and(|(_, c)| c.trim() == text) {
         return Ok(None);
     }
+    // The owner already said no to exactly this text.
+    let rejected: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM knowledge_versions WHERE project_id=$1 AND status='rejected' AND content=$2)",
+    )
+    .bind(task.project_id)
+    .bind(&text)
+    .fetch_one(&st.db)
+    .await?;
+    if rejected {
+        return Ok(Some(
+            "Regel-Vorschlag verworfen: genau dieser Text wurde schon abgelehnt".into(),
+        ));
+    }
     let mut tx = st.db.begin().await?;
     // One writer per project at a time (the count below must hold).
     sqlx::query("SELECT id FROM projects WHERE id=$1 FOR UPDATE")

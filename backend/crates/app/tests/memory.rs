@@ -299,6 +299,25 @@ async fn upload_limits_mime_forgery_exif_rights_and_headers(pool: PgPool) {
     }
     let (code, _) = upload(&b, &p, "n10.md", b"# 11\n".to_vec(), "", None).await;
     assert_eq!(code, 400);
+    // The composer finds them again (only the uploader's own drafts).
+    let (_, d) = b
+        .get(&format!("/api/projects/{p}/attachments/drafts"))
+        .await;
+    assert_eq!(d.as_array().unwrap().len(), 10);
+    let (_, d) = a
+        .get(&format!("/api/projects/{p}/attachments/drafts"))
+        .await;
+    assert!(d
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|x| x["id"] != json!(drafts[0])));
+    assert_eq!(
+        v.get(&format!("/api/projects/{p}/attachments/drafts"))
+            .await
+            .0,
+        403
+    );
 
     // Rights: viewers do not upload; drafts are private; strangers see nothing.
     let (code, _) = upload(&v, &p, "x.txt", b"hello".to_vec(), "", None).await;
@@ -534,6 +553,24 @@ async fn agent_rule_proposal_needs_owner_approval(pool: PgPool) {
     let s = seen(&h, &p);
     assert!(s.lines().last().unwrap().contains("MOCKRULE-TWO"), "{s}");
     assert!(!s.contains("MOCKRULE-EDITOR"));
+    // The same text the owner rejected is not proposed again.
+    let t5 = a
+        .task_with(
+            &p,
+            &format!("again MOCK_KNOWLEDGE_B64:{}", b64("- MOCKRULE-EDITOR\n")),
+            json!({"title": "Nochmal"}),
+        )
+        .await;
+    a.wait_status(&t5, &["done"]).await;
+    assert!(rules(&a, &p).await["proposals"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(a
+        .events_of(&t5)
+        .await
+        .iter()
+        .any(|(_, c)| c.contains("schon abgelehnt")));
     // Stale base: refused.
     let (code, _) = a
         .put(
@@ -867,8 +904,16 @@ async fn onempty_dedupe_drops_duplicates_and_explains(pool: PgPool) {
         .to_string()
         .contains("CI-Konfiguration"));
     // Only the two kept proposals became tasks, with their reasons.
-    let created: Vec<&Value> = ts.iter().filter(|t| t["parent_id"] == oe["id"]).collect();
+    // By id from the report: the task list leaves out tasks in the merge
+    // queue ("merging"), and the accepted one may be there right now.
+    let mut created: Vec<Value> = vec![];
+    for r in report {
+        if let Some(id) = r["task_id"].as_str() {
+            created.push(a.task_json(id).await["task"].clone());
+        }
+    }
     assert_eq!(created.len(), 2, "{created:#?}");
+    assert!(created.iter().all(|t| t["parent_id"] == oe["id"]));
     let docs = created
         .iter()
         .find(|t| t["title"] == "Document the HTTP API")
@@ -940,7 +985,9 @@ async fn onempty_model_critic_is_stricter_and_costs_are_recorded(pool: PgPool) {
     );
     assert_eq!(report[1]["verdict"], "accepted");
     assert_eq!(report[1]["critic"], "rules+model");
-    assert!(ts.iter().any(|t| t["title"] == "Fake B"));
+    let b = a.task_json(report[1]["task_id"].as_str().unwrap()).await;
+    assert_eq!(b["task"]["title"], "Fake B");
+    assert!(report[0]["task_id"].is_null(), "dropped: no task");
     assert!(!ts.iter().any(|t| t["title"] == "Fake A"));
     let critic_calls = fake
         .requests()

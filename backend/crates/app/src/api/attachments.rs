@@ -331,6 +331,25 @@ pub async fn remove(
     Ok(Json(json!({"ok": true})))
 }
 
+/// The caller's drafts in a project (the composer shows them again after
+/// a reload, so they are attached to the next task or removed).
+pub async fn drafts(
+    State(st): State<AppState>,
+    AuthUser(u): AuthUser,
+    Path(project_id): Path<Uuid>,
+) -> ApiResult<Json<Vec<AttachmentView>>> {
+    require(&st, project_id, u.id, Role::Editor).await?;
+    let rows: Vec<Row> = sqlx::query_as(&format!(
+        "SELECT {} FROM attachments WHERE task_id IS NULL AND user_id=$1 AND project_id=$2 ORDER BY created_at, id",
+        att::COLUMNS
+    ))
+    .bind(u.id)
+    .bind(project_id)
+    .fetch_all(&st.db)
+    .await?;
+    Ok(Json(rows.iter().map(|r| r.view(true)).collect()))
+}
+
 pub async fn quota(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,

@@ -3,7 +3,7 @@ import { expect, test } from "@playwright/test";
 import { join } from "node:path";
 import { apiProject, expectAccessible, simulateInsets, uiRegister } from "../helpers";
 
-const fixture = (n: string) => join(__dirname, "..", "..", "fixtures", n);
+const fixture = (n: string) => join(process.cwd(), "fixtures", n);
 
 test("photo from the camera input on the iPhone; EXIF removed; rules and state tabs fit", async ({ page }) => {
   const landscape = await simulateInsets(page);

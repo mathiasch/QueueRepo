@@ -140,6 +140,25 @@ pub fn Composer() -> impl IntoView {
         })
     });
     // WP07: templates of the chosen project ("Aus Vorlage").
+    // Drafts belong to one project: show the chosen project's drafts (also
+    // after a reload – they are attached to the next task or removed).
+    Effect::new(move |_| {
+        let Some(pid) = project_id.get() else {
+            attachments.set(vec![]);
+            return;
+        };
+        spawn_local(async move {
+            if let Ok(list) = api::get::<Vec<queued_api::memory::AttachmentView>>(&format!(
+                "/projects/{pid}/attachments/drafts"
+            ))
+            .await
+            {
+                if project_id.get_untracked() == Some(pid) {
+                    attachments.set(list);
+                }
+            }
+        });
+    });
     let templates = RwSignal::new(Vec::<queued_api::triggers::TemplateView>::new());
     let tpl_title = RwSignal::new(None::<String>);
     Effect::new(move |_| {
@@ -445,11 +464,7 @@ pub fn Composer() -> impl IntoView {
                         let v = event_target_value(&ev);
                         set_pref("project", &v);
                         chosen.set(v);
-                        // Drafts belong to the project they were uploaded to.
-                        if !attachments.with_untracked(Vec::is_empty) {
-                            attachments.set(vec![]);
-                            store.announce("Anhänge entfernt: sie gehören zum vorher gewählten Projekt");
-                        }
+
                     }
                 >
                     {move || editable.get().into_iter().map(|(id, name)| view! { <option value=id.to_string()>{name}</option> }).collect_view()}

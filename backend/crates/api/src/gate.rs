@@ -238,12 +238,12 @@ pub struct RepoConfigSupport {
 pub const REPO_CONFIG_SUPPORT: [RepoConfigSupport; 4] = [
     RepoConfigSupport {
         cli: "Claude Code",
-        off: "Nur eigene Einstellungen (--setting-sources user), keine MCP-Server aus .mcp.json (--strict-mcp-config).",
+        off: "Nur eigene Einstellungen (--setting-sources user): keine Projekt-Einstellungen und keine CLAUDE.md/AGENTS.md aus dem Projekt; keine MCP-Server aus .mcp.json (--strict-mcp-config).",
         evidence: "Optionen im installierten Programm 2.1.319 vorhanden; Wirkung nicht mit echtem Modell geprüft.",
     },
     RepoConfigSupport {
         cli: "Gemini CLI",
-        off: "System-Einstellungen mit höchster Priorität: keine Hooks, keine MCP-Server, keine Tool-Befehle, keine .env aus dem Projekt. .gemini/.env lädt Gemini trotzdem (nur nicht gesetzte Variablen).",
+        off: "System-Einstellungen mit höchster Priorität: keine Hooks, keine MCP-Server, keine Tool-Befehle, keine .env und keine GEMINI.md aus dem Projekt. .gemini/.env lädt Gemini trotzdem (nur nicht gesetzte Variablen).",
         evidence: "Aus dem Quelltext von 0.67.0 abgeleitet; nicht ausgeführt.",
     },
     RepoConfigSupport {
@@ -253,7 +253,7 @@ pub const REPO_CONFIG_SUPPORT: [RepoConfigSupport; 4] = [
     },
     RepoConfigSupport {
         cli: "Codex",
-        off: "Codex lädt .codex/config.toml nur in vertrauten Ordnern; Queue vertraut nie. Die Freischaltung wirkt bei Codex nicht.",
+        off: "Codex lädt .codex/config.toml nur in vertrauten Ordnern; Queue vertraut nie (die Freischaltung wirkt dafür nicht). AGENTS.md aus dem Projekt schaltet Queue ab (project_doc_max_bytes=0).",
         evidence: "Aus Texten im Programm 0.167.0 abgeleitet; nicht ausgeführt.",
     },
 ];

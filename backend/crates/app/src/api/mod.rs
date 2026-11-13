@@ -147,6 +147,10 @@ pub fn router(st: AppState) -> Router {
                 queued_api::memory::MAX_ATTACHMENT_BYTES + 64 * 1024,
             )),
         )
+        .route(
+            "/projects/{id}/attachments/drafts",
+            get(attachments::drafts),
+        )
         .route("/attachments/quota", get(attachments::quota))
         .route(
             "/attachments/{id}",

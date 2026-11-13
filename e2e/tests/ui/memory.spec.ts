@@ -3,7 +3,7 @@ import { expect, test } from "@playwright/test";
 import { join } from "node:path";
 import { apiProject, expectAccessible, openTask, uiRegister, waitTask } from "../helpers";
 
-const fixture = (n: string) => join(__dirname, "..", "..", "fixtures", n);
+const fixture = (n: string) => join(process.cwd(), "fixtures", n);
 const b64 = (s: string) => Buffer.from(s).toString("base64");
 
 test("composer attachment reaches the task; drawer lists it", async ({ page }) => {
@@ -19,6 +19,9 @@ test("composer attachment reaches the task; drawer lists it", async ({ page }) =
   await expect(chip).toContainText("screenshot.png");
   await expect(chip).toContainText("Bild");
   await expect(chip.locator("img")).toBeVisible();
+  // Drafts survive a reload (they stay until used, removed or a day old).
+  await page.reload();
+  await expect(chip).toHaveCount(1);
   // A forged file is refused with an understandable message.
   const bad = page.waitForEvent("filechooser");
   await page.getByRole("button", { name: "Datei anhängen" }).click();
