@@ -28,7 +28,7 @@ Testdaten: `e2e/fixtures/iphone-gps.jpg` (64×48, EXIF Orientation 6, Make/Model
 - Integration/E2E zum Leerlauf waren im Volllauf rot (Bericht wird nach „erledigt“ geschrieben) – Tests warten jetzt auf den Bericht.
 - iPhone-Spec war rot (Speichern-Knopf unter der Tab-Bar) – Produktfehler, mit `scroll-padding-bottom` behoben (Review B6).
 - Bestehender WP07-Test `automation.spec.ts` war im ersten Volllauf rot (Race, Review B7), 4× isoliert wiederholt grün, danach robust gemacht.
-- Abnahmelauf 2 war rot: System-Spec „OnEmpty dedupe“ fand den eingeplanten Auftrag nicht in `GET /api/tasks` (Status `merging` fehlt dort, Review B9). Testfehler; Integration und System holen die Aufträge jetzt per ID. Danach zwei neue, vollständige Abnahmeläufe (3 und 4) auf dem Endstand.
+- Abnahmelauf 2 war rot: System-Spec „OnEmpty dedupe“ fand den eingeplanten Auftrag nicht in `GET /api/tasks` (Status `merging` fehlt dort, Review B9). Testfehler; Integration und System holen die Aufträge jetzt per ID. Abnahmelauf 3 war rot durch einen racy WP06-Test (Review B10, Testfehler, behoben). Danach zwei neue, vollständige Abnahmeläufe (5 und 6) auf dem Endstand.
 
 ## 3. Integrationstests `tests/memory.rs`
 
