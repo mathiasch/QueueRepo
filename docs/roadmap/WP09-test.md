@@ -28,7 +28,7 @@ Testdaten: `e2e/fixtures/iphone-gps.jpg` (64×48, EXIF Orientation 6, Make/Model
 - Integration/E2E zum Leerlauf waren im Volllauf rot (Bericht wird nach „erledigt“ geschrieben) – Tests warten jetzt auf den Bericht.
 - iPhone-Spec war rot (Speichern-Knopf unter der Tab-Bar) – Produktfehler, mit `scroll-padding-bottom` behoben (Review B6).
 - Bestehender WP07-Test `automation.spec.ts` war im ersten Volllauf rot (Race, Review B7), 4× isoliert wiederholt grün, danach robust gemacht.
-- Abnahmelauf 2 war rot: System-Spec „OnEmpty dedupe“ fand den eingeplanten Auftrag nicht in `GET /api/tasks` (Status `merging` fehlt dort, Review B9). Testfehler; Integration und System holen die Aufträge jetzt per ID. Abnahmelauf 3 war rot durch einen racy WP06-Test (Review B10, Testfehler, behoben). Danach zwei neue, vollständige Abnahmeläufe (5 und 6) auf dem Endstand.
+- Abnahmelauf 2 war rot: System-Spec „OnEmpty dedupe“ fand den eingeplanten Auftrag nicht in `GET /api/tasks` (Status `merging` fehlt dort, Review B9). Testfehler; Integration und System holen die Aufträge jetzt per ID. Abnahmelauf 3 war rot durch einen racy WP06-Test (Review B10, Testfehler, behoben). Lauf 5 war grün, Lauf 6 wurde durch einen Container-Stopp abgebrochen. Gewertet werden die beiden frischen, vollständigen Läufe **7 und 8** direkt hintereinander auf dem Endstand.
 
 ## 3. Integrationstests `tests/memory.rs`
 
@@ -46,14 +46,16 @@ Testdaten: `e2e/fixtures/iphone-gps.jpg` (64×48, EXIF Orientation 6, Make/Model
 
 Skript `accept.sh` (Scratchpad): Backend `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, `cargo test --workspace`; Frontend `cargo fmt --check`, `cargo clippy --target wasm32-unknown-unknown --all-targets -D warnings`, `cargo clippy --all-targets -D warnings`, `cargo test`, `trunk build --release`; danach `frontend/target` gelöscht; Playwright alle Projekte (system, desktop, iphone, iphone-landscape inkl. axe-Tour). Stoppt beim ersten Fehler.
 
-| Schritt | Lauf 1 | Lauf 2 |
+| Schritt | Lauf 7 | Lauf 8 |
 |---|---|---|
-| Backend fmt / clippy | grün / grün | siehe unten |
-| Backend Tests | **535 bestanden, 0 fehlgeschlagen**: app lib 171, api 49, common 44, runner 96, queuectl 6, Integration: api 19, branches 9, cli_contract 26, edge_cases 11, environments 8, failures 19, gate 9, intake 8, **memory 7**, parser_robustness 6, plan_steering 13, providers 16, pull_requests 9, tokens 4, triggers 5 | |
-| Frontend fmt / clippy wasm / clippy nativ | grün / grün / grün | |
-| Frontend Tests | **60 bestanden** (davon 4 neu in `logic::memory`) | |
-| `trunk build --release` | ok | |
-| Playwright | **103 bestanden** (7,8 min; neu: system 4, desktop 3, iphone 1, iphone-landscape 1) | |
+| Backend fmt / clippy `-D warnings` | grün / grün | grün / grün |
+| Backend Tests | **535 bestanden, 0 fehlgeschlagen**: app lib 171, api 49, common 44, runner 96, queuectl 6, Integration: api 19, branches 9, cli_contract 26, edge_cases 11, environments 8, failures 19, gate 9, intake 8, **memory 7**, parser_robustness 6, plan_steering 13, providers 16, pull_requests 9, tokens 4, triggers 5 | **535 bestanden, 0 fehlgeschlagen** |
+| Frontend fmt / clippy wasm32 / clippy nativ | grün / grün / grün | grün / grün / grün |
+| Frontend Tests | **60 bestanden** (davon 4 neu in `logic::memory`) | **60 bestanden** |
+| `trunk build --release` | ok | ok |
+| Playwright (system, desktop, iphone, iphone-landscape, inkl. axe-Tour) | **103 bestanden** (7,8 min) | **103 bestanden** (7,3 min) |
+
+Neu darunter: system 4, desktop 3, iphone 1, iphone-landscape 1 (Logs: `accept-7.log`, `accept-8.log` im Scratchpad).
 
 Neue Tests insgesamt: common 8, runner 6, api 1, app lib 14 (+ Erweiterung `repo_config_is_restricted_per_cli`), Integration 7 (+ Kompatibilitätstests in `queued-api` um die neuen Felder ergänzt), Frontend 4, Playwright 9 Ausführungen (+ Tour um 2 Ansichten × 2 Farbschemata × 3 Geräte).
 
