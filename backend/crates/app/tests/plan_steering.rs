@@ -460,6 +460,16 @@ async fn messages_wait_can_be_withdrawn_and_reach_the_next_start(pool: PgPool) {
     // At most 20 waiting messages per task.
     let q = a.task(&p, "MOCK_SLOW waits").await;
     a.wait_status(&q, &["running"]).await;
+    // "running" starts at the claim; messages sent before the prompt is
+    // built would be delivered at the start (race under load): wait until
+    // the agent itself works.
+    wait_for("agent works", || async {
+        a.events_of(&q)
+            .await
+            .iter()
+            .any(|(_, c)| c.contains("working slowly"))
+    })
+    .await;
     for i in 0..20 {
         assert_eq!(send(&a, &q, &format!("m{i}"), false).await.0, 200);
     }
