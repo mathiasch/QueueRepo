@@ -294,7 +294,8 @@ pub async fn cancel(
     if t.status == status::HELD {
         // Held changes are discarded with the task (they never reach the branch).
         if t.gate_parsed().is_some_and(|g| g.has_diff) {
-            st.runner
+            st.runner(t.project_id)
+                .await
                 .discard_held(super::gate::held_ws(&t), t.id)
                 .await
                 .map_err(runner_err)?;
@@ -416,6 +417,15 @@ pub async fn approve(
 ) -> ApiResult<Json<Value>> {
     own_task(&st, id, u.id).await?;
     set_status(&st, id, &[status::PENDING_APPROVAL], status::QUEUED).await?;
+    crate::audit::log(
+        &st,
+        &u,
+        "approval.task_approved",
+        ("task", &id.to_string()),
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -516,7 +526,12 @@ pub async fn diff(
             changed: None,
         }));
     };
-    let d = match st.runner.diff(t.project_id, a, b, 2_000_000).await {
+    let d = match st
+        .runner(t.project_id)
+        .await
+        .diff(t.project_id, a, b, 2_000_000)
+        .await
+    {
         Ok(d) => d,
         // The branch of a long-finished task may be gone.
         Err(e) if crate::runner_client::runner_status(&e) == Some(422) => {
@@ -563,15 +578,20 @@ pub async fn revert(
             return Err(AppError::conflict("a task is running in this project"));
         }
     }
-    let sha = st.runner.revert(t.project_id, a, b).await.map_err(|e| {
-        tracing::info!("revert of {id} failed: {e:#}");
-        match crate::runner_client::runner_status(&e) {
-            Some(409) => AppError::conflict(
-                "Rückgängig nicht möglich: spätere Aufträge haben dieselben Stellen geändert",
-            ),
-            _ => runner_err(e),
-        }
-    })?;
+    let sha = st
+        .runner(t.project_id)
+        .await
+        .revert(t.project_id, a, b)
+        .await
+        .map_err(|e| {
+            tracing::info!("revert of {id} failed: {e:#}");
+            match crate::runner_client::runner_status(&e) {
+                Some(409) => AppError::conflict(
+                    "Rückgängig nicht möglich: spätere Aufträge haben dieselben Stellen geändert",
+                ),
+                _ => runner_err(e),
+            }
+        })?;
     // WP09: a reverted task is a negative example for OnEmpty proposals.
     sqlx::query("UPDATE tasks SET reverted_at=now() WHERE id=$1")
         .bind(t.id)

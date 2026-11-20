@@ -17,6 +17,7 @@ pub mod memory;
 pub mod pr;
 pub mod progress;
 pub mod protection;
+pub mod security;
 pub mod shortcuts;
 pub mod task;
 pub mod triggers;

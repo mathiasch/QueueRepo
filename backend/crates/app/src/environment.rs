@@ -209,21 +209,22 @@ fn policy(p: &NetworkPolicy, always: Vec<String>) -> EgressPolicy {
 /// engine must not keep showing an outdated protection status.
 const SANDBOX_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// What the runner enforces; cached for [`SANDBOX_TTL`].
-pub async fn sandbox(st: &AppState) -> SandboxInfo {
-    if let Some((at, s)) = st.sandbox.read().ok().and_then(|g| g.clone()) {
+/// What the runner of `project` enforces; cached per runner for [`SANDBOX_TTL`].
+pub async fn sandbox(st: &AppState, project: uuid::Uuid) -> SandboxInfo {
+    let rid = st.runner_id(project).await.unwrap_or(crate::fleet::BUILTIN);
+    if let Some((at, s)) = st.sandbox.read().ok().and_then(|g| g.get(&rid).cloned()) {
         if at.elapsed() < SANDBOX_TTL {
             return s;
         }
     }
-    match st.runner.info().await {
+    match st.runner(project).await.info().await {
         Ok(i) => {
             let s = SandboxInfo {
                 engine: i.engine,
                 egress_enforced: i.egress_enforced,
             };
             if let Ok(mut g) = st.sandbox.write() {
-                *g = Some((std::time::Instant::now(), s.clone()));
+                g.insert(rid, (std::time::Instant::now(), s.clone()));
             }
             s
         }

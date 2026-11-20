@@ -18,7 +18,9 @@ COPY backend/ ./
 RUN cargo build --release --bin queued
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
+# libssl3: WebAuthn (webauthn-rs, WP11). No pg_dump here: bookworm ships 15,
+# the database is 16 – run `queued backup` where a matching client exists (README).
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --create-home queued
 COPY --from=api /src/target/release/queued /usr/local/bin/queued
 COPY --from=web /src/frontend/dist /srv/web

@@ -25,6 +25,9 @@ jobs:
         with: { components: "rustfmt, clippy" }
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: backend }
+      # WP11: pg_dump/pg_restore for the backup/restore round trip (same major
+      # version as the service: Ubuntu 24.04 ships 16), OpenSSL for webauthn-rs.
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client libssl-dev pkg-config
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace

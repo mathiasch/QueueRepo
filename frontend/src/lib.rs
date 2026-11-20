@@ -6,6 +6,7 @@ pub mod pages;
 pub mod store;
 pub mod theme;
 pub mod ui;
+pub mod webauthn;
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -76,6 +77,8 @@ fn App() -> impl IntoView {
         }
         .into_any(),
         Session::LoggedOut(meta) => view! { <pages::login::Login meta=meta on_login=on_login/> }.into_any(),
+        // WP11: the MFA policy requires a factor first.
+        Session::LoggedIn(_, user) if user.mfa_setup_required => view! { <pages::security::MfaSetupGate on_done=on_login/> }.into_any(),
         Session::LoggedIn(meta, user) => view! { <pages::shell::Shell meta=meta user=user/> }.into_any(),
     }
     }

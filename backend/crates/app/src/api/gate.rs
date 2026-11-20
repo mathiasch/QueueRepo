@@ -96,7 +96,8 @@ pub async fn approve(
             } else {
                 "agent-config"
             };
-            st.runner
+            st.runner(t.project_id)
+                .await
                 .baseline_approve(t.project_id, name, &head)
                 .await
                 .map_err(runner_err)?;
@@ -176,6 +177,15 @@ pub async fn approve(
     queue::event(&st, &t, "gate", &format!("{what} (von {who})")).await;
     queue::emit_task(&st, id).await;
     st.wake.notify_one();
+    crate::audit::log(
+        &st,
+        &u,
+        "approval.gate_approved",
+        ("task", &id.to_string()),
+        Some(t.project_id),
+        serde_json::json!({"stage": format!("{:?}", g.stage)}),
+    )
+    .await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -217,7 +227,8 @@ pub async fn reject(
         return Ok(Json(json!({"ok": true})));
     }
     if g.stage == GateStage::Changes && g.has_diff {
-        st.runner
+        st.runner(t.project_id)
+            .await
             .discard_held(held_ws(&t), t.id)
             .await
             .map_err(runner_err)?;
@@ -248,6 +259,15 @@ pub async fn reject(
     // The working tree goes; the branch stays for a while (diff, retry).
     crate::runner::merge::cleanup_task(&st, t.project_id, t.id, false).await;
     st.wake.notify_one();
+    crate::audit::log(
+        &st,
+        &u,
+        "approval.gate_rejected",
+        ("task", &id.to_string()),
+        Some(t.project_id),
+        serde_json::json!({}),
+    )
+    .await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -280,7 +300,8 @@ pub async fn diff(
         }));
     }
     let d = st
-        .runner
+        .runner(t.project_id)
+        .await
         .held_diff(held_ws(&t), t.id)
         .await
         .map_err(runner_err)?;

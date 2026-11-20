@@ -30,13 +30,15 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
 send_wrapper = "0.6"
+# WP11: QR code of the authenticator-app setup (pure Rust, rendered as SVG path).
+qrcode = { version = "=0.14.1", default-features = false }
 web-sys = { version = "0.3", features = [
   "Blob", "Document", "DomTokenList", "Element", "Event", "EventSource", "EventTarget", "File", "FileList",
   "HtmlDocument", "HtmlDetailsElement", "HtmlElement", "HtmlInputElement", "HtmlTextAreaElement", "HtmlSelectElement", "KeyboardEvent",
   "Location", "MediaQueryList", "MessageEvent", "Navigator", "Notification", "NotificationPermission",
   "PushManager", "PushSubscription", "PushSubscriptionOptionsInit", "ServiceWorkerContainer",
   "ServiceWorkerRegistration", "Storage", "Url", "UrlSearchParams", "Window", "History", "ScrollIntoViewOptions",
-  "ScrollBehavior", "ScrollLogicalPosition", "FocusOptions", "NodeList", "Clipboard",
+  "ScrollBehavior", "ScrollLogicalPosition", "FocusOptions", "NodeList", "Clipboard", "CredentialsContainer", "CredentialCreationOptions", "CredentialRequestOptions",
 ] }
 
 [profile.release]

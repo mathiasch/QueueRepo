@@ -176,7 +176,7 @@ pub(crate) async fn check_changes(
         watch: agent_config_paths(project, &task.provider),
     };
     let ws = crate::runner_client::task_ws(task.id);
-    let res = st.runner.inspect(&ws, &req).await?;
+    let res = st.runner(task.project_id).await.inspect(&ws, &req).await?;
     let mut findings = res.findings;
     findings.extend(log_findings.iter().cloned());
     if findings.is_empty() {
@@ -193,7 +193,10 @@ pub(crate) async fn check_changes(
     }
     // Park everything the run changed (also commits the agent made itself)
     // outside the branch; nothing reaches verify, review or a push.
-    st.runner.hold(&ws, task.id, &pending.before).await?;
+    st.runner(task.project_id)
+        .await
+        .hold(&ws, task.id, &pending.before)
+        .await?;
     hold(
         st,
         task,
@@ -220,7 +223,8 @@ pub(crate) async fn commit(
         set_snapshot_after(f.st, f.task.id, &out.sha).await?;
         return Ok(Some(out.sha));
     }
-    f.st.runner
+    f.st.runner(f.task.project_id)
+        .await
         .hold(
             crate::runner_client::task_ws(f.task.id),
             f.task.id,
@@ -280,7 +284,8 @@ pub(crate) async fn check_agent_config(
         return Ok(false);
     }
     let res = st
-        .runner
+        .runner(project.id)
+        .await
         .baseline_check(
             project.id,
             &cgate::BaselineCheck {
@@ -375,7 +380,8 @@ pub(crate) async fn check_setup(
     usage: &Usage,
 ) -> Result<bool, RunError> {
     let res = st
-        .runner
+        .runner(project.id)
+        .await
         .baseline_check(
             project.id,
             &cgate::BaselineCheck {
@@ -516,7 +522,18 @@ pub(crate) async fn push_gated(
         scan_base: None,
         expect: None,
     };
-    let p = st.runner.push(project.id, &req).await?;
+    let p = st.runner(project.id).await.push(project.id, &req).await?;
+    if p.held.is_empty() {
+        crate::audit::system(
+            st,
+            if p.ok { "git.push" } else { "git.push_failed" },
+            "task",
+            &task.id.to_string(),
+            Some(project.id),
+            serde_json::json!({"auto": true, "approved": approved, "user": task.user_id}),
+        )
+        .await;
+    }
     if !p.held.is_empty() {
         hold(
             st,
@@ -841,7 +858,8 @@ pub(crate) async fn resume(f: &Flow<'_>, g: TaskGate, usage: &mut Usage) -> Resu
             // there from the shared workspace for holds from before WP04).
             let before = prepare_workspace(st, task, project, f.remote.clone()).await?;
             let out = st
-                .runner
+                .runner(task.project_id)
+                .await
                 .release(
                     crate::runner_client::task_ws(task.id),
                     &cgate::ReleaseRequest {
@@ -889,7 +907,8 @@ pub(crate) async fn resume(f: &Flow<'_>, g: TaskGate, usage: &mut Usage) -> Resu
                 .iter()
                 .any(|f| f.kind == FindingKind::AgentConfig)
             {
-                st.runner
+                st.runner(project.id)
+                    .await
                     .baseline_approve(project.id, "agent-config", &out.sha)
                     .await?;
             }

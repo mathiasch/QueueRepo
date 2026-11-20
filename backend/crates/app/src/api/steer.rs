@@ -133,7 +133,17 @@ pub async fn plan_approve(
     Json(a): Json<PlanApprove>,
 ) -> ApiResult<Json<Value>> {
     let (t, _) = steerable(&st, id, u.id).await?;
-    approve_plan(&st, &t, u.id, a.plan).await
+    let r = approve_plan(&st, &t, u.id, a.plan).await?;
+    crate::audit::log(
+        &st,
+        &u,
+        "approval.plan_approved",
+        ("task", &id.to_string()),
+        Some(t.project_id),
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(r)
 }
 
 /// `POST /api/tasks/{id}/plan/revise`.
@@ -160,7 +170,17 @@ pub async fn plan_reject(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let (t, _) = steerable(&st, id, u.id).await?;
-    reject_plan(&st, &t, u.id).await
+    let r = reject_plan(&st, &t, u.id).await?;
+    crate::audit::log(
+        &st,
+        &u,
+        "approval.plan_rejected",
+        ("task", &id.to_string()),
+        Some(t.project_id),
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(r)
 }
 
 // ---------------------------------------------------------------------------

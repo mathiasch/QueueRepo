@@ -6,7 +6,9 @@ use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
 use queued_common::{gate, *};
 use serde::{de::DeserializeOwned, Serialize};
-use tokio::sync::mpsc;
+use std::{collections::HashSet, sync::Arc};
+
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 /// Runner workspace id of a task's own working tree (WP04).
@@ -20,6 +22,32 @@ pub struct RunnerClient {
     token: String,
     http: reqwest::Client,
     stream: reqwest::Client,
+    /// WP11: why this client cannot be used (runner revoked, offline,
+    /// project unknown); every call fails with this text.
+    fault: Option<Arc<str>>,
+    /// WP11: lease of runs started through this client (`None` = no lease).
+    lease_secs: Option<u64>,
+    /// WP11: names of the runs streaming from this runner right now (sent
+    /// with every heartbeat to renew their leases).
+    runs: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// WP11: `true` while the fleet monitor considers the runner lost; open
+    /// exec streams end at once (instead of hanging on a dead host).
+    lost: Arc<watch::Sender<bool>>,
+}
+
+/// Removes a run name from the heartbeat set when its stream ends.
+struct RunGuard {
+    runs: Arc<std::sync::Mutex<HashSet<String>>>,
+    name: String,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        self.runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.name);
+    }
 }
 
 /// Error returned by the runner, with its HTTP status.
@@ -49,7 +77,164 @@ impl RunnerClient {
                 .connect_timeout(Duration::from_secs(10))
                 .build()
                 .expect("http client"),
+            fault: None,
+            lease_secs: None,
+            runs: Default::default(),
+            lost: Arc::new(watch::channel(false).0),
         }
+    }
+
+    /// WP11: a client whose every call fails with `why`.
+    pub fn faulty(why: &str) -> Self {
+        let mut c = Self::new("http://invalid.invalid", "-");
+        c.fault = Some(why.into());
+        c
+    }
+
+    /// WP11: runs started through this client carry a lease.
+    pub fn with_lease(mut self, secs: u64) -> Self {
+        self.lease_secs = Some(secs);
+        self
+    }
+
+    /// WP11: the same runner under a new address/token; open runs, the
+    /// heartbeat set and the lost signal are kept.
+    pub fn renewed(&self, base: &str, token: &str) -> Self {
+        let mut c = Self::new(base, token);
+        c.lease_secs = self.lease_secs;
+        c.runs = self.runs.clone();
+        c.lost = self.lost.clone();
+        c
+    }
+
+    pub fn fault(&self) -> Option<&str> {
+        self.fault.as_deref()
+    }
+
+    /// WP11: marks the runner lost (open streams end) or back.
+    pub fn set_lost(&self, lost: bool) {
+        self.lost.send_if_modified(|v| {
+            let changed = *v != lost;
+            *v = lost;
+            changed
+        });
+    }
+
+    pub fn is_lost(&self) -> bool {
+        *self.lost.borrow()
+    }
+
+    /// Runs streaming from this runner right now.
+    pub fn active_runs(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The HTTP client, unless the runner cannot be used (fault) or the
+    /// fleet monitor declared it lost (fail fast instead of a timeout).
+    fn h(&self) -> Result<&reqwest::Client> {
+        match &self.fault {
+            Some(f) => Err(anyhow!("{f}")),
+            None if self.is_lost() => Err(anyhow!("runner unreachable (no heartbeat)")),
+            None => Ok(&self.http),
+        }
+    }
+
+    /// Sends a request; ends with an error as soon as the runner is
+    /// declared lost (a hung host never answers, not even with a reset).
+    async fn send(&self, rb: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let mut lost = self.lost.subscribe();
+        if *lost.borrow_and_update() {
+            return Err(anyhow!("runner unreachable (no heartbeat)"));
+        }
+        let gone = async {
+            while lost.changed().await.is_ok() {
+                if *lost.borrow_and_update() {
+                    return;
+                }
+            }
+            futures::future::pending::<()>().await
+        };
+        tokio::select! {
+            r = rb.send() => Ok(r.context("runner unreachable")?),
+            _ = gone => Err(anyhow!("runner unreachable (no heartbeat)")),
+        }
+    }
+
+    /// WP11: renews the leases of the open runs; the runner's state.
+    pub async fn heartbeat(&self, lease_secs: u64, timeout: Duration) -> Result<HeartbeatResponse> {
+        if let Some(f) = &self.fault {
+            return Err(anyhow!("{f}"));
+        }
+        let r = self
+            .http
+            .post(format!("{}/heartbeat", self.base))
+            .bearer_auth(&self.token)
+            .timeout(timeout)
+            .json(&HeartbeatRequest {
+                lease_secs,
+                runs: self.active_runs(),
+            })
+            .send()
+            .await
+            .context("runner unreachable")?;
+        Ok(Self::check(r).await?.json().await?)
+    }
+
+    /// WP11: workspace ids on the runner.
+    pub async fn workspaces(&self) -> Result<Vec<String>> {
+        Ok(self
+            .get::<WorkspaceList>(format!("{}/workspaces", self.base))
+            .await?
+            .workspaces)
+    }
+
+    /// WP11: `git bundle` of a workspace as a byte stream plus its HEAD ref.
+    pub async fn bundle(&self, ws: impl std::fmt::Display) -> Result<(String, reqwest::Response)> {
+        self.h()?;
+        let r = self
+            .stream
+            .get(self.url(ws, "/bundle"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("runner unreachable")?;
+        let r = Self::check(r).await?;
+        let head = r
+            .headers()
+            .get(BUNDLE_HEAD_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        Ok((head, r))
+    }
+
+    /// WP11: creates a workspace from a bundle (must not exist yet).
+    pub async fn restore(
+        &self,
+        ws: impl std::fmt::Display,
+        head: &str,
+        body: reqwest::Body,
+    ) -> Result<String> {
+        self.h()?;
+        let r = self
+            .stream
+            .post(self.url(ws, "/restore"))
+            .bearer_auth(&self.token)
+            .header(BUNDLE_HEAD_HEADER, head)
+            .timeout(Duration::from_secs(3600))
+            .body(body)
+            .send()
+            .await
+            .context("runner unreachable")?;
+        Ok(Self::check(r).await?.json::<Sha>().await?.sha)
     }
 
     fn url(&self, ws: impl std::fmt::Display, path: &str) -> String {
@@ -71,11 +256,7 @@ impl RunnerClient {
 
     async fn post<B: Serialize, T: DeserializeOwned>(&self, url: String, body: &B) -> Result<T> {
         let r = self
-            .http
-            .post(url)
-            .bearer_auth(&self.token)
-            .json(body)
-            .send()
+            .send(self.h()?.post(url).bearer_auth(&self.token).json(body))
             .await
             .context("runner unreachable")?;
         Ok(Self::check(r).await?.json().await?)
@@ -83,10 +264,7 @@ impl RunnerClient {
 
     async fn get<T: DeserializeOwned>(&self, url: String) -> Result<T> {
         let r = self
-            .http
-            .get(url)
-            .bearer_auth(&self.token)
-            .send()
+            .send(self.h()?.get(url).bearer_auth(&self.token))
             .await
             .context("runner unreachable")?;
         Ok(Self::check(r).await?.json().await?)
@@ -98,10 +276,7 @@ impl RunnerClient {
 
     pub async fn delete(&self, ws: impl std::fmt::Display) -> Result<()> {
         let r = self
-            .http
-            .delete(self.url(ws, ""))
-            .bearer_auth(&self.token)
-            .send()
+            .send(self.h()?.delete(self.url(ws, "")).bearer_auth(&self.token))
             .await?;
         Self::check(r).await?;
         Ok(())
@@ -182,10 +357,11 @@ impl RunnerClient {
 
     pub async fn discard_held(&self, ws: impl std::fmt::Display, task: Uuid) -> Result<()> {
         let r = self
-            .http
-            .delete(self.url(ws, &format!("/held/{}", task.simple())))
-            .bearer_auth(&self.token)
-            .send()
+            .send(
+                self.h()?
+                    .delete(self.url(ws, &format!("/held/{}", task.simple())))
+                    .bearer_auth(&self.token),
+            )
             .await
             .context("runner unreachable")?;
         Self::check(r).await?;
@@ -305,10 +481,7 @@ impl RunnerClient {
             url.push_str(&format!("?branch={b}"));
         }
         let r = self
-            .http
-            .delete(url)
-            .bearer_auth(&self.token)
-            .send()
+            .send(self.h()?.delete(url).bearer_auth(&self.token))
             .await
             .context("runner unreachable")?;
         Self::check(r).await?;
@@ -323,10 +496,11 @@ impl RunnerClient {
     /// Drops the dependency caches of a project.
     pub async fn clear_cache(&self, ws: impl std::fmt::Display) -> Result<()> {
         let r = self
-            .http
-            .delete(self.url(ws, "/cache"))
-            .bearer_auth(&self.token)
-            .send()
+            .send(
+                self.h()?
+                    .delete(self.url(ws, "/cache"))
+                    .bearer_auth(&self.token),
+            )
             .await
             .context("runner unreachable")?;
         Self::check(r).await?;
@@ -349,10 +523,7 @@ impl RunnerClient {
 
     pub async fn zip(&self, ws: impl std::fmt::Display) -> Result<Vec<u8>> {
         let r = self
-            .http
-            .get(self.url(ws, "/zip"))
-            .bearer_auth(&self.token)
-            .send()
+            .send(self.h()?.get(self.url(ws, "/zip")).bearer_auth(&self.token))
             .await?;
         Ok(Self::check(r).await?.bytes().await?.to_vec())
     }
@@ -365,12 +536,13 @@ impl RunnerClient {
         author_email: &str,
     ) -> Result<ImportResult> {
         let r = self
-            .http
-            .post(self.url(ws, "/import"))
-            .query(&[("author_name", author_name), ("author_email", author_email)])
-            .bearer_auth(&self.token)
-            .body(data)
-            .send()
+            .send(
+                self.h()?
+                    .post(self.url(ws, "/import"))
+                    .query(&[("author_name", author_name), ("author_email", author_email)])
+                    .bearer_auth(&self.token)
+                    .body(data),
+            )
             .await?;
         Ok(Self::check(r).await?.json().await?)
     }
@@ -411,11 +583,12 @@ impl RunnerClient {
                 .collect(),
         };
         let r = self
-            .http
-            .put(self.url(ws, "/attachments"))
-            .bearer_auth(&self.token)
-            .json(&req)
-            .send()
+            .send(
+                self.h()?
+                    .put(self.url(ws, "/attachments"))
+                    .bearer_auth(&self.token)
+                    .json(&req),
+            )
             .await
             .context("runner unreachable")?;
         Self::check(r).await?;
@@ -441,44 +614,78 @@ impl RunnerClient {
     }
 
     /// Streams frames into `tx` until the run ends. Returns the final frame.
+    /// WP11: the run carries this client's lease and ends with an error as
+    /// soon as the fleet monitor declares the runner lost.
     pub async fn exec(&self, req: &ExecRequest, tx: mpsc::Sender<ExecFrame>) -> Result<ExecFrame> {
-        let r = self
-            .stream
-            .post(format!("{}/exec", self.base))
-            .bearer_auth(&self.token)
-            // Runtime + SIGINT grace (runner side, ≤ 60 s) + slack for setup/cleanup.
-            .timeout(Duration::from_secs(req.timeout_secs + 180))
-            .json(req)
-            .send()
-            .await
-            .context("runner unreachable")?;
-        let r = Self::check(r).await?;
-        let mut body = r.bytes_stream();
-        let mut buf: Vec<u8> = vec![];
-        let mut last: Option<ExecFrame> = None;
-        while let Some(chunk) = body.next().await {
-            buf.extend_from_slice(&chunk.context("runner stream interrupted")?);
-            while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
-                let line: Vec<u8> = buf.drain(..=pos).collect();
-                let frame: ExecFrame = serde_json::from_slice(&line[..line.len() - 1])
-                    .context("bad frame from runner")?;
-                match frame {
-                    ExecFrame::Exit { .. } | ExecFrame::Fail { .. } => last = Some(frame),
-                    f => {
-                        let _ = tx.send(f).await;
+        self.h()?;
+        let mut lost = self.lost.subscribe();
+        if *lost.borrow_and_update() {
+            return Err(anyhow!("runner unreachable (no heartbeat)"));
+        }
+        let mut req = req.clone();
+        req.lease_secs = self.lease_secs;
+        self.runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(req.name.clone());
+        let _guard = RunGuard {
+            runs: self.runs.clone(),
+            name: req.name.clone(),
+        };
+        let run = async {
+            let r = self
+                .stream
+                .post(format!("{}/exec", self.base))
+                .bearer_auth(&self.token)
+                // Runtime + SIGINT grace (runner side, ≤ 60 s) + slack for setup/cleanup.
+                .timeout(Duration::from_secs(req.timeout_secs + 180))
+                .json(&req)
+                .send()
+                .await
+                .context("runner unreachable")?;
+            let r = Self::check(r).await?;
+            let mut body = r.bytes_stream();
+            let mut buf: Vec<u8> = vec![];
+            let mut last: Option<ExecFrame> = None;
+            while let Some(chunk) = body.next().await {
+                buf.extend_from_slice(&chunk.context("runner stream interrupted")?);
+                while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=pos).collect();
+                    let frame: ExecFrame = serde_json::from_slice(&line[..line.len() - 1])
+                        .context("bad frame from runner")?;
+                    match frame {
+                        ExecFrame::Exit { .. } | ExecFrame::Fail { .. } => last = Some(frame),
+                        f => {
+                            let _ = tx.send(f).await;
+                        }
                     }
                 }
             }
+            last.ok_or_else(|| anyhow!("runner stream ended without exit frame"))
+        };
+        let gone = async {
+            while lost.changed().await.is_ok() {
+                if *lost.borrow_and_update() {
+                    return;
+                }
+            }
+            futures::future::pending::<()>().await
+        };
+        tokio::select! {
+            r = run => r,
+            _ = gone => Err(anyhow!(
+                "runner unreachable (no heartbeat): the run was abandoned; the runner stops it when its lease expires"
+            )),
         }
-        last.ok_or_else(|| anyhow!("runner stream ended without exit frame"))
     }
 
     pub async fn cancel(&self, name: &str) -> Result<()> {
         let r = self
-            .http
-            .post(format!("{}/exec/{name}/cancel", self.base))
-            .bearer_auth(&self.token)
-            .send()
+            .send(
+                self.h()?
+                    .post(format!("{}/exec/{name}/cancel", self.base))
+                    .bearer_auth(&self.token),
+            )
             .await?;
         Self::check(r).await?;
         Ok(())

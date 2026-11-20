@@ -290,7 +290,8 @@ pub(super) async fn next_round(
         None => {
             // No resume: a new run with everything plus what the last run did.
             let file = st
-                .runner
+                .runner(task.project_id)
+                .await
                 .queue_file(crate::runner_client::task_ws(task.id), "result.json")
                 .await
                 .ok()

@@ -1561,6 +1561,100 @@ impl Repo {
         }
         Ok(())
     }
+
+    /// WP11 (backup, moving a project to another runner): `git bundle
+    /// create --all` into `out` (every ref: branches, held changes,
+    /// baselines, quarantine). Returns the symbolic `HEAD` (`refs/heads/…`,
+    /// empty when detached), which a bundle does not record. Uncommitted
+    /// changes of the working tree are not part of a bundle.
+    pub async fn bundle(&self, out: &Path) -> Result<String> {
+        let head = self
+            .git(&["symbolic-ref", "-q", "HEAD"])
+            .await
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let out_s = out.to_string_lossy().to_string();
+        self.git(&["bundle", "create", "--quiet", &out_s, "--all"])
+            .await
+            .context("git bundle create")?;
+        Ok(head)
+    }
+
+    /// WP11: creates this (not yet existing) workspace from a bundle made by
+    /// [`Repo::bundle`]: all refs as they were, `HEAD` on `head` (or detached
+    /// at the bundle's HEAD when `head` is empty), working tree checked out.
+    /// Returns the HEAD commit.
+    pub async fn restore_bundle(&self, bundle: &Path, head: &str) -> Result<String> {
+        if self.exists() || self.dir.exists() {
+            bail!("workspace already exists");
+        }
+        if !head.is_empty() && !valid_head_ref(head) {
+            bail!("invalid HEAD ref");
+        }
+        tokio::fs::create_dir_all(&self.dir).await?;
+        let res = self.restore_inner(bundle, head).await;
+        if res.is_err() {
+            let _ = tokio::fs::remove_dir_all(&self.dir).await;
+        }
+        res
+    }
+
+    async fn restore_inner(&self, bundle: &Path, head: &str) -> Result<String> {
+        run_git(&self.dir, &[], &["init", "-q"], None).await?;
+        let b = bundle.to_string_lossy().to_string();
+        self.git(&["bundle", "verify", "--quiet", &b])
+            .await
+            .context("invalid bundle")?;
+        self.git(&[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--update-head-ok",
+            &b,
+            "+refs/*:refs/*",
+        ])
+        .await
+        .context("fetch from bundle")?;
+        if head.is_empty() {
+            let sha = self
+                .git(&["bundle", "list-heads", &b, "HEAD"])
+                .await?
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if sha.len() < 40 {
+                bail!("bundle has no HEAD");
+            }
+            self.git(&["checkout", "-q", "--detach", &sha]).await?;
+        } else {
+            self.git(&["symbolic-ref", "HEAD", head]).await?;
+            self.git(&["reset", "-q", "--hard", "HEAD"]).await?;
+        }
+        self.ensure_exclude().await?;
+        self.head().await
+    }
+}
+
+/// `refs/heads/<name>` with a name git accepts (no `..`, no control
+/// characters, …): the `HEAD` header of a restore is checked before use.
+pub fn valid_head_ref(r: &str) -> bool {
+    let Some(name) = r.strip_prefix("refs/heads/") else {
+        return false;
+    };
+    !name.is_empty()
+        && r.len() <= 250
+        && !name.starts_with('-')
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.ends_with(".lock")
+        && !name.ends_with('.')
+        && !name.contains("..")
+        && !name.contains("//")
+        && !name.contains("@{")
+        && !name
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c))
 }
 
 /// Options of [`Repo::push_checked`].

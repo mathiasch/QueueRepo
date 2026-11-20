@@ -18,7 +18,7 @@ anyhow.workspace = true
 axum.workspace = true
 axum-extra = { version = "0.10", features = ["cookie"] }
 tokio.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures.workspace = true
 tower-http = { version = "0.6", features = ["fs", "trace", "compression-gzip"] }
@@ -45,8 +45,15 @@ chrono-tz = "0.10"
 hmac = "0.12"
 # WP09: re-encoding of uploaded images (strips EXIF/GPS), pure Rust codecs.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# WP11: WebAuthn/passkeys (kanidm; ceremony state is kept server-side in the DB),
+# TOTP (RFC 6238) on HMAC-SHA-1.
+webauthn-rs = { version = "0.6.2", features = ["danger-allow-state-serialisation"] }
+sha1 = "0.10"
+bytes = "1"
 
 [dev-dependencies]
+# WP11: software authenticator for WebAuthn ceremonies in tests.
+webauthn-authenticator-rs = { version = "0.6.2", default-features = false, features = ["softpasskey"] }
 queued-runner = { path = "../runner" }
 tempfile.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }

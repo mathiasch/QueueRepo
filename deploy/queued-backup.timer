@@ -1,0 +1,11 @@
+# Daily backup at 03:17 (randomized by up to 30 min), caught up after downtime.
+[Unit]
+Description=Daily queued backup
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -101,6 +101,15 @@ pub async fn create(
     .bind(t.expires_in_days)
     .fetch_one(&st.db)
     .await?;
+    crate::audit::log(
+        &st,
+        &u,
+        "token.created",
+        ("token", &row.0.to_string()),
+        None,
+        serde_json::json!({"name": name, "scopes": scopes, "days": t.expires_in_days}),
+    )
+    .await;
     Ok(Json(CreatedApiToken {
         token,
         info: view(row),
@@ -120,6 +129,15 @@ pub async fn revoke(
     .bind(u.id)
     .fetch_optional(&st.db)
     .await?;
+    crate::audit::log(
+        &st,
+        &u,
+        "token.revoked",
+        ("token", &id.to_string()),
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     Ok(Json(view(row.ok_or_else(AppError::not_found)?)))
 }
 
@@ -137,6 +155,15 @@ pub async fn remove(
     if n == 0 {
         return Err(AppError::not_found());
     }
+    crate::audit::log(
+        &st,
+        &u,
+        "token.deleted",
+        ("token", &id.to_string()),
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     Ok(Json(json!({"ok": true})))
 }
 

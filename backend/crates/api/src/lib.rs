@@ -23,6 +23,7 @@ pub mod memory;
 pub mod notify;
 pub mod pr;
 mod providers;
+pub mod security;
 pub mod steer;
 pub mod tokens;
 pub mod triggers;
@@ -50,6 +51,11 @@ pub struct User {
     pub email: String,
     pub name: String,
     pub is_admin: bool,
+    /// WP11: the instance requires a second factor and this person has none
+    /// yet – everything except setting one up is refused until then.
+    #[serde(default)]
+    #[cfg_attr(feature = "sqlx", sqlx(default))]
+    pub mfa_setup_required: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +96,9 @@ pub struct Meta {
     pub credential_kinds: BTreeMap<String, Vec<String>>,
     pub oidc: Vec<OidcProvider>,
     pub allow_registration: bool,
+    /// WP11: `open` | `invite` | `closed` (registration form, invite links).
+    #[serde(default = "default_registration_mode")]
+    pub registration_mode: security::RegistrationMode,
     pub provider_capabilities: BTreeMap<String, ProviderCapabilities>,
     pub cli_versions: BTreeMap<String, String>,
     /// Connector types this server offers (WP13).
@@ -101,6 +110,10 @@ pub struct Meta {
     /// Version of the built-in price catalog.
     #[serde(default)]
     pub price_catalog_version: String,
+}
+
+fn default_registration_mode() -> security::RegistrationMode {
+    security::RegistrationMode::Open
 }
 
 // ---------------------------------------------------------------------------

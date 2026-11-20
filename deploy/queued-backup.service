@@ -1,0 +1,36 @@
+# queued-backup: encrypted backup of database, workspaces (git bundles) and
+# app keys. A one-shot job of the unprivileged service user, started by
+# queued-backup.timer. Needs pg_dump (postgresql-client, same major version
+# as the server or newer) and BACKUP_KEY_FILE in /etc/queued/queued.env.
+[Unit]
+Description=queued backup (pg_dump + git bundles, encrypted)
+After=network-online.target postgresql.service queued-runner.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=queued
+Group=queued
+UMask=0077
+EnvironmentFile=/etc/queued/queued.env
+Environment=BACKUP_DIR=/var/backups/queued
+WorkingDirectory=/opt/queued
+ExecStart=/opt/queued/bin/queued backup
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+# The app data dir only for reading the Web Push key; backups go to BACKUP_DIR.
+ReadOnlyPaths=/var/lib/queued/app
+ReadWritePaths=/var/backups/queued

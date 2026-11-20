@@ -156,7 +156,8 @@ async fn check_inner(st: &AppState, task: &Task, allow_done: bool) -> anyhow::Re
         .await?;
     let previous = revision(st, task.project_id, rev.unwrap_or(0)).await?;
     let res = st
-        .runner
+        .runner(task.project_id)
+        .await
         .state_check(
             crate::runner_client::task_ws(task.id),
             &queued_common::StateCheckRequest {

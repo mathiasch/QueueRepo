@@ -31,7 +31,17 @@ impl Vapid {
                     break k;
                 }
             };
-            std::fs::write(&path, &key)?;
+            // WP11: owner-only (the key signs Web Push requests).
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)?;
+                f.write_all(key.as_bytes())?;
+            }
             key
         };
         let partial =

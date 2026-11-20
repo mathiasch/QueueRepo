@@ -80,6 +80,9 @@ pub fn SettingsPage() -> impl IntoView {
                 None => view! { <p class="muted" role="status">"Lade Einstellungen …"</p> }.into_any(),
                 Some(s) => view! { <GeneralSettings s=s/> }.into_any(),
             }}
+            <super::security::SecurityCard/>
+            <AdminCard/>
+            <QuotaCard/>
             <super::notify_settings::NotifySettingsCard/>
             <Budgets/>
             <Credentials/>
@@ -693,6 +696,46 @@ fn confirm_remove(store: Store, provider: String) {
             });
         }),
     });
+}
+
+/// WP11: entry to the admin console (admins only).
+#[component]
+fn AdminCard() -> impl IntoView {
+    let store = use_store();
+    move || {
+        store.me.with(|u| u.is_admin).then(|| view! {
+            <Card id="admin" icon=Ic::Shield title="Verwaltung" text="Personen, Einladungen, Regeln, Protokoll und Runner dieser Instanz.">
+                <div><a class="btn primary" href="/admin" data-testid="admin-open">"Verwaltung öffnen"</a></div>
+            </Card>
+        })
+    }
+}
+
+/// WP11: the quota an admin set for this person (shown only if there is one).
+#[component]
+fn QuotaCard() -> impl IntoView {
+    let q = RwSignal::new(None::<queued_api::security::QuotaStatus>);
+    spawn_local(async move {
+        if let Ok(v) = api::get::<queued_api::security::QuotaStatus>("/account/quota").await {
+            q.set(Some(v));
+        }
+    });
+    move || {
+        q.get().filter(|v| !v.quota.is_unlimited()).map(|v| {
+            let cost = v.quota.max_cost_30d_usd;
+            view! {
+                <Card id="quota" icon=Ic::Gauge title="Dein Kontingent" text="Grenzen, die die Verwaltung für dich festgelegt hat.">
+                    {cost.map(|c| view! {
+                        <Meter label="Kosten der letzten 30 Tage" used=v.cost_30d_usd limit=Some(c)
+                            value_text=format!("{} von {}", crate::logic::security::usd(v.cost_30d_usd), crate::logic::security::usd(c))/>
+                    })}
+                    {v.exhausted.then(|| view! { <div class="alert tone-warn">"Das Kontingent ist aufgebraucht: neue Aufträge warten, bis wieder Platz ist oder die Verwaltung es erhöht."</div> })}
+                    {v.quota.max_parallel.map(|p| view! { <p>{format!("Höchstens {p} Aufträge gleichzeitig.")}</p> })}
+                    {v.quota.max_projects.map(|p| view! { <p>{format!("Höchstens {p} eigene Projekte (du hast {}).", v.projects)}</p> })}
+                </Card>
+            }
+        })
+    }
 }
 
 #[component]

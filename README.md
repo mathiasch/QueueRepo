@@ -564,6 +564,70 @@ Semantik nach den OpenTelemetry-GenAI-Konventionen (Status *Development*; geprü
 
 **Nie in Spans:** Prompts, Titel, Kontext, Code, Diffs, Werkzeug-Argumente und -Ergebnisse, Fehlertexte, Pfade, URLs, Secrets (Fehlerstatus ohne Nachricht). Ein Opt-in für Inhalte gibt es nicht; `OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT` wird ignoriert (Warnung im Log). Der Runner exportiert keine Traces.
 
+## Sicherheit, Verwaltung und Betrieb (WP11)
+
+### Zwei-Faktor-Anmeldung und Geräte (Einstellungen → Sicherheit)
+
+- **Authenticator-App (TOTP):** „App einrichten“ zeigt einen QR-Code (und den Schlüssel zum Abtippen). Die App erzeugt alle 30 Sekunden einen 6-stelligen Code (RFC 6238, SHA-1). Jeder Code gilt genau einmal; ein mitgeschnittener Code ist danach wertlos.
+- **Passkeys (WebAuthn):** Fingerabdruck, Gesichtserkennung oder Sicherheitsschlüssel als zweiter Faktor. Voraussetzung: Die Instanz läuft unter einem Domainnamen (nicht unter einer IP-Adresse), über `https://` oder `http://localhost`, und `PUBLIC_URL` ist genau die Adresse, die im Browser steht.
+- **Wiederherstellungscodes:** Beim ersten Faktor bekommst du 10 Codes, angezeigt genau einmal. Jeder Code funktioniert einmal. In der Datenbank liegt nur ein HMAC (Pepper aus `MASTER_KEY`); der TOTP-Schlüssel liegt AES-256-GCM-verschlüsselt mit `MASTER_KEY`.
+- **Anmeldung:** Wer einen zweiten Faktor hat, bekommt nach dem Passwort **keine** Session, sondern einen 5-Minuten-Zwischenschritt (`qmfa`-Cookie, einmal nutzbar, 5 Versuche). Erst der zweite Faktor erzeugt eine neue Session (neues Zufallstoken, keine Session-Fixation). Das gilt **auch nach OIDC**: Ein schwach gesichertes Google-/Firmenkonto reicht nicht, wenn das Queue-Konto einen zweiten Faktor hat.
+- **Drosselung:** 10 falsche Passwörter oder 5 falsche Codes in 15 Minuten sperren die Anmeldung für dieses Konto 15 Minuten (HTTP 429, auch für unbekannte E-Mail-Adressen gleich). Eine Begrenzung pro IP-Adresse gehört in den Reverse-Proxy/Tunnel (hinter Cloudflare ist die Client-IP für die App nicht vertrauenswürdig).
+- **Angemeldete Geräte:** Liste aller Sessions mit Gerät, Anmeldeart und letzter Aktivität; einzeln oder „alle anderen“ abmelden. Passwortwechsel und jede Änderung am zweiten Faktor melden alle anderen Geräte ab. Abgemeldete Geräte verlieren auch ihren Live-Stream innerhalb von Sekunden.
+- **API-Tokens** erreichen weder Konto-, MFA-, Token- noch Verwaltungsrouten (Default-Deny aus WP07). Ändernde Sicherheitsaktionen verlangen das Passwort (bzw. bei reinen OIDC-Konten einen Code).
+
+### Verwaltung (nur Admins, Schild-Symbol oben rechts bzw. Einstellungen → Verwaltung)
+
+- **Personen:** sperren/entsperren (Sperre löscht sofort alle Sessions, widerruft alle API-Tokens und hält ihre Aufträge an), Admin-Rolle geben/nehmen, **Kontingent** (Höchstkosten in 30 Tagen aus der WP13-Kostenrechnung, gleichzeitige Aufträge, eigene Projekte). Die letzte aktive Admin-Person kann weder gesperrt noch herabgestuft werden, auch nicht durch zwei Admins gleichzeitig.
+- **Einladungen:** Einmal-Link mit Ablauf (1/7/30 Tage), optional an eine E-Mail-Adresse gebunden, optional als Admin. Gespeichert wird nur ein Hash.
+- **Regeln:** Registrierung *offen*, *nur mit Einladung* oder *geschlossen* (ohne Wahl gilt `ALLOW_REGISTRATION`); Zwei-Faktor-Pflicht *aus*, *für Admins* oder *für alle* – betroffene Personen können bis zur Einrichtung nur ihren Faktor einrichten, ihre API-Tokens ruhen so lange.
+- **Protokoll (Audit-Log):** Anmeldungen (auch fehlgeschlagene und Sperren), Konto/MFA, Zugangsdaten, Secrets, Umgebungen, API-Tokens, Projekte und Mitglieder, Pushes (manuell und automatisch), Freigaben, alle Verwaltungsaktionen, Runner-Ausfälle, Backups. Nie Werte von Passwörtern, Codes, Tokens oder Zugangsdaten. Filter nach Bereich und Person, „Ältere Einträge laden“, Export als JSON Lines, „Unverändertheit prüfen“.
+  - *Append-only in der Datenbank:* Trigger verbieten `UPDATE`, `TRUNCATE` und `DELETE` von Einträgen, die jünger als 365 Tage sind (und löschen nur vom ältesten Ende her). Jeder Eintrag enthält den SHA-256 des vorigen (Hash-Kette, berechnet im Insert-Trigger) – eine nachträgliche Änderung an der Kette vorbei fällt bei der Prüfung auf.
+  - *Retention:* `AUDIT_RETENTION_DAYS` (Standard 730, mindestens 365); stündlich werden ältere Einträge entfernt.
+  - *Grenze:* Der Eigentümer der Tabelle (die DB-Rolle der App) könnte Trigger abschalten. Wer das ausschließen will, legt `audit_log` einer eigenen Rolle und gibt der App-Rolle nur `INSERT, SELECT` (`ALTER TABLE audit_log OWNER TO queued_audit; GRANT INSERT, SELECT ON audit_log TO queued; GRANT USAGE ON SEQUENCE audit_log_id_seq TO queued;`) und archiviert den Export regelmäßig außerhalb des Servers.
+
+### Runner-Flotte
+
+Der Runner aus `RUNNER_URL`/`RUNNER_TOKEN` heißt „Standard-Runner“; mit ihm allein ändert sich nichts. Weitere Runner (eigener Rechner, eigener unprivilegierter Benutzer, eigene `runner.env`):
+
+1. Verwaltung → Runner → „Runner anmelden“: Name, Adresse (z. B. `http://10.0.0.5:8090`), Kapazität. Die Queue erzeugt ein **eigenes Token für diesen Runner** und zeigt es einmal an.
+2. Auf dem neuen Rechner `RUNNER_TOKEN=<dieses Token>` und `RUNNER_BIND=0.0.0.0:8090` setzen, `queued-runner` starten (wie in „Betrieb“, ohne App). Die Firewall lässt nur die App an Port 8090.
+3. Nach dem ersten Heartbeat steht er auf „Bereit“; neue Projekte gehen an den Runner mit den wenigsten Projekten.
+
+- **Sicherheit:** Jeder Runner kennt nur sein eigenes Token (die App speichert es verschlüsselt). Ein Runner hat keinerlei Zugang zur App und bekommt nur Aufträge und Zugangsdaten seiner eigenen Projekte. Ein kompromittierter Runner kann weder andere Runner noch die App ansprechen. „Widerrufen“ löscht das Token sofort.
+- **Heartbeat/Lease:** Die App meldet sich alle `RUNNER_HEARTBEAT_SECS` (5 s) und verlängert dabei die Leases der laufenden Läufe. Ohne Antwort für `RUNNER_LEASE_SECS` (30 s) gilt der Runner als nicht erreichbar: Seine Aufträge werden als Infrastrukturfehler neu eingereiht (kein Korrekturversuch verbraucht) und warten auf ihn; der Runner selbst beendet Läufe, deren Lease abgelaufen ist, und startet nie zwei Prozesse im selben Arbeitsverzeichnis – es läuft also nie derselbe Auftrag doppelt.
+- **Kapazität und Leeren:** Kapazität = gleichzeitige Aufträge über alle Projekte des Runners. „Leeren“ nimmt keine neuen Aufträge/Projekte mehr an, Laufendes und Übernahmen laufen zu Ende. „Projekte umziehen“ kopiert ruhende Projekte (alle Refs und offenen Arbeitsstände als `git bundle`) auf einen anderen Runner.
+- Projekte eines **widerrufenen** Runners warten, bis sie aus einem Backup auf einen anderen Runner gebracht werden (`queued restore --target-runner`).
+
+### Backup und Wiederherstellung
+
+`queued backup` sichert **Datenbank** (`pg_dump --format=custom`), **alle Arbeitsverzeichnisse aller Runner** (`git bundle --all`: Branches, gehaltene Änderungen, Baselines – nicht unversionierte Dateien) und den Web-Push-Schlüssel. Jede Datei wird mit `BACKUP_KEY` verschlüsselt (AES-256-GCM in 64-KiB-Blöcken, Manipulation/Abschneiden/Vertauschen fällt auf); das Verzeichnis ist `0700`, die Dateien `0600`; ein HMAC schützt das Manifest. **`MASTER_KEY` ist nie Teil des Backups** – ohne ihn sind gesicherte Zugangsdaten nicht lesbar.
+
+```bash
+# einmalig (install.sh macht das): Schlüssel erzeugen und AUSSERHALB des Servers aufbewahren
+sudo -u queued /opt/queued/bin/queued backup-key /etc/queued/backup.key
+# täglich per Timer (deploy/queued-backup.{service,timer}, läuft als User "queued")
+sudo systemctl enable --now queued-backup.timer
+sudo systemctl start queued-backup.service && journalctl -u queued-backup -n 20   # sofort testen
+```
+
+Ohne Root als eigener Benutzer geht dasselbe als User-Unit: beide Dateien nach `~/.config/systemd/user/`, `User=`/`Group=` entfernen, Pfade anpassen, `systemctl --user enable --now queued-backup.timer` (dauerhaft mit `loginctl enable-linger`).
+
+`BACKUP_KEEP` (Standard 14) hält die neuesten vollständigen Backups; unvollständige liegen als `*.partial` daneben und werden nach einem Tag entfernt. Kopiere `/var/backups/queued` regelmäßig auf einen anderen Rechner (z. B. `restic`/`rsync`) – die Dateien sind bereits verschlüsselt.
+
+**Runbook Wiederherstellung** (z. B. neuer Server):
+
+1. Queue installieren (`install.sh`), **denselben `MASTER_KEY`** in `queued.env` eintragen, `BACKUP_KEY_FILE` auf den gesicherten Schlüssel zeigen lassen.
+2. Leere Datenbank anlegen (Postgres starten; `queued` noch **nicht** starten) und leere Runner starten (`queued-runner` für jeden Runner aus dem Backup oder nur den Standard-Runner).
+3. `sudo -u queued env $(cat /etc/queued/queued.env | xargs) /opt/queued/bin/queued restore --from /var/backups/queued/queue-backup-…`
+   - prüft zuerst **alle** Dateien (Schlüssel, Prüfsummen, Manifest-HMAC), bricht sonst ab, ohne etwas zu ändern;
+   - spielt die Datenbank in einer Transaktion ein und **nur in eine leere Datenbank**;
+   - legt die Arbeitsverzeichnisse auf ihren Runnern an (nie über bestehende). Gibt es einen Runner nicht mehr: `--target-runner builtin` bringt alles auf den Standard-Runner und ordnet die Projekte ihm zu.
+4. `systemctl start queued-runner queued`. Laufende Aufträge vom Zeitpunkt des Backups werden als unterbrochen neu eingereiht. Unversionierte Dateien in Arbeitsverzeichnissen sind nicht im Backup.
+5. In der Verwaltung → Protokoll → „Unverändertheit prüfen“: Die Kette muss intakt sein.
+
+`pg_dump`/`pg_restore` müssen mindestens die Hauptversion des Servers haben (`postgresql-client-16`). Im App-Container-Image (`Dockerfile`, Debian bookworm) ist kein passender Client enthalten – dort `queued backup` auf dem Host oder in einem Container mit `postgres:16`-Client ausführen.
+
 ## Tests
 
 | Ebene | Was | Ausführen |
@@ -580,6 +644,8 @@ Semantik nach den OpenTelemetry-GenAI-Konventionen (Status *Development*; geprü
 | Integration WP08 | je Anbindung (GitHub, Slack, Linear, Jira): falsche/fehlende Signatur (401, nichts gespeichert), Zeitfenster (Slack ±5 min, Linear 60 s), Replay ⇒ Duplikat, fremder Arbeitsbereich ⇒ 403, nicht zugeordnete Person abgewiesen (Linear bekommt eine `error`-Activity), Auftrag mit Verknüpfung und Datenblock, Rückmeldung genau einmal (auch nach verlorener Antwort, mit zwei parallelen Zustellern, gleiche Rückfrage erneut), Rückfrage über den externen Kanal beantwortet bis „erledigt“, „Weiter mit …“; Zuordnung mit zwei Zustimmungen, Rechte/Mandanten, Opt-in mit GitHub-Schreibrechten, Limit (429), Secrets verschlüsselt und nie in Antworten; `answer` über den Nachrichtenpfad | `cargo test -p queued --test intake` |
 | Integration WP09 | Anhänge: Limits (Datei, Anzahl, Body, Quota), MIME-Fälschung (SVG/HTML/Skript unter Bild- oder Textnamen, Binärdaten, HEIC), EXIF/GPS entfernt und Ausrichtung angewendet, Pfad-Namen, Schutz-Header, Rechte (Betrachter, Fremde, Entwürfe, Löschen), Löschen mit Auftrag/Projekt, Bereitstellung im Lauf (Prüfsummen), nie im Commit trotz `!.queue/` und Agenten-Commit; Regeln: Agenten-Vorschlag (geschwärzt) erst nach Freigabe im Prompt, Bearbeiter nur Vorschlag, Konflikt, Ablehnung, abgelehnter Text nicht erneut, Export/Import mit Baseline; Zustand abgelehnt/repariert/erst bei „erledigt“ übernommen; OnEmpty-Dedupe (Duplikat, ähnlich, rückgängig, Critic-Regeln) und Modell-Critic gegen Fake-Server mit Kosten | `cargo test -p queued --test memory` |
 | System/E2E WP09 | über die Prozessgrenze: Fälschung, EXIF, Header, nie im Commit, Regel erst nach Freigabe, ungültiger Zustand, Dedupe; Browser: Anhang im Composer und Drawer, Regeln mit Vorschlag freigeben, Zustand bearbeiten, Dedupe-Begründung; iPhone: Foto per Tippen über den Kamera-Eingang, Safe-Areas, axe | `npx playwright test tests/system/memory.spec.ts tests/ui/memory*.spec.ts` |
+| Integration WP11 | TOTP (RFC-Vektoren, Replay gleicher/älterer Schritt, Sperre nach 5 Fehlern, Passwort-Drosselung auch für unbekannte Konten), Recovery-Codes (nur gehasht, Einmalnutzung auch parallel, neuer Satz), Passkey mit Software-Authenticator (falscher Origin abgewiesen), Session-Fixation, Session-Liste/Widerruf/SSE-Ende, Passwort-/MFA-Wechsel meldet ab, MFA-Pflicht für Session und Token, Sperre (Sessions, Tokens, Stream, Scheduler), letzter Admin (auch parallel), Einladungen/Modi, Kontingente, Audit (append-only per SQL, Hash-Kette erkennt Manipulation, keine Secrets, Filter/Paging/Export, Retention); Runner-Flotte (eigene Tokens, Isolation, Zuweisung, Leeren, Kapazität, Umzug, Widerruf), Runner-Ausfall ohne Doppel-Lauf, Backup → leere DB → Restore (alle Tabellen und Refs identisch) | `cargo test -p queued --test enterprise --test fleet` |
+| System/E2E WP11 | getrennte Prozesse: MFA über die API, Sperre widerruft Token, `queued backup`/`restore` als Kommandos mit zwei Runner-Prozessen; Browser: App mit QR-Code einrichten, Anmeldung mit Code und Wiederherstellungscode, andere Geräte abmelden, Passkey mit virtuellem Authenticator, Verwaltung (sperren ⇒ Browser der Person abgemeldet, Einladung, Protokoll, Runner), iPhone hoch/quer, axe hell/dunkel | `npx playwright test tests/system/enterprise.spec.ts tests/ui/security*.spec.ts tests/ui/admin.spec.ts` |
 | Unit (Frontend) | Formatierung, Status-/Fehlertexte, Budget-Anzeige, Limit-Eingaben, Fortschrittsphasen, Diff, Tastaturkürzel, VAPID-Decoding, Geldbeträge/Schätzung | `cd frontend && cargo test` |
 | System | echte Binaries als getrennte Prozesse: Runner-Auth, Session-Pflicht, Flow über die Prozessgrenze, Budget, Cancel | `cd e2e && npx playwright test --project=system` |
 | System WP07 | echtes `queuectl` gegen den echten Stack (add über stdin, watch per SSE und Polling, list/status/steer/cancel, fehlende Berechtigung, 0644-Datei abgelehnt, Token aus der Umgebung, Tippfehler, `http://` zu fremdem Host, widerrufen), Webhook mit Node-HMAC, GitHub-Ping, `queuectl fire`, einmaliger Auslöser durch den Scheduler | `npx playwright test tests/system/triggers.spec.ts` |
@@ -596,7 +662,7 @@ Der Mock-Provider (`ENABLE_MOCK_PROVIDER=true`) macht alle Flows deterministisch
 sudo ./deploy/install.sh        # einmalig: Pakete, User "queued", subuid, linger, Build, Agent-Image, systemd-Units
 sudoedit /etc/queued/queued.env /etc/queued/runner.env   # gleicher RUNNER_TOKEN (openssl rand -hex 32), MASTER_KEY
 sudo -iu queued POSTGRES_PASSWORD=… podman-compose -f /opt/queued/deploy/compose.yml up -d   # + --profile tunnel
-sudo systemctl enable --now queued-runner queued
+sudo systemctl enable --now queued-runner queued queued-backup.timer
 ```
 
 Als IdP-Callback trägst du `${PUBLIC_URL}/api/auth/oidc/<id>/callback` ein. Bei Apple erfolgt der Callback als `form_post`, die Domain muss verifiziert sein.
