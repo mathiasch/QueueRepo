@@ -35,6 +35,8 @@ Gegenstand: kompletter WP10-Diff auf `mvp` (Backend App/Runner/Common/API, Migra
 | N10 | Tagesdiagramm der Kosten nur in USD; CHF steht in der Summe. | Kein belegter Wechselkurs (WP13-N13). |
 | N11 | `/readyz` ist öffentlich (über einen Tunnel erreichbar) und verrät „DB“/„Runner“ als ok/fail. | Keine Adressen, Texte oder Versionen; 1 s Cache. Für Load-Balancer nötig. |
 | N12 | Benachrichtigungs- und Analytics-Routen sind nicht per API-Token erreichbar. | Bewusst (Konto-Einstellungen); ein Dashboard-Export per Token wäre ein eigener Scope. |
+| N14 | „Teuerste Aufträge“ listet bei Kosten 0 (Mock, unbekannte Preise) nach Tokens sortiert – die Überschrift passt dann nur halb. | Kosmetisch; im Screenshot der Tour gesehen. |
+| N15 | Die Dauer der Insights/„Dauer bis erledigt“ zählt ab Anlage; ein lange zurückgehaltener Auftrag (Freigabe, Limits) wirkt langsam, obwohl der Agent schnell war. Die Agentenzeit steht daneben, der Hinweis „meiste Zeit gewartet“ erklärt es. | Bewusst. |
 | N13 | Webhook-Secret liegt verschlüsselt in der DB; ein Wechsel der URL löscht es, ein neues muss erzeugt werden. | Absicht: ein Secret gehört zu genau einem Empfänger. In der UI erklärt. |
 
 ## Geprüft und für gut befunden

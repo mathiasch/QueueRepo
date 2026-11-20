@@ -58,4 +58,24 @@ Weitere Rot-Läufe während der Entwicklung: Span-Test wartete auf `done`, der A
 
 ## 4. Ergebnisse (Abnahme: komplette Suite zweimal hintereinander auf dem Endstand)
 
-ERGEBNISSE_PLATZHALTER
+Skript `wp10-accept.sh` (Scratchpad, identisch mit dem Abnahmeskript aus WP09): Backend `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, `cargo test --workspace`; E2E-Binaries; Frontend `cargo fmt --check`, `cargo clippy --target wasm32-unknown-unknown --all-targets -D warnings`, `cargo clippy --all-targets -D warnings`, `cargo test`, `trunk build --release`; danach `frontend/target` gelöscht; Playwright alle Projekte (system, desktop, iphone, iphone-landscape inkl. axe-Tour). Stoppt beim ersten Fehler. Geprüfter Stand = Inhalt von `07f6108` (Unterschied zum getesteten Snapshot nur `WP10-test.md`).
+
+| Schritt | Lauf 2 (19.11., 21:48–22:12 UTC) | Lauf 3 (19.11., 22:12–22:36 UTC) |
+|---|---|---|
+| Backend fmt / clippy `-D warnings` | grün / grün | grün / grün |
+| Backend Tests | **579 bestanden, 0 fehlgeschlagen** | **579 bestanden, 0 fehlgeschlagen** |
+| Frontend fmt / clippy wasm32 / clippy nativ | grün / grün / grün | grün / grün / grün |
+| Frontend Tests | **62 bestanden** | **62 bestanden** |
+| `trunk build --release` | ok | ok |
+| Playwright (system, desktop, iphone, iphone-landscape, inkl. axe-Tour) | **109 bestanden** (7,6 min) | **109 bestanden** (7,6 min) |
+
+Vergleich WP09-Abnahme: Backend 535 → 579 (+44: common 6, runner 3, app lib 10, api 6, Integration 19), Frontend 60 → 62, Playwright 103 → 109 (system 2, desktop 2, iphone 1, iphone-landscape 1) plus Tour um „Auswertung“ (hell/dunkel × 3 Geräte) und Insights im Drawer erweitert. Bestehende Tests wurden nur angepasst, nicht abgeschwächt: `AgentEvent::Tool { name, summary }` statt `Tool(String)` (gleiche Prüfungen, zusätzlich Werkzeugname), iPhone-Tab-Leiste 4 → 5 Tabs (gleiche 44-pt-/Safe-Area-Prüfung).
+
+Lauf 1 (davor) scheiterte an `cargo fmt --check` des danach eingefügten Push-Tests; Backend-Tests dort 579/0. Ein früherer Teil-Lauf brach mit „No space left on device“ ab (`frontend/target` + alte Test-Binaries); danach wurden veraltete Artefakte gelöscht (siehe Auftrag: volle Platte ⇒ falsche Fehler).
+
+## 5. Nicht getestet / nicht verifizierbar
+
+- Echter OTLP-Collector (Jaeger, Tempo, OTel Collector), echtes Prometheus, echte Push-Dienste (FCM/Mozilla/Apple), echte ntfy-Instanz.
+- Verhalten unter echter Zeitumstellung im laufenden Betrieb (nur Unit-Tests mit festen Zeitpunkten in Sommer- und Winterzeit).
+- Mehrere App-Instanzen als getrennte Prozesse (Integration nutzt zwei `AppState` auf derselben Datenbank im selben Prozess – gleiche SQL-Pfade).
+- Leistung im Release-Build und mit mehr als 60 000 Aufträgen.
