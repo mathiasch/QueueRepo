@@ -65,6 +65,19 @@ pub struct Config {
     /// WP08: replaces the Jira site address for API calls (env
     /// `INTAKE_JIRA_API_URL`; tests only, the site stays the tenant).
     pub intake_jira_api: Option<String>,
+    /// WP10: who may read `/metrics` (`METRICS_TOKEN`, `METRICS_BIND`).
+    pub metrics: queued_common::metrics::Access,
+    /// WP10: OTLP trace export (`OTEL_*`); `None` = off, no overhead.
+    pub otel: Option<crate::otel::OtelConfig>,
+    /// WP10: interval of the notification loop (outbox, daily summary;
+    /// env `NOTIFY_TICK_SECS`, default 15; 0 = tests drive `notify::tick`).
+    pub notify_tick_secs: u64,
+    /// WP10: ntfy/Web Push/webhook targets in loopback/private networks
+    /// (self-hosted ntfy in the LAN; env `ALLOW_PRIVATE_NOTIFY_TARGETS`).
+    pub allow_private_notify_targets: bool,
+    /// WP10: days of `usage_log` kept for analytics (env
+    /// `USAGE_RETENTION_DAYS`, default 400, at least 35 for the budgets).
+    pub usage_retention_days: i64,
 }
 
 fn api_url(k: &str, default: &str) -> String {
@@ -138,6 +151,17 @@ impl Config {
             intake_linear_api: api_url("INTAKE_LINEAR_API_URL", "https://api.linear.app/graphql"),
             intake_jira_api: var("INTAKE_JIRA_API_URL")
                 .map(|u| u.trim_end_matches('/').to_string()),
+            metrics: queued_common::metrics::Access::parse(
+                var("METRICS_TOKEN"),
+                var("METRICS_BIND"),
+                "",
+                None,
+            )
+            .map_err(anyhow::Error::msg)?,
+            otel: crate::otel::OtelConfig::from_env(&|k| var(k)).map_err(anyhow::Error::msg)?,
+            notify_tick_secs: num::<u64>("NOTIFY_TICK_SECS", 15),
+            allow_private_notify_targets: flag("ALLOW_PRIVATE_NOTIFY_TARGETS", false),
+            usage_retention_days: num::<i64>("USAGE_RETENTION_DAYS", 400).max(35),
             data_dir,
         })
     }
@@ -188,6 +212,13 @@ impl Config {
             intake_slack_api: "https://slack.com/api".into(),
             intake_linear_api: "https://api.linear.app/graphql".into(),
             intake_jira_api: None,
+            metrics: Default::default(),
+            otel: None,
+            // Tests drive the notification loop themselves.
+            notify_tick_secs: 0,
+            // Fake ntfy/webhook receivers listen on 127.0.0.1.
+            allow_private_notify_targets: true,
+            usage_retention_days: 400,
         }
     }
 
@@ -210,6 +241,14 @@ impl Config {
     pub fn git_host_guard(&self) -> crate::llm::Guard {
         crate::llm::Guard {
             allow_private: self.allow_private_git_hosts,
+            ..self.llm_guard()
+        }
+    }
+
+    /// SSRF guard for notification targets (ntfy, Web Push, webhooks).
+    pub fn notify_guard(&self) -> crate::llm::Guard {
+        crate::llm::Guard {
+            allow_private: self.allow_private_notify_targets,
             ..self.llm_guard()
         }
     }

@@ -39,7 +39,7 @@ fn signals(evs: &[AgentEvent]) -> Vec<String> {
         .filter(|e| {
             !matches!(
                 e,
-                AgentEvent::Text(_) | AgentEvent::Tool(_) | AgentEvent::Final(_)
+                AgentEvent::Text(_) | AgentEvent::Tool { .. } | AgentEvent::Final(_)
             )
         })
         .map(|e| {

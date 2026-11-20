@@ -161,10 +161,10 @@ pub(super) fn parse(v: &Value, st: &mut ParseState) -> Vec<AgentEvent> {
                     st.last_text = s(item, "text");
                     out.push(AgentEvent::Text(trunc(&st.last_text, 2000)));
                 }
-                Some("command_execution") if started => out.push(AgentEvent::Tool(format!(
-                    "$ {}",
-                    trunc(&s(item, "command"), 200)
-                ))),
+                Some("command_execution") if started => out.push(AgentEvent::Tool {
+                    name: "command_execution".into(),
+                    summary: format!("$ {}", trunc(&s(item, "command"), 200)),
+                }),
                 Some("file_change") if !started => {
                     let files: Vec<String> = item["changes"]
                         .as_array()
@@ -172,11 +172,15 @@ pub(super) fn parse(v: &Value, st: &mut ParseState) -> Vec<AgentEvent> {
                         .flatten()
                         .map(|c| s(c, "path"))
                         .collect();
-                    out.push(AgentEvent::Tool(format!("edit {}", files.join(", "))));
+                    out.push(AgentEvent::Tool {
+                        name: "file_change".into(),
+                        summary: format!("edit {}", files.join(", ")),
+                    });
                 }
-                Some("web_search") if !started => {
-                    out.push(AgentEvent::Tool(format!("search: {}", s(item, "query"))))
-                }
+                Some("web_search") if !started => out.push(AgentEvent::Tool {
+                    name: "web_search".into(),
+                    summary: format!("search: {}", s(item, "query")),
+                }),
                 // Non-fatal notices (documented as such; see recordings).
                 Some("error") => out.push(AgentEvent::Text(format!(
                     "⚠ {}",

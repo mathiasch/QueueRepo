@@ -34,7 +34,7 @@ async fn own_task(st: &AppState, id: Uuid, user_id: Uuid) -> ApiResult<Task> {
 pub async fn list(State(st): State<AppState>, AuthUser(u): AuthUser) -> ApiResult<Json<Vec<Task>>> {
     Ok(Json(
         sqlx::query_as::<_, Task>(
-            "(SELECT * FROM tasks WHERE user_id=$1 AND status IN ('queued','running','waiting_batch','waiting_input','pending_approval','held'))
+            "(SELECT * FROM tasks WHERE user_id=$1 AND status IN ('queued','running','waiting_batch','waiting_input','pending_approval','held','merging'))
              UNION ALL
              (SELECT * FROM tasks WHERE user_id=$1 AND status IN ('done','failed','blocked','cancelled') ORDER BY updated_at DESC LIMIT 150)
              ORDER BY position",

@@ -33,7 +33,7 @@ export async function waitTask(request: APIRequestContext, id: string, status: s
 }
 
 /** Main navigation link (sidebar on desktop, tab bar on phones). */
-export const navLink = (page: Page, name: "Aufträge" | "Postfach" | "Projekte" | "Einstellungen") =>
+export const navLink = (page: Page, name: "Aufträge" | "Postfach" | "Projekte" | "Auswertung" | "Einstellungen") =>
   page.getByRole("navigation", { name: "Hauptnavigation" }).getByRole("link", { name: new RegExp(`^${name}`) });
 
 /** Logs a page in by registering through the UI (labels, not placeholders). */

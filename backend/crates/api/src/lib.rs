@@ -12,6 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+pub mod analytics;
 pub mod branch;
 mod costs;
 pub mod diff;
@@ -19,6 +20,7 @@ pub mod env;
 pub mod gate;
 pub mod intake;
 pub mod memory;
+pub mod notify;
 pub mod pr;
 mod providers;
 pub mod steer;

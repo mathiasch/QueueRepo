@@ -267,7 +267,7 @@ async fn process(st: &AppState, j: Job) -> anyhow::Result<()> {
     let req = request_of(&j.request);
     match (j.mode.as_str(), j.status.as_str()) {
         ("sync", _) => {
-            let r = llm::call(&http, &ep, &req).await;
+            let r = llm::call_traced(st, &http, &ep, &req, j.task_id, &j.step).await;
             settle(st, &j, &conn, r).await
         }
         ("batch", "pending") => match submit(&http, &ep, &j, &req).await {

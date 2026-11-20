@@ -1,3 +1,4 @@
+mod analytics;
 mod attachments;
 mod credentials;
 mod environment;
@@ -7,12 +8,13 @@ mod hooks;
 mod intake;
 mod knowledge;
 pub mod limits;
+mod notifications;
 pub(crate) mod projects;
 mod providers;
 mod pulls;
 pub(crate) mod steer;
 mod tasks;
-mod tokens;
+pub(crate) mod tokens;
 mod triggers;
 
 use std::convert::Infallible;
@@ -88,6 +90,22 @@ pub fn router(st: AppState) -> Router {
         .route("/evals", get(evals::list).post(evals::start))
         .route("/evals/{id}", get(evals::get).delete(evals::remove))
         .route("/notifications", get(list_notifications))
+        // WP10: notification settings, analytics, session insights (cookie only).
+        .route(
+            "/notifications/settings",
+            get(notifications::get).put(notifications::put),
+        )
+        .route(
+            "/notifications/webhook/secret",
+            post(notifications::renew_secret),
+        )
+        .route(
+            "/notifications/webhook/test",
+            post(notifications::test_webhook),
+        )
+        .route("/notifications/deliveries", get(notifications::deliveries))
+        .route("/analytics", get(analytics::get))
+        .route("/tasks/{id}/insights", get(analytics::insights))
         .route("/notifications/read-all", post(read_all))
         .route("/notifications/{id}/read", post(read_one))
         .route("/push/key", get(push_key))
@@ -282,9 +300,22 @@ pub fn router(st: AppState) -> Router {
     let web = Router::new()
         .fallback_service(spa)
         .layer(CompressionLayer::new());
-    Router::new()
-        .nest("/api", api)
+    let mut root = Router::new()
+        // WP10: health and metrics, before the SPA fallback.
+        .route("/healthz", get(crate::health::healthz))
+        .route("/readyz", get(crate::health::readyz));
+    root = if st.cfg.metrics.on_main() {
+        root.route("/metrics", get(crate::metrics::serve))
+    } else {
+        // Not enabled here: a plain 404, never the SPA's index.html.
+        root.route("/metrics", get(|| async { AppError::not_found() }))
+    };
+    root.nest("/api", api)
         .fallback_service(web)
+        .layer(axum::middleware::from_fn_with_state(
+            st.clone(),
+            crate::metrics::track,
+        ))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(st)
 }

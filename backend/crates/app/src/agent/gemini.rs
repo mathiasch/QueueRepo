@@ -13,7 +13,7 @@ use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
 use super::{
-    error_event, n, s, tool_summary, trunc, AgentEvent, Credential, Invocation, LimitKind,
+    error_event, n, s, tool_event, trunc, AgentEvent, Credential, Invocation, LimitKind,
     ParseState, RunKind, RunLimits, Session,
 };
 use crate::models::Usage;
@@ -96,10 +96,7 @@ pub(super) fn parse(v: &Value, st: &mut ParseState) -> Vec<AgentEvent> {
         "message" if s(v, "role") == "assistant" => st.buf.push_str(&s(v, "content")),
         "tool_use" => {
             flush(st, &mut out);
-            out.push(AgentEvent::Tool(tool_summary(
-                &s(v, "tool_name"),
-                &v["parameters"],
-            )));
+            out.push(tool_event(&s(v, "tool_name"), &v["parameters"]));
         }
         "error" => {
             let msg = s(v, "message");

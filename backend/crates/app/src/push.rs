@@ -47,6 +47,7 @@ impl Vapid {
 /// Returns Ok(false) if the subscription is gone and should be deleted.
 pub async fn send(
     st: &AppState,
+    http: &reqwest::Client,
     endpoint: &str,
     p256dh: &str,
     auth: &str,
@@ -66,7 +67,11 @@ pub async fn send(
     let msg = builder.build().map_err(|e| anyhow!("push build: {e:?}"))?;
     let req = web_push::request_builder::build_request::<Vec<u8>>(msg);
 
-    let mut rb = st.http.post(req.uri().to_string());
+    // WP10: through the caller's SSRF-guarded client (the endpoint comes
+    // from the browser, i.e. from the user).
+    let mut rb = http
+        .post(req.uri().to_string())
+        .timeout(std::time::Duration::from_secs(15));
     for (k, v) in req.headers() {
         rb = rb.header(k.as_str(), v.as_bytes());
     }

@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use super::{
     classify::{epoch_value, ErrorCategory},
-    count, n, s, tool_summary, trunc, usd, AgentEvent, ConnCfg, Credential, Invocation, LimitKind,
+    count, n, s, tool_event, trunc, usd, AgentEvent, ConnCfg, Credential, Invocation, LimitKind,
     ParseState, RetryInfo, RunKind, RunLimits, Session,
 };
 use crate::models::{Usage, PLAN_SCHEMA, RESULT_SCHEMA, REVIEW_SCHEMA};
@@ -218,9 +218,7 @@ pub(super) fn parse(v: &Value, st: &mut ParseState) -> Vec<AgentEvent> {
             for c in v["message"]["content"].as_array().into_iter().flatten() {
                 match c["type"].as_str() {
                     Some("text") => out.push(AgentEvent::Text(trunc(&s(c, "text"), 2000))),
-                    Some("tool_use") => {
-                        out.push(AgentEvent::Tool(tool_summary(&s(c, "name"), &c["input"])))
-                    }
+                    Some("tool_use") => out.push(tool_event(&s(c, "name"), &c["input"])),
                     _ => {}
                 }
             }
@@ -450,7 +448,9 @@ mod tests {
             &mut st,
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}},{"type":"text","text":"ok"}]}}"#,
         );
-        assert!(matches!(&ev[0], AgentEvent::Tool(t) if t == "Bash: cargo test"));
+        assert!(
+            matches!(&ev[0], AgentEvent::Tool { name, summary } if name == "Bash" && summary == "Bash: cargo test")
+        );
         assert!(matches!(&ev[1], AgentEvent::Text(t) if t == "ok"));
     }
 

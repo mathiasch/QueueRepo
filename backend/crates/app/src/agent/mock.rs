@@ -223,7 +223,22 @@ pub(super) fn parse(v: &Value) -> Vec<AgentEvent> {
     let status = v["status"].as_u64().and_then(|x| u16::try_from(x).ok());
     match s(v, "type").as_str() {
         "text" => vec![AgentEvent::Text(s(v, "text"))],
-        "tool" => vec![AgentEvent::Tool(s(v, "text"))],
+        "tool" => {
+            let text = s(v, "text");
+            let name = match s(v, "name") {
+                n if !n.is_empty() => n,
+                _ => text
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("tool")
+                    .trim_end_matches(':')
+                    .to_string(),
+            };
+            vec![AgentEvent::Tool {
+                name,
+                summary: text,
+            }]
+        }
         "final" => vec![AgentEvent::Final(s(v, "text"))],
         "error" => match v["category"].as_str() {
             Some(c) => {

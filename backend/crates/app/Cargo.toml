@@ -12,7 +12,7 @@ name = "queued"
 path = "src/main.rs"
 
 [dependencies]
-queued-common = { path = "../common", features = ["scan"] }
+queued-common = { path = "../common", features = ["scan", "metrics"] }
 queued-api = { path = "../api", features = ["sqlx"] }
 anyhow.workspace = true
 axum.workspace = true
@@ -51,3 +51,6 @@ queued-runner = { path = "../runner" }
 tempfile.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }
+# WP10: the OTLP JSON of `otel.rs` is checked against the official proto types
+# (messages + serde only; no tonic transport, no SDK at runtime).
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "trace", "with-serde"] }

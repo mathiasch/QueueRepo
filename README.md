@@ -8,7 +8,8 @@ Aufträge per Web-UI (Desktop oder iPhone als PWA) einreihen. Pro Auftrag arbeit
 - **Parallel im selben Projekt:** pro Projekt einstellbar, wie viele Aufträge gleichzeitig laufen (Standard 1). Konflikte zwischen parallelen Aufträgen löst ein automatischer Korrektur-Auftrag.
 - **Token-Budgets pro Provider** (Claude, Codex/GPT, Gemini) in 5h- und 7-Tage-Fenstern plus 30-Tage-USD. Erkannte Abo-Limits pausieren den Provider bis zum Reset.
 - **Kein Root zur Laufzeit:** Die App hat keinerlei Host-Rechte. Der separate `queued-runner` läuft als unprivilegierter User und startet Agenten in rootless Podman.
-- **Notifications:** In-App (SSE), Web Push (PWA, auch iOS) und ntfy.
+- **Benachrichtigungen:** Postfach (SSE), Web Push (PWA, auch iOS), ntfy und signierter Webhook – pro Ereignis und Kanal einstellbar, mit Ruhezeiten und täglicher Zusammenfassung.
+- **Auswertung & Betrieb:** Dashboard (Erfolg beim ersten Versuch, Kosten, Cache, Dauer, Pausen), `/healthz`, `/readyz`, Prometheus `/metrics` (App + Runner), optionale OpenTelemetry-Traces.
 
 ## Architektur
 
@@ -467,6 +468,102 @@ Damit erreicht im Standard kein von Agenten geschriebener Anweisungstext einen A
 
 **Doppelte Vorschläge im Leerlauf (OnEmpty).** Bevor Vorschläge der Leerlauf-Funktion zu Aufträgen werden, prüft Queue jeden: Regeln (zu knapp, sehr umfangreich, berührt CI/Tests/Geheimnisse/Deployment/Git-Verlauf ⇒ Freigabe) und Ähnlichkeit zu offenen, erledigten, gescheiterten, abgebrochenen bzw. abgelehnten Aufträgen der letzten N Tage, zu rückgängig gemachten Aufträgen und zu den anderen Vorschlägen desselben Laufs. Die Ähnlichkeit ist deterministisch und ohne externen Dienst: Jaccard über normalisierte Wörter (mit einfacher Wortstamm-Kürzung, ohne Füllwörter) und Wortpaare von Titel und Text sowie über Zeichen-Dreiergruppen des Titels; der höhere Wert zählt. Ab *Duplikat ab* (Standard 60 %) wird verworfen, ab *Prüfen ab* (35 %) braucht der Vorschlag eine Freigabe; Vorschläge ähnlich zu rückgängig gemachten Aufträgen werden schon ab der Prüf-Schwelle verworfen (rückgängig gemachte Aufträge stehen außerdem als Negativbeispiele im Leerlauf-Prompt). Optional (*Einstellungen → Automatisch weiterarbeiten*) prüft zusätzlich ein Modell über den direkten Zugang des Analyse-Schritts des Projekts; es kann nur strenger urteilen, die Kosten stehen als Schritt „Prüfung“ beim Leerlauf-Auftrag. Die Begründung steht am erzeugten Auftrag („Warum dieser Vorschlag?“) und am Leerlauf-Auftrag („Geprüfte Vorschläge“).
 
+## Auswertung, Benachrichtigungen und Monitoring
+
+### Auswertung (Reiter „Auswertung“)
+
+Zeitraum 7, 30 oder 90 Tage; Bereich **„Meine Aufträge“** (eigene Aufträge und eigener Verbrauch in Projekten, in denen du *jetzt* Mitglied bist) oder **ein Projekt** (alle Aufträge des Projekts, für jede Rolle – genau wie die Auftragsliste des Projekts). Fremde Projekte gibt es nicht (404), API-Tokens haben keinen Zugriff.
+
+| Kennzahl | Bedeutung |
+|---|---|
+| Beim ersten Versuch erledigt | Ursprüngliche Aufträge (keine Reparaturaufträge), die ohne Reparaturauftrag erledigt wurden ÷ alle beendeten (erledigt, fehlgeschlagen, blockiert; Abbrüche zählen nicht). Daneben: „am Ende erledigt“ inkl. Reparaturkette. |
+| Kosten | Summe je Währung (Katalogpreise, WP13) und pro erledigtem Auftrag; nach Projekt, Anbieter/Modell und die zehn teuersten Aufträge. |
+| Cache-Treffer | Cache-Lesen ÷ (Eingabe + Cache-Lesen + Cache-Schreiben). |
+| Dauer bis erledigt | Median und 90-%-Wert von „angelegt → erledigt“, dazu die reine Agentenzeit. |
+| Pausen durch Limits | Minuten, in denen ein Anbieter pausiert war (Limit des Anbieters, Anmeldeproblem, eigenes Budget); überlappende Pausen zählen einmal. Nur in „Meine Aufträge“ (Pausen gehören einer Person). |
+
+Jedes Diagramm hat eine Textzusammenfassung für Screenreader und eine Tabelle mit allen Werten. Im Auftrag zeigt **„Auswertung dieses Auftrags“** jeden Agentenlauf (Dauer, Ergebnis, Tokens, Werkzeugaufrufe), die häufigsten Werkzeuge und Hinweise in Klartext. Verbrauchsdaten bleiben `USAGE_RETENTION_DAYS` Tage (Standard 400, mindestens 35); Verbrauch aus der Zeit vor WP13 ohne Projektzuordnung erscheint nicht.
+
+### Benachrichtigungen (Einstellungen → „Was wohin gemeldet wird“)
+
+Für jedes Ereignis einzeln: **Postfach**, **Push** (Web Push auf allen aktivierten Geräten), **ntfy** (Adresse unter „Benachrichtigungen“) und **Webhook**. Standard = Verhalten vor WP10 (Push/ntfy nur, wo etwas auf dich wartet; Webhook aus).
+
+| Ereignis | Standard extern | wichtig* |
+|---|---|---|
+| Rückfrage des Agenten, Freigabe nötig, Auftrag blockiert | Push + ntfy | ja |
+| Anbieter pausiert/Budget erreicht, Pull Request braucht dich, Automatisierung nicht gestartet, Tägliche Zusammenfassung | Push + ntfy | – |
+| Auftrag erledigt, Neuigkeiten zum Pull Request, Anbindungen, Folgeaufträge, Projekt-Regeln | nur Postfach | – |
+
+- **Ruhezeit** (z. B. 22:00–07:00, über Mitternacht erlaubt) in deiner Zeitzone: keine Push-/ntfy-Nachrichten, alles landet im Postfach und in der Zusammenfassung. *Wichtiges* kommt trotzdem, solange „Wichtiges trotzdem melden“ an ist. Webhooks gelten als Maschinen und werden immer zugestellt.
+- **Tägliche Zusammenfassung** zur gewählten Uhrzeit: erledigte/fehlgeschlagene/blockierte Aufträge, Kosten, was auf dich wartet, in der Ruhezeit Zurückgehaltenes, Pausenminuten. Genau eine pro Person und Tag – auch mit mehreren App-Instanzen und nach Neustarts (Datenbankschlüssel Person + lokales Datum). War die App zur Uhrzeit aus, kommt sie bis zu 12 Stunden später am selben Tag. Ist nichts passiert, kommt nichts.
+- Externe Zustellung über eine Warteschlange in der Datenbank: bis zu 5 Versuche mit Backoff (30 s, 1 min, 2 min, …), danach „fehlgeschlagen“ (sichtbar unter `GET /api/notifications/deliveries`). Ein Absturz genau zwischen „gesendet“ und „als gesendet markiert“ kann eine Nachricht doppelt zustellen.
+- **Webhook:** HTTPS-Adresse speichern, dann „Secret erzeugen“ (wird einmal angezeigt; neue Adresse ⇒ neues Secret nötig). Jede Zustellung ist ein `POST` mit JSON `{event, kind, title, body, task_id, url, created_at, delivery}` und den Köpfen `X-Queue-Event`, `X-Queue-Delivery` und `X-Queue-Signature: t=<Unix-Zeit>,v1=<hex>` mit `v1 = HMAC-SHA256(secret, "<t>.<roher Body>")`. Prüfen: Signatur vergleichen (konstante Zeit), Zeitstempel höchstens 5 Minuten alt, `delivery` gegen Wiederholungen merken.
+- **Sicherheit:** ntfy, Web Push und Webhooks laufen über den SSRF-geschützten Client (Link-Local/Metadaten immer gesperrt). Ziele im eigenen Netz (z. B. ntfy im LAN) nur mit `ALLOW_PRIVATE_NOTIFY_TARGETS=true` – **Änderung gegenüber früher**: ein ntfy im LAN muss jetzt so freigeschaltet werden. Titel und Texte laufen durch den Secret-Scanner.
+
+### Monitoring: Health, Metriken, Traces
+
+| Endpunkt | Wo | Schutz | Inhalt |
+|---|---|---|---|
+| `GET /healthz` | App, Runner | öffentlich | Prozess lebt (keine Abhängigkeit geprüft) |
+| `GET /readyz` | App | öffentlich | `200 {"status":"ready","checks":{"database":"ok","runner":"ok"}}` bzw. `503` mit `fail` – Datenbank (`SELECT 1`) und Runner (`/v1/info` mit Runner-Token), je 2 s Timeout, 1 s gecacht, keine Fehlertexte |
+| `GET /metrics` | App | `METRICS_TOKEN` (Bearer) und/oder eigener Listener `METRICS_BIND` | Prometheus-Text 0.0.4 |
+| `GET /metrics` | Runner | `RUNNER_METRICS_TOKEN` (≠ `RUNNER_TOKEN`) und/oder `RUNNER_METRICS_BIND` | Prometheus-Text 0.0.4 |
+
+Ohne Token und ohne eigenen Listener gibt es kein `/metrics` (404). Ein Listener auf einer Nicht-Loopback-Adresse startet nur mit Token. Das Metrik-Token des Runners öffnet keinen anderen Runner-Endpunkt, und das `RUNNER_TOKEN` öffnet `/metrics` nicht – Prometheus bekommt nie das Token, das Prozesse startet. Empfehlung für einen Host: `METRICS_BIND=127.0.0.1:9464`, `RUNNER_METRICS_BIND=127.0.0.1:9465`, Prometheus lokal:
+
+```yaml
+scrape_configs:
+  - job_name: queued
+    static_configs: [{ targets: ["127.0.0.1:9464"] }]
+  - job_name: queued-runner
+    static_configs: [{ targets: ["127.0.0.1:9465"] }]
+  # Mit Token statt eigenem Listener:
+  # - job_name: queued
+  #   authorization: { credentials_file: /etc/prometheus/queued-metrics-token }
+  #   static_configs: [{ targets: ["127.0.0.1:8080"] }]
+```
+
+**Metriken** (Labels nur aus festen Mengen – nie Nutzer-, Auftrags- oder Projekt-IDs, Titel oder freie Modellnamen; höchstens 500 Labelkombinationen je Metrik, Rest unter `_other`):
+
+| Metrik | Typ | Labels |
+|---|---|---|
+| `queued_build_info` | gauge | `version` |
+| `queued_http_requests_total` | counter | `method`, `route` (Muster wie `/api/tasks/{id}`, sonst `unmatched`), `status` (`2xx` …) |
+| `queued_http_request_duration_seconds` | histogram | – |
+| `queued_tasks` | gauge | `status` (nur aktive: `queued`, `running`, `merging` …; aus der DB, 10 s gecacht) |
+| `queued_agent_runs_total` | counter | `provider`, `kind` (`agent`/`review`/`plan`), `outcome` (`success`, `task_error`, `task`, `rate_limit`, `provider_auth`, `provider_transient`, `infra`, `stalled`, `timeout`, `cancelled`, `limit`, `steered`, `config`, `failure`) |
+| `queued_agent_run_duration_seconds` | histogram | `kind` |
+| `queued_tokens_total` | counter | `provider`, `model` (Katalog-ID oder `unknown`), `type` (`input`, `output`, `cache_read`, `cache_write`) |
+| `queued_cost_total` | counter | `provider`, `currency` |
+| `queued_provider_pauses` | gauge | `reason` (laufende Pausen aller Nutzer) |
+| `queued_notifications_total` | counter | `channel`, `result` (`sent`, `retry`, `failed`) |
+| `queued_notification_outbox_pending` | gauge | – |
+| `queued_digests_total` | counter | – |
+| `queued_database_up`, `queued_runner_up` | gauge | – |
+| `queued_otel_spans_dropped_total`, `queued_otel_export_errors_total` | counter | – |
+| `queued_runner_build_info` | gauge | `version` |
+| `queued_runner_http_requests_total` | counter | `method`, `route`, `status` |
+| `queued_runner_http_request_duration_seconds` | histogram | – |
+| `queued_runner_exec_active` | gauge | `kind` (`agent`, `review`, `plan`, `verify`, `setup`, `other`) |
+| `queued_runner_exec_total` | counter | `kind`, `outcome` (`success`, `failure`, `timeout`, `stalled`, `cancelled`, `error`, `aborted`) |
+| `queued_runner_exec_duration_seconds` | histogram | `kind` |
+| `queued_runner_egress_requests_total` | counter | `decision` (`allowed`, `refused`) |
+
+Zähler beginnen nach einem Neustart bei 0 (Prometheus-üblich, `rate()`/`increase()` verwenden).
+
+**OpenTelemetry-Traces** (optional, nur App): aktiv, sobald `OTEL_EXPORTER_OTLP_ENDPOINT` (→ `<endpoint>/v1/traces`) oder `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` gesetzt ist; `OTEL_SDK_DISABLED=true` oder `OTEL_TRACES_EXPORTER=none` schalten ab. Ohne Konfiguration: kein Exporter, kein Netzwerkzugriff, nur eine `Option`-Prüfung pro Span. Unterstützt: `OTEL_EXPORTER_OTLP_(TRACES_)HEADERS` (z. B. `authorization=Bearer%20…`), `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_EXPORTER_OTLP_(TRACES_)TIMEOUT` (ms). Protokoll ausschließlich **OTLP/HTTP mit JSON** (`http/json`, Collector-Port 4318); ein anderer Wert in `OTEL_EXPORTER_OTLP_(TRACES_)PROTOCOL` verhindert den Start. Export in Paketen (alle 5 s oder 512 Spans, Warteschlange 2 048, Überlauf wird gezählt), beim Herunterfahren wird geleert.
+
+Semantik nach den OpenTelemetry-GenAI-Konventionen (Status *Development*; geprüft gegen `open-telemetry/semantic-conventions-genai`, Commit `e6658f1` vom 6. 11. 2026 – die GenAI-Konventionen sind aus dem Hauptrepo dorthin umgezogen):
+
+| Span | Art | Attribute |
+|---|---|---|
+| `invoke_workflow queue_task` (ein Lauf eines Auftrags) | INTERNAL | `gen_ai.operation.name=invoke_workflow`, `queue.task.id`, `queue.project.id`, `queue.task.kind`, `queue.task.status`; Fehler: `error.type` = `failed`/`blocked`/`config`/`infra`/`cancelled` |
+| `invoke_agent {claude-code\|codex\|gemini-cli\|opencode\|mock}` (Agent, Prüfung, Plan) | CLIENT | `gen_ai.operation.name=invoke_agent`, `gen_ai.provider.name` (`anthropic`, `openai`, `gcp.gemini`, `aws.bedrock`, `gcp.vertex_ai`, `azure.ai.openai`, `mistral`, sonst Zugangstyp), `gen_ai.agent.name`, `gen_ai.request.model` (nur Katalog-ID), `gen_ai.usage.input_tokens` (inkl. Cache), `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens`, `queue.run.kind`, `queue.run.outcome`, `error.type` |
+| `execute_tool {Werkzeug}` | INTERNAL | `gen_ai.operation.name=execute_tool`, `gen_ai.tool.name` (bereinigt, sonst `other`), `gen_ai.tool.type=function`; Dauer bis zum nächsten Ereignis des Agenten (Näherung) |
+| `chat` (direkte Planung/Prüfung/Analyse/Critic) | CLIENT | `gen_ai.operation.name=chat`, `gen_ai.provider.name`, Tokens, `queue.step` |
+
+**Nie in Spans:** Prompts, Titel, Kontext, Code, Diffs, Werkzeug-Argumente und -Ergebnisse, Fehlertexte, Pfade, URLs, Secrets (Fehlerstatus ohne Nachricht). Ein Opt-in für Inhalte gibt es nicht; `OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT` wird ignoriert (Warnung im Log). Der Runner exportiert keine Traces.
+
 ## Tests
 
 | Ebene | Was | Ausführen |
@@ -545,6 +642,6 @@ cd frontend && trunk serve                      # http://localhost:5173, /api wi
 - **Geheimnisse im Setup:** Das Setup führt Code aus dem Repository aus (z. B. `preinstall` beim `npm install`), und das Repository wird von früheren Agentenläufen verändert. Seit WP03 fragt Queue vor einem Setup mit Geheimnissen nach, wenn sich Setup-Dateien seit der letzten Freigabe geändert haben (Heuristik, siehe oben). Trotzdem: enge Setup-Allowlist und nur Tokens mit minimalen Rechten. Die Leck-Suche findet nur wörtliche Kopien (nicht base64 o. Ä.) und liest Dateien bis 8 MiB.
 - Das Setup läuft bei jedem Auftrag (mit warmem Cache), es gibt keinen Container-Snapshot nach dem Setup.
 - **Plan-Modus/Sitzungen (WP06):** Nur Claude Code ist für Plan-Modus und Fortsetzen live geprüft (2.1.322, nicht die gepinnte 2.1.319). Bei Codex, Gemini und opencode stammen Aufruf und Speicherort der Sitzung aus den Programmen bzw. dem Quelltext, ausgeführt wurde nichts; scheitert ein Fortsetzen ohne jeden Verbrauch, startet Queue einen neuen Lauf mit Übergabe, eine still neu begonnene Sitzung bemerkt Queue aber nicht (der Prompt enthält deshalb immer die Aufgabe). Mit Engine `none` (nur Entwicklung) kann ein Plan-Lauf außerhalb seiner Wegwerf-Kopie schreiben; Queue erkennt nur Änderungen in der Kopie. „Sofort zustellen“ unterbricht nur den Agenten selbst, nicht Setup, Verify oder Review. Nachrichten erreichen einen Lauf nicht mitten in einem Schritt, sondern an dessen Ende (oder per Unterbrechung).
-- **Automatisierung (WP07):** GitHub signiert keinen Zeitstempel; nach 90 Tagen (Aufbewahrung des Verlaufs) könnte eine abgefangene GitHub-Zustellung erneut wirken. Ungültig signierte Anfragen werden nicht gespeichert und nicht gezählt (jede kostet einen Datenbankzugriff) – eine Drosselung von `/api/hooks/` gehört in den Reverse-Proxy bzw. Tunnel. Webhook-Bodys über 1 MiB lehnt Queue ab (GitHub erlaubt bis 25 MB; sehr große Pushes erscheinen dann als fehlgeschlagene Zustellung bei GitHub). Vorlagen lassen Anbieter/Modell im UI weg (Projekt-/Nutzervorgabe), per API sind sie setzbar. Ein Token gilt für alle Projekte seiner Person (Rollen greifen), es gibt keine projektgebundenen Tokens. `X-Hub-Signature-256` und alle ausgewerteten Felder sind aus GitHubs OpenAPI/Doku belegt, aber nur gegen nachgebaute Zustellungen getestet; der Wert `"Bot"` von `sender.type` ist nicht belegt. Zeitpläne laufen mit Tick-Auflösung (`TRIGGER_TICK_SECS`, Standard 15 s). Ausgehende Webhooks (Benachrichtigung an andere Systeme) gibt es nicht (WP10). Die Tests laufen als root: Die Eigentümer-Prüfung der `queuectl`-Datei ist mit einer fremden UID nicht automatisiert geprüft.
+- **Automatisierung (WP07):** GitHub signiert keinen Zeitstempel; nach 90 Tagen (Aufbewahrung des Verlaufs) könnte eine abgefangene GitHub-Zustellung erneut wirken. Ungültig signierte Anfragen werden nicht gespeichert und nicht gezählt (jede kostet einen Datenbankzugriff) – eine Drosselung von `/api/hooks/` gehört in den Reverse-Proxy bzw. Tunnel. Webhook-Bodys über 1 MiB lehnt Queue ab (GitHub erlaubt bis 25 MB; sehr große Pushes erscheinen dann als fehlgeschlagene Zustellung bei GitHub). Vorlagen lassen Anbieter/Modell im UI weg (Projekt-/Nutzervorgabe), per API sind sie setzbar. Ein Token gilt für alle Projekte seiner Person (Rollen greifen), es gibt keine projektgebundenen Tokens. `X-Hub-Signature-256` und alle ausgewerteten Felder sind aus GitHubs OpenAPI/Doku belegt, aber nur gegen nachgebaute Zustellungen getestet; der Wert `"Bot"` von `sender.type` ist nicht belegt. Zeitpläne laufen mit Tick-Auflösung (`TRIGGER_TICK_SECS`, Standard 15 s). Ausgehende Webhooks gibt es seit WP10 als Benachrichtigungskanal (siehe „Benachrichtigungen“). Die Tests laufen als root: Die Eigentümer-Prüfung der `queuectl`-Datei ist mit einer fremden UID nicht automatisiert geprüft.
 - **Anbindungen (WP08):** Nur gegen nachgebaute Zustellungen und Fake-Server getestet, nie gegen GitHub, Linear, Slack oder Jira selbst. Jira-Signatur und -Felder sind nur über die Sekundärquelle `jira.js` belegt; ob `issue.self` bei allen Jira-Webhooks die Site-Adresse enthält, ist nicht belegt (sonst „Fremder Arbeitsbereich“). Nicht belegt sind außerdem: der Fehlertext von Linear bei einer schon vorhandenen Activity-ID (Queue wertet „already exists“/„duplicate“ als Erfolg), dass bei GitHub nur Personen mit Triage-Rechten Labels setzen können (ein Label zählt beim Opt-in als Schreibrecht). GitHub und Jira signieren keinen Zeitstempel: Replays werden 90 Tage lang erkannt. Eine Slack-Wurzelnachricht (Slash-Befehl) kann bei verlorener Antwort doppelt erscheinen (eine Nachricht ohne Thread lässt sich nicht nachschlagen). Dass ein externes Konto wirklich der Person gehört, prüft Queue nicht – dafür steht die Freigabe der Eigentümerin. Ein Arbeitsbereich, den jemand zuerst mit einem anderen Projekt verbindet, ist für alle anderen belegt; lösen lässt sich das nur durch die Eigentümerin jenes Projekts (oder direkt in der Datenbank). Das Stopp-Signal aus Linear bricht den Auftrag nicht ab (Hinweis im Verlauf). Der WP07-GitHub-Auslöser und eine GitHub-Anbindung auf demselben Repository reagieren beide auf dasselbe Issue, wenn beide passen.
 - **Wissen, Zustand, Anhänge, Dedupe (WP09):** Was die CLIs aus dem Repository lesen und dass `project_doc_max_bytes=0` (Codex) bzw. `context.fileName` (Gemini) es abschaltet, ist aus Programm/Bundle abgeleitet, nicht mit echtem Modell geprüft; Claude-`@`-Importe in der Brücke ebenso. Vorschläge für die Regeln sind Volltexte: zwei offene Vorschläge werden nicht zusammengeführt, die Freigabe übernimmt genau den gewählten Text. Ein Projekt, das selbst ein Verzeichnis `.queue/` versioniert, wird nicht unterstützt (seit WP01 reserviert; die Übernahme eines Auftrags, der es ändert, wird angehalten). HEIC-Fotos werden abgelehnt (Safari wandelt sie beim Hochladen mit `accept="image/*"` normalerweise in JPEG um; nur in Chromium mit iPhone-Profil getestet, nicht auf einem echten iPhone). Animierte GIF/WebP werden auf das erste Bild reduziert. PDFs werden nicht bereinigt (Metadaten bleiben; ausgeliefert nur als Download). Die Ähnlichkeitsprüfung erkennt Umformulierungen mit ganz anderen Wörtern nicht (dafür der optionale Modell-Critic); die Schwellen sind Erfahrungswerte aus den Testfällen. API-Tokens (WP07) können die neuen Endpunkte nicht nutzen (Allowlist).

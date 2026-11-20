@@ -1,3 +1,4 @@
+pub mod analytics;
 pub mod attachments;
 pub mod automation;
 pub mod branch;
@@ -9,6 +10,7 @@ pub mod inbox;
 pub mod integrations;
 pub mod login;
 pub mod memory;
+pub mod notify_settings;
 pub mod onboarding;
 pub mod pr;
 pub mod project;

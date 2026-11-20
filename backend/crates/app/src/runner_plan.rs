@@ -372,7 +372,9 @@ mod tests {
                 match ev {
                     AgentEvent::Structured(v) => structured = Some(v),
                     AgentEvent::Session(s) => session = Some(s),
-                    AgentEvent::Tool(t) if t.starts_with("Write") || t.starts_with("Edit") => {
+                    AgentEvent::Tool { summary: t, .. }
+                        if t.starts_with("Write") || t.starts_with("Edit") =>
+                    {
                         edits.push(t)
                     }
                     _ => {}

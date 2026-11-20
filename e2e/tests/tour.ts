@@ -84,6 +84,9 @@ export async function tour(page: Page, info: TestInfo, device: string, full: boo
     await drawer.getByRole("button", { name: "Änderungen anzeigen" }).click();
     await expect(drawer.locator(".diff")).toBeVisible();
     await drawer.getByText("Protokoll anzeigen").click();
+    // WP10: session insights of the task.
+    await drawer.getByTestId("task-insights").locator("summary").click();
+    await expect(drawer.getByTestId("task-insights").getByRole("table")).toBeVisible();
     await expectAccessible(page, `drawer (${scheme})`);
     await shot(page, out, `${device}-${scheme}-drawer`);
     // WP06: "Weiter mit …" and commenting in the diff.
@@ -197,8 +200,17 @@ export async function tour(page: Page, info: TestInfo, device: string, full: boo
     await expect(page.locator(".member")).toHaveCount(1);
     await expectAccessible(page, `project members (${scheme})`);
 
+    // WP10: analytics with KPIs, charts and their tables.
+    await navLink(page, "Auswertung").click();
+    await expect(page.getByTestId("kpi-first-pass")).toBeVisible();
+    await page.getByTestId("chart-tasks").getByText("Als Tabelle anzeigen").click();
+    await expect(page.getByTestId("chart-tasks").getByRole("table")).toBeVisible();
+    await expectAccessible(page, `analytics (${scheme})`);
+    await shot(page, out, `${device}-${scheme}-analytics`, device === "desktop");
+
     await navLink(page, "Einstellungen").click();
     await expect(page.getByTestId("budget-mock")).toBeVisible();
+    await expect(page.getByTestId("notify-settings")).toBeVisible();
     await page.getByTestId("credential-claude").getByRole("button", { name: "Verbinden" }).click();
     // WP13: form for an additional access, price table, costs.
     await page.locator("#connectors").getByRole("button", { name: "Zugang hinzufügen" }).click();

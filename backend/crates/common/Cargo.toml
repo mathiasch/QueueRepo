@@ -7,6 +7,8 @@ description = "Wire protocol between the queue app and the runner"
 [features]
 # Secret scanner and diff analysis (runner + app; not needed in the WASM frontend).
 scan = ["dep:regex", "dep:sha2"]
+# Prometheus registry + /metrics access rules (app + runner, WP10).
+metrics = []
 
 [dependencies]
 serde.workspace = true

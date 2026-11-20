@@ -12,19 +12,23 @@ pub mod config;
 pub mod connectors;
 pub mod crypto;
 pub mod dedupe;
+pub mod digest;
 pub mod environment;
 pub mod error;
 pub mod estimate;
 pub mod eval;
 pub mod gateway;
 pub mod githost;
+pub mod health;
 pub mod intake;
 pub mod knowledge;
 pub mod limits;
 pub mod llm;
+pub mod metrics;
 pub mod models;
 pub mod notify;
 pub mod oidc;
+pub mod otel;
 pub mod plan;
 pub mod pr;
 pub mod pricing;
@@ -71,6 +75,10 @@ pub async fn start_worker(st: &state::AppState) -> anyhow::Result<()> {
     // 0 = tests drive the trigger scheduler themselves.
     if st.cfg.trigger_tick_secs > 0 {
         tokio::spawn(triggers::run(st.clone()));
+    }
+    // 0 = tests drive the notification loop themselves (WP10).
+    if st.cfg.notify_tick_secs > 0 {
+        tokio::spawn(notify::run(st.clone()));
     }
     // 0 = tests drive the intake outbox themselves.
     if st.cfg.intake_tick_secs > 0 {

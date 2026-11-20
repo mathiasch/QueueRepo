@@ -52,7 +52,7 @@ test("content never sits under the Dynamic Island, notch or home indicator", asy
   else expect(brand.y).toBeGreaterThanOrEqual(59);
   // All tabs fully visible and tappable (≥ 44pt), clear of island / home indicator.
   const tabs = page.locator(".tabs .tab");
-  await expect(tabs).toHaveCount(4);
+  await expect(tabs).toHaveCount(5);
   for (let i = 0; i < 4; i++) {
     const b = (await tabs.nth(i).boundingBox())!;
     expect(b.x).toBeGreaterThanOrEqual(landscape ? 59 : 0);

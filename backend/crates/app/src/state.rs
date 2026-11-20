@@ -43,6 +43,14 @@ pub struct AppState {
     pub prices: Arc<std::sync::RwLock<Option<PriceCache>>>,
     /// What the runner enforces (`GET /v1/info`), cached (see `environment::sandbox`).
     pub sandbox: Arc<std::sync::RwLock<Option<(std::time::Instant, queued_api::env::SandboxInfo)>>>,
+    /// WP10: Prometheus metrics.
+    pub metrics: Arc<crate::metrics::AppMetrics>,
+    /// WP10: OTLP trace exporter (`None` = tracing off).
+    pub otel: Option<Arc<crate::otel::Tracer>>,
+    /// WP10: last readiness result (see `health::readiness`).
+    pub ready: Arc<crate::health::ReadyCache>,
+    /// WP10: wakes the notification loop (outbox, daily summary).
+    pub notify_wake: Arc<Notify>,
 }
 
 pub type PriceCache = (Option<i32>, Arc<queued_api::PriceCatalog>);
@@ -51,6 +59,14 @@ impl AppState {
     pub fn new(cfg: Config, db: PgPool) -> anyhow::Result<Self> {
         let vapid = Vapid::load_or_create(&cfg.data_dir)?;
         let (bus, _) = broadcast::channel(1024);
+        let metrics = Arc::new(crate::metrics::AppMetrics::new());
+        let otel = cfg.otel.clone().map(|c| {
+            crate::otel::Tracer::start(
+                c,
+                Some(metrics.otel_dropped.clone()),
+                Some(metrics.otel_errors.clone()),
+            )
+        });
         Ok(Self {
             db,
             runner: RunnerClient::new(&cfg.runner_url, &cfg.runner_token),
@@ -71,6 +87,10 @@ impl AppState {
             vapid: Arc::new(vapid),
             prices: Arc::new(std::sync::RwLock::new(None)),
             sandbox: Arc::new(std::sync::RwLock::new(None)),
+            metrics,
+            otel,
+            ready: Arc::new(tokio::sync::Mutex::new(None)),
+            notify_wake: Arc::new(Notify::new()),
         })
     }
 

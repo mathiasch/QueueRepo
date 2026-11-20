@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod gate;
 pub mod glob;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod net;
 #[cfg(feature = "scan")]
 pub mod secrets;

@@ -192,6 +192,7 @@ pub fn TaskDrawer(id: Uuid) -> impl IntoView {
                         {move || pull.get().map(|p| view! { <super::pr::PrBlock pr=p/> })}
                         <super::steer::MessagesBlock id=id task=task events=events/>
                         {move || diff.get().map(|d| view! { <super::steer::CommentDiff id=id diff=d/> })}
+                        <super::analytics::TaskInsightsBlock id=id/>
                         <LogBlock t=task events=events/>
                     </div>
                 </Show>

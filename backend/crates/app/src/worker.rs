@@ -110,7 +110,7 @@ pub async fn run(st: AppState) {
         }
         if last_prune.elapsed() > Duration::from_secs(3600) {
             last_prune = std::time::Instant::now();
-            if let Err(e) = budget::prune(&st.db).await {
+            if let Err(e) = budget::prune(&st.db, st.cfg.usage_retention_days).await {
                 tracing::warn!("usage prune failed: {e:#}");
             }
             if let Err(e) = runner::merge::sweep(&st).await {

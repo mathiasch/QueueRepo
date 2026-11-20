@@ -360,7 +360,7 @@ mod tests {
         for line in raw.lines() {
             for ev in agent::parse_line("claude", line, &mut ps) {
                 match ev {
-                    AgentEvent::Tool(_) => o.tools += 1,
+                    AgentEvent::Tool { .. } => o.tools += 1,
                     AgentEvent::UsageDelta(u) => o.usage_delta.add(&u),
                     AgentEvent::UsageTotal(u) => o.usage_total = Some(u),
                     AgentEvent::Session(s) => o.session_id = Some(s),

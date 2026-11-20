@@ -3,6 +3,7 @@
 pub mod egress;
 pub mod exec;
 pub mod git;
+pub mod metrics;
 pub mod sessions;
 pub mod setup;
 pub mod snapshot;
@@ -49,6 +50,8 @@ pub struct RunnerConfig {
     pub egress: Arc<egress::EgressConfig>,
     /// WP06: CLI session stores unused for this many days are removed.
     pub session_ttl_days: u64,
+    /// WP10: who may read `/metrics` (`RUNNER_METRICS_TOKEN`/`_BIND`).
+    pub metrics: queued_common::metrics::Access,
 }
 
 /// Longest data dir path: `<data_dir>/e/<16 hex>/p.sock` must stay below the
@@ -77,6 +80,7 @@ impl RunnerConfig {
                 ..Default::default()
             }),
             session_ttl_days: sessions::DEFAULT_TTL_DAYS,
+            metrics: Default::default(),
         }
     }
 
@@ -100,6 +104,8 @@ pub struct RunnerState {
     running: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /// Workspace of each active run (run name → workspace id).
     active: Arc<Mutex<HashMap<String, String>>>,
+    /// WP10: Prometheus metrics of this runner.
+    pub metrics: Arc<metrics::RunnerMetrics>,
 }
 
 impl RunnerState {
@@ -109,6 +115,7 @@ impl RunnerState {
             locks: Default::default(),
             running: Default::default(),
             active: Default::default(),
+            metrics: Arc::new(metrics::RunnerMetrics::new()),
         }
     }
 
@@ -228,9 +235,22 @@ pub fn router(st: RunnerState) -> Router {
         .route("/cli-status", get(cli_status))
         .route("/info", get(info))
         .layer(middleware::from_fn_with_state(st.clone(), auth));
-    Router::new()
+    let mut r = Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .nest(API_PREFIX, api)
+        .nest(API_PREFIX, api);
+    // WP10: `/metrics` on this listener only with its own token (never the
+    // exec token); a separate listener serves it otherwise (`metrics_router`).
+    if st.cfg.metrics.on_main() {
+        r = r.route("/metrics", get(metrics::serve));
+    }
+    r.layer(middleware::from_fn_with_state(st.clone(), metrics::track))
+        .with_state(st)
+}
+
+/// Router of the separate metrics listener (`RUNNER_METRICS_BIND`).
+pub fn metrics_router(st: RunnerState) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics::serve))
         .with_state(st)
 }
 
@@ -774,13 +794,16 @@ async fn exec_start(State(st): State<RunnerState>, Json(req): Json<ExecRequest>)
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(256);
     let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(256);
     let name = req.name.clone();
+    let run = st.metrics.exec_started(&req.name);
     let st2 = st.clone();
     let c2 = cancel.clone();
     tokio::spawn(async move {
         let cfg = st2.cfg.clone();
         let runner = tokio::spawn(async move { exec::run(&cfg, req, c2, tx).await });
         let mut ended = false;
+        let mut run = run;
         while let Some(frame) = rx.recv().await {
+            st2.metrics.on_frame(&mut run, &frame);
             if matches!(frame, ExecFrame::Exit { .. } | ExecFrame::Fail { .. }) {
                 ended = true;
                 // The process is gone: the workspace is free before the
@@ -795,6 +818,7 @@ async fn exec_start(State(st): State<RunnerState>, Json(req): Json<ExecRequest>)
             }
         }
         let _ = runner.await;
+        st2.metrics.exec_ended(run);
         if !ended {
             // (A run with the same name may already have started otherwise.)
             st2.running.lock().await.remove(&name);
@@ -839,6 +863,134 @@ mod tests {
         let addr = format!("http://{}", l.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(l, router(st)).await.unwrap() });
         (t, addr)
+    }
+
+    /// WP10: `/metrics` needs its own token; the exec token does not open
+    /// it and the metrics token opens nothing else. Labels carry the run
+    /// kind, never the task id of the run name.
+    #[tokio::test]
+    async fn metrics_need_their_own_token_and_carry_no_ids() {
+        let t = tempfile::tempdir().unwrap();
+        let mtok = "metrics-token-0123456789abcdef";
+        let mut cfg = RunnerConfig::for_tests(t.path().to_path_buf());
+        cfg.metrics = queued_common::metrics::Access::parse(
+            Some(mtok.into()),
+            None,
+            "RUNNER_",
+            Some(&cfg.token),
+        )
+        .unwrap();
+        let st = RunnerState::new(cfg);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, router(st)).await.unwrap() });
+        let c = reqwest::Client::new();
+        let get = |tok: Option<&str>| {
+            let mut r = c.get(format!("{a}/metrics"));
+            if let Some(t) = tok {
+                r = r.bearer_auth(t);
+            }
+            r.send()
+        };
+        assert_eq!(get(None).await.unwrap().status(), 401);
+        assert_eq!(get(Some("test-token")).await.unwrap().status(), 401);
+        assert_eq!(get(Some("wrong")).await.unwrap().status(), 401);
+        // The metrics token is no runner token.
+        assert_eq!(
+            c.get(format!("{a}/v1/info"))
+                .bearer_auth(mtok)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        // One run with a task-like name.
+        c.post(format!("{a}/v1/workspaces/w1"))
+            .bearer_auth("test-token")
+            .json(&InitWorkspace::default())
+            .send()
+            .await
+            .unwrap();
+        let req = ExecRequest {
+            name: "q-0123456789ab-agent".into(),
+            workspace: "w1".into(),
+            program: "sh".into(),
+            args: vec!["-c".into(), "echo hi".into()],
+            env: vec![],
+            home_files: vec![],
+            read_back: vec![],
+            stdin: None,
+            timeout_secs: 10,
+            idle_timeout_secs: None,
+            queue_files: vec![],
+            egress: Default::default(),
+            cache: None,
+            secret_env: vec![],
+            home_env: vec![],
+            read_only: false,
+            session: None,
+        };
+        c.post(format!("{a}/v1/exec"))
+            .bearer_auth("test-token")
+            .json(&req)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let mut text = String::new();
+        for _ in 0..50 {
+            let r = get(Some(mtok)).await.unwrap();
+            assert_eq!(r.status(), 200);
+            assert!(r.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/plain; version=0.0.4"));
+            text = r.text().await.unwrap();
+            if text.contains("queued_runner_exec_total{kind=\"agent\",outcome=\"success\"} 1") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            text.contains("queued_runner_exec_total{kind=\"agent\",outcome=\"success\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("queued_runner_exec_active{kind=\"agent\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("route=\"/v1/exec\""),
+            "route pattern of the nested API: {text}"
+        );
+        assert!(text.contains("route=\"/v1/workspaces/{id}\""), "{text}");
+        assert!(
+            !text.contains("0123456789ab"),
+            "no task id in labels: {text}"
+        );
+        assert!(!text.contains("w1"), "no workspace id in labels");
+        queued_common::metrics::validate_exposition(&text).unwrap();
+    }
+
+    /// Without metrics settings there is no `/metrics` at all.
+    #[tokio::test]
+    async fn metrics_are_off_by_default() {
+        let (_t, a) = serve().await;
+        let c = reqwest::Client::new();
+        for tok in ["test-token", ""] {
+            assert_eq!(
+                c.get(format!("{a}/metrics"))
+                    .bearer_auth(tok)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                404
+            );
+        }
     }
 
     #[tokio::test]

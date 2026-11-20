@@ -80,6 +80,7 @@ pub fn SettingsPage() -> impl IntoView {
                 None => view! { <p class="muted" role="status">"Lade Einstellungen …"</p> }.into_any(),
                 Some(s) => view! { <GeneralSettings s=s/> }.into_any(),
             }}
+            <super::notify_settings::NotifySettingsCard/>
             <Budgets/>
             <Credentials/>
             <super::tokens::TokensCard/>

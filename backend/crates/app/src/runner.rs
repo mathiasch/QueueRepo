@@ -24,6 +24,7 @@ use crate::{
         status, AgentResult, FailureClass, FollowUp, Project, ReviewResult, Settings, Task, Usage,
     },
     notify::{notify, Note},
+    otel,
     pricing::{self, Meter, PriceCtx, Tier},
     prompt::{self, Parent},
     queue::{self, event, finish, Finish, NewTask, Requeue, TaskLimits},
@@ -83,7 +84,28 @@ pub async fn run_task(st: AppState, task: Task, cancel: CancellationToken, gen: 
         .clone()
         .and_then(|u| serde_json::from_value(u).ok())
         .unwrap_or_default();
-    match run_inner(&st, &task, &cancel, &mut usage).await {
+    // WP10: root span of this run of the task (`invoke_workflow`, the queue
+    // decides the flow); agent runs below become its children.
+    let mut root = otel::Span::start(
+        st.otel.as_ref(),
+        || "invoke_workflow queue_task".into(),
+        otel::Kind::Internal,
+        None,
+    );
+    root.str("gen_ai.operation.name", "invoke_workflow");
+    root.str("queue.task.id", &id.to_string());
+    root.str("queue.project.id", &task.project_id.to_string());
+    root.str("queue.task.kind", task_kind_label(&task.kind));
+    let ctx = root.ctx();
+    let res = otel::scope(ctx, run_inner(&st, &task, &cancel, &mut usage)).await;
+    if res.is_err() {
+        root.error(match &res {
+            Err(RunError::Config(_)) => "config",
+            _ if cancel.is_cancelled() => "cancelled",
+            _ => "infra",
+        });
+    }
+    match res {
         Ok(()) => {}
         Err(_) if cancel.is_cancelled() => {
             if let Err(e) = finish_cancelled(&st, id, None, None, &usage).await {
@@ -134,8 +156,31 @@ pub async fn run_task(st: AppState, task: Task, cancel: CancellationToken, gen: 
             }
         }
     }
+    if let Ok(Some(status)) =
+        sqlx::query_scalar::<_, String>("SELECT status FROM tasks WHERE id=$1")
+            .bind(id)
+            .fetch_optional(&st.db)
+            .await
+    {
+        let label = crate::models::status_label(&status);
+        root.str("queue.task.status", label);
+        if matches!(label, "failed" | "blocked") {
+            root.error(label);
+        }
+    }
+    root.end();
     st.untrack(id, gen).await;
     st.wake.notify_one();
+}
+
+/// Task kind as span attribute (fixed set).
+fn task_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "task" => "task",
+        "fix" => "fix",
+        "onempty" => "onempty",
+        _ => "other",
+    }
 }
 
 /// Sets a still-running task to `blocked` (no-op if it already ended).
@@ -1044,6 +1089,7 @@ pub(crate) async fn record_cost(
     connector: Option<Uuid>,
     sc: &StepCost,
 ) -> sqlx::Result<()> {
+    st.metrics.usage(provider, sc);
     budget::record_usage(
         &st.db,
         budget::UsageRow {
@@ -1969,6 +2015,30 @@ async fn agent_run(
         read_only: spec.read_only,
         session: spec.store.clone(),
     };
+    // WP10: one `invoke_agent` span and one `task_runs` row per run.
+    let run_started = Utc::now();
+    let run_kind = match spec.kind {
+        RunKind::Review => "review",
+        RunKind::Plan => "plan",
+        RunKind::Agent => "agent",
+    };
+    let conn_type = spec.cred.conn.as_ref().map(|c| c.kind.as_str());
+    let mut span = otel::Span::start(
+        st.otel.as_ref(),
+        || format!("invoke_agent {}", otel::agent_name(spec.provider)),
+        otel::Kind::Client,
+        None,
+    );
+    span.str("gen_ai.operation.name", "invoke_agent");
+    span.str(
+        "gen_ai.provider.name",
+        otel::provider_name(spec.provider, conn_type),
+    );
+    span.str("gen_ai.agent.name", otel::agent_name(spec.provider));
+    span.str("queue.run.kind", run_kind);
+    span.str("queue.task.id", &task.id.to_string());
+    span.str("queue.project.id", &task.project_id.to_string());
+    let span_ctx = span.ctx();
     let run_cancel = cancel.child_token();
     // WP06 "Sofort zustellen": the steering token stops this run only.
     let steered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1988,6 +2058,10 @@ async fn agent_run(
     let consumer = async {
         let mut ps = ParseState::default();
         let mut o = RunOutcome::default();
+        let mut tools = ToolStats::default();
+        // Open `execute_tool` span: ends with the agent's next event (the
+        // CLIs report no uniform tool end – an approximation, documented).
+        let mut tool_span: Option<otel::Span> = None;
         let mut stderr_events = 0;
         let mut elog = EgressLog::new(phase);
         let scan_log = spec.kind == RunKind::Agent;
@@ -2015,14 +2089,31 @@ async fn agent_run(
                 ExecFrame::Out { line } => {
                     seen_log(&mut o, &line);
                     for ev in agent::parse_line(provider, &line, &mut ps) {
+                        if let Some(t) = tool_span.take() {
+                            t.end();
+                        }
                         match ev {
                             AgentEvent::Text(t) if !t.trim().is_empty() => {
                                 event(st, task, "text", &t).await
                             }
                             AgentEvent::Text(_) => {}
-                            AgentEvent::Tool(t) => {
+                            AgentEvent::Tool { name, summary } => {
                                 o.tools += 1;
-                                event(st, task, "tool", &t).await
+                                let name = otel::tool_name(&name);
+                                tools.add(name);
+                                if span_ctx.is_some() {
+                                    let mut t = otel::Span::start(
+                                        st.otel.as_ref(),
+                                        || format!("execute_tool {name}"),
+                                        otel::Kind::Internal,
+                                        span_ctx,
+                                    );
+                                    t.str("gen_ai.operation.name", "execute_tool");
+                                    t.str("gen_ai.tool.name", name);
+                                    t.str("gen_ai.tool.type", "function");
+                                    tool_span = Some(t);
+                                }
+                                event(st, task, "tool", &summary).await
                             }
                             AgentEvent::Session(id) => o.session_id = Some(id),
                             AgentEvent::UsageDelta(mut u) => {
@@ -2094,10 +2185,13 @@ async fn agent_run(
                 _ => {}
             }
         }
+        if let Some(t) = tool_span.take() {
+            t.end();
+        }
         elog.finish(st, task, enforced).await;
-        (o, meter)
+        (o, meter, tools)
     };
-    let (last, (mut o, meter)) = tokio::join!(exec(st, req, &run_cancel, tx), consumer);
+    let (last, (mut o, meter, tools)) = tokio::join!(exec(st, req, &run_cancel, tx), consumer);
     if let Some(w) = steer_watch {
         w.abort();
     }
@@ -2174,7 +2268,132 @@ async fn agent_run(
     }
     o.stderr_tail = tail(&o.stderr_tail, 3000);
     o.step_cost = Some(meter.finish(&o.usage()));
+    finish_run_record(
+        st,
+        task,
+        spec.provider,
+        run_kind,
+        run_started,
+        &o,
+        tools,
+        span,
+    )
+    .await;
     Ok(o)
+}
+
+/// Tool calls of one run by sanitized name (at most [`MAX_TOOL_NAMES`]).
+#[derive(Default)]
+pub(crate) struct ToolStats(std::collections::BTreeMap<String, i64>);
+
+const MAX_TOOL_NAMES: usize = 50;
+
+impl ToolStats {
+    pub(crate) fn add(&mut self, name: &str) {
+        let key = if self.0.contains_key(name) || self.0.len() < MAX_TOOL_NAMES {
+            name
+        } else {
+            "other"
+        };
+        *self.0.entry(key.to_string()).or_insert(0) += 1;
+    }
+}
+
+/// Outcome of one agent run as metric label / `task_runs.outcome`.
+pub(crate) fn run_outcome(o: &RunOutcome) -> &'static str {
+    if o.steered {
+        "steered"
+    } else if o.guard_limit.is_some() || o.cli_limit.is_some() {
+        "limit"
+    } else if o.cancelled {
+        "cancelled"
+    } else if o.timed_out {
+        "timeout"
+    } else if o.stalled {
+        "stalled"
+    } else if o.infra_error.is_some() {
+        "infra"
+    } else if let Some((c, _)) = &o.failure {
+        c.class().as_str()
+    } else if o.error.is_some() {
+        "task_error"
+    } else if o.success {
+        "success"
+    } else {
+        "failure"
+    }
+}
+
+/// WP10: `task_runs` row, run metrics and the end of the `invoke_agent` span.
+#[allow(clippy::too_many_arguments)]
+async fn finish_run_record(
+    st: &AppState,
+    task: &Task,
+    provider: &str,
+    kind: &'static str,
+    started: chrono::DateTime<Utc>,
+    o: &RunOutcome,
+    tools: ToolStats,
+    mut span: otel::Span,
+) {
+    let outcome = run_outcome(o);
+    let u = o.priced_usage();
+    let price_id = o.step_cost.as_ref().and_then(|c| c.price_id.clone());
+    let secs = (Utc::now() - started).num_milliseconds().max(0) as f64 / 1000.0;
+    st.metrics.agent_runs.inc(&[provider, kind, outcome]);
+    st.metrics.agent_run_seconds.observe(&[kind], secs);
+    if span.is_recording() {
+        if let Some(m) = otel::model_name(price_id.as_deref()) {
+            span.str("gen_ai.request.model", m);
+        }
+        // Conventions: input tokens include cached ones.
+        span.int(
+            "gen_ai.usage.input_tokens",
+            u.input_tokens
+                .saturating_add(u.cache_read_tokens)
+                .saturating_add(u.cache_write_tokens),
+        );
+        span.int("gen_ai.usage.output_tokens", u.output_tokens);
+        if u.cache_read_tokens > 0 {
+            span.int("gen_ai.usage.cache_read.input_tokens", u.cache_read_tokens);
+        }
+        if u.cache_write_tokens > 0 {
+            span.int(
+                "gen_ai.usage.cache_write.input_tokens",
+                u.cache_write_tokens,
+            );
+        }
+        span.str("queue.run.outcome", outcome);
+        if !matches!(outcome, "success" | "steered") {
+            span.error(outcome);
+        }
+    }
+    span.end();
+    let calls: i64 = tools.0.values().sum();
+    let res = sqlx::query(
+        "INSERT INTO task_runs (task_id, user_id, project_id, kind, provider, price_id, started_at, ended_at, outcome,
+                                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, tool_calls, tools)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,now(),$8,$9,$10,$11,$12,$13,$14)",
+    )
+    .bind(task.id)
+    .bind(task.user_id)
+    .bind(task.project_id)
+    .bind(kind)
+    .bind(provider)
+    .bind(price_id)
+    .bind(started)
+    .bind(outcome)
+    .bind(u.input_tokens)
+    .bind(u.output_tokens)
+    .bind(u.cache_read_tokens)
+    .bind(u.cache_write_tokens)
+    .bind(calls.min(i32::MAX as i64) as i32)
+    .bind(serde_json::to_value(&tools.0).unwrap_or_default())
+    .execute(&st.db)
+    .await;
+    if let Err(e) = res {
+        tracing::warn!("task {}: run record not stored: {e:#}", task.id);
+    }
 }
 
 enum SetupOutcome {
@@ -3392,7 +3611,7 @@ async fn llm_critic(
         cache_long: false,
     };
     let http = llm::client(&ep.guard);
-    let resp = match llm::call(&http, &ep, &req).await {
+    let resp = match llm::call_traced(st, &http, &ep, &req, parent.id, "critic").await {
         Ok(r) => r,
         Err(e) => return skip(format!("{e}")).await,
     };

@@ -19,8 +19,8 @@ use crate::ui::dialog::{ConfirmDialog, Modal};
 use crate::ui::{uid, Ic, Icon};
 
 use super::{
-    drawer::TaskDrawer, inbox::InboxPage, project::ProjectPage, projects::ProjectsPage,
-    queue::QueuePage, settings::SettingsPage,
+    analytics::AnalyticsPage, drawer::TaskDrawer, inbox::InboxPage, project::ProjectPage,
+    projects::ProjectsPage, queue::QueuePage, settings::SettingsPage,
 };
 
 #[component]
@@ -42,6 +42,7 @@ pub fn Shell(meta: Meta, user: User) -> impl IntoView {
                         <Route path=path!("/inbox") view=InboxPage/>
                         <Route path=path!("/projects") view=ProjectsPage/>
                         <Route path=path!("/projects/:id") view=ProjectPage/>
+                        <Route path=path!("/analytics") view=AnalyticsPage/>
                         <Route path=path!("/settings") view=SettingsPage/>
                     </Routes>
                 </main>
@@ -196,6 +197,7 @@ fn AppBar() -> impl IntoView {
                     (a + unread.get(), a > 0, "neu")
                 }))}
                 {tab("/projects", "Projekte", Ic::Folder, Signal::derive(|| (0, false, "")))}
+                {tab("/analytics", "Auswertung", Ic::Chart, Signal::derive(|| (0, false, "")))}
                 {tab("/settings", "Einstellungen", Ic::Settings, Signal::derive(|| (0, false, "")))}
             </nav>
             <LimitChips/>

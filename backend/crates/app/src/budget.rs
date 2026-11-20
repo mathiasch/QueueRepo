@@ -153,6 +153,17 @@ pub async fn set_budget(db: &PgPool, user: Uuid, provider: &str, b: &Budget) -> 
     .bind(b.limit_30d_usd.filter(|x| *x > 0.0))
     .execute(db)
     .await?;
+    // WP10: a raised budget ends a running budget pause in the history.
+    if status(db, user, provider).await?.budget_until.is_none() {
+        sqlx::query(
+            "UPDATE provider_pauses SET ends_at=now()
+              WHERE user_id=$1 AND provider=$2 AND reason='budget' AND ends_at > now()",
+        )
+        .bind(user)
+        .bind(provider)
+        .execute(db)
+        .await?;
+    }
     Ok(())
 }
 
@@ -212,6 +223,20 @@ pub async fn set_limited(
     .bind(used)
     .execute(db)
     .await?;
+    // WP10 history: extend the running rate-limit pause or start one.
+    sqlx::query(
+        "WITH upd AS (
+             UPDATE provider_pauses SET ends_at = GREATEST(ends_at, $3, now())
+              WHERE user_id=$1 AND provider=$2 AND reason='rate_limit' AND ends_at > now()
+          RETURNING id)
+         INSERT INTO provider_pauses (user_id, provider, reason, ends_at)
+         SELECT $1, $2, 'rate_limit', GREATEST($3, now()) WHERE NOT EXISTS (SELECT 1 FROM upd)",
+    )
+    .bind(user)
+    .bind(provider)
+    .bind(until)
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -228,6 +253,16 @@ pub async fn set_paused(db: &PgPool, user: Uuid, provider: &str, reason: &str) -
     .bind(reason)
     .execute(db)
     .await?;
+    // WP10 history: open until the pause is lifted.
+    sqlx::query(
+        "INSERT INTO provider_pauses (user_id, provider, reason)
+         SELECT $1, $2, 'auth' WHERE NOT EXISTS (
+             SELECT 1 FROM provider_pauses WHERE user_id=$1 AND provider=$2 AND reason='auth' AND ends_at IS NULL)",
+    )
+    .bind(user)
+    .bind(provider)
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -239,6 +274,17 @@ pub async fn clear_pause(
     provider: &str,
     with_limit: bool,
 ) -> sqlx::Result<bool> {
+    // WP10 history: the lifted pauses end now.
+    sqlx::query(
+        "UPDATE provider_pauses SET ends_at=now()
+          WHERE user_id=$1 AND provider=$2
+            AND ((reason='auth' AND ends_at IS NULL) OR ($3 AND reason='rate_limit' AND ends_at > now()))",
+    )
+    .bind(user)
+    .bind(provider)
+    .bind(with_limit)
+    .execute(db)
+    .await?;
     Ok(sqlx::query(
         "UPDATE provider_limits SET paused_reason=NULL,
                 limited_until = CASE WHEN $3 THEN NULL ELSE limited_until END
@@ -295,12 +341,30 @@ pub async fn take_budget_notification(
     .execute(db)
     .await?
     .rows_affected();
+    if updated > 0 {
+        // WP10 history: the budget blocks until the oldest usage leaves the window.
+        sqlx::query(
+            "INSERT INTO provider_pauses (user_id, provider, reason, ends_at) VALUES ($1,$2,'budget',GREATEST($3, now()))",
+        )
+        .bind(user)
+        .bind(provider)
+        .bind(until)
+        .execute(db)
+        .await?;
+    }
     Ok((updated > 0).then_some((reason, until)))
 }
 
-pub async fn prune(db: &PgPool) -> sqlx::Result<u64> {
+/// Removes usage older than `retention_days` (WP10: kept for analytics,
+/// at least 35 days for the 30-day budget window).
+pub async fn prune(db: &PgPool, retention_days: i64) -> sqlx::Result<u64> {
+    sqlx::query("DELETE FROM provider_pauses WHERE ends_at < now() - make_interval(days => $1)")
+        .bind(retention_days.max(35) as i32)
+        .execute(db)
+        .await?;
     Ok(
-        sqlx::query("DELETE FROM usage_log WHERE ts < now() - interval '35 days'")
+        sqlx::query("DELETE FROM usage_log WHERE ts < now() - make_interval(days => $1)")
+            .bind(retention_days.max(35) as i32)
             .execute(db)
             .await?
             .rows_affected(),

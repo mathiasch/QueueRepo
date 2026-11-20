@@ -99,9 +99,9 @@ fn claude_success_structured_recorded() {
         })
         .expect("structured_output in stream-json result");
     assert_eq!(s["a"], "Hi! How can I help you today?");
-    assert!(evs
-        .iter()
-        .any(|e| matches!(e, AgentEvent::Tool(t) if t.starts_with("StructuredOutput"))));
+    assert!(evs.iter().any(
+        |e| matches!(e, AgentEvent::Tool { summary: t, .. } if t.starts_with("StructuredOutput"))
+    ));
     let t = total(&evs).unwrap();
     assert_eq!(
         (
@@ -255,10 +255,10 @@ fn codex_success_structured_final_message() {
         .any(|e| matches!(e, AgentEvent::Structured(v) if v["status"] == "done")));
     assert!(evs
         .iter()
-        .any(|e| matches!(e, AgentEvent::Tool(t) if t.contains("cargo test"))));
+        .any(|e| matches!(e, AgentEvent::Tool { summary: t, .. } if t.contains("cargo test"))));
     assert!(evs
         .iter()
-        .any(|e| matches!(e, AgentEvent::Tool(t) if t == "edit src/lib.rs")));
+        .any(|e| matches!(e, AgentEvent::Tool { summary: t, name } if t == "edit src/lib.rs" && name == "file_change")));
     let t = total(&evs).unwrap();
     assert_eq!(
         (t.input_tokens, t.cache_read_tokens, t.output_tokens),
@@ -306,7 +306,7 @@ fn gemini_success_with_tools() {
     assert_eq!(class, None);
     assert!(evs
         .iter()
-        .any(|e| matches!(e, AgentEvent::Tool(t) if t == "run_shell_command: npm test")));
+        .any(|e| matches!(e, AgentEvent::Tool { summary: t, name } if t == "run_shell_command: npm test" && name == "run_shell_command")));
     assert!(evs
         .iter()
         .any(|e| matches!(e, AgentEvent::Final(t) if t == "Tests pass.")));
@@ -350,7 +350,7 @@ fn gemini_network_error_is_transient() {
 fn opencode_success_with_tools_and_usage() {
     let (evs, class) = run_fixture("opencode", "success_tools");
     assert_eq!(class, None);
-    assert_eq!(count(&evs, |e| matches!(e, AgentEvent::Tool(_))), 2);
+    assert_eq!(count(&evs, |e| matches!(e, AgentEvent::Tool { .. })), 2);
     assert!(evs.contains(&AgentEvent::Final("Tests laufen, Fix ist drin.".into())));
     let u = deltas(&evs);
     assert_eq!(

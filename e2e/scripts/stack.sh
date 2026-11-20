@@ -12,6 +12,9 @@ FAKE_INTAKE_PORT="${E2E_FAKE_INTAKE_PORT:-18096}"
 DB="queued_e2e_$(date +%s)_$$"
 WORK="$(mktemp -d)"
 TOKEN="e2e-runner-token-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+# WP10: fixed metrics tokens (tests know them; never the runner token).
+METRICS_TOKEN="${E2E_METRICS_TOKEN:-e2e-app-metrics-token-0123456789}"
+RUNNER_METRICS_TOKEN="${E2E_RUNNER_METRICS_TOKEN:-e2e-runner-metrics-token-0123456789}"
 
 cleanup() {
   kill "${RUNNER_PID:-}" "${APP_PID:-}" "${FAKE_PID:-}" "${INTAKE_PID:-}" 2>/dev/null || true
@@ -30,6 +33,7 @@ DB_URL="${ADMIN_URL%/*}/$DB"
 # 127.0.0.1 as an internal host the egress proxy may reach: system tests use
 # a local fake upstream instead of real external hosts (WP02).
 RUNNER_ALLOW_ROOT=1 RUNNER_ENGINE=none RUNNER_TOKEN="$TOKEN" RUNNER_DATA_DIR="$WORK/runner" \
+RUNNER_METRICS_TOKEN="$RUNNER_METRICS_TOKEN" \
 RUNNER_EGRESS_PRIVATE_HOSTS=127.0.0.1 \
 RUNNER_BIND="127.0.0.1:$RUNNER_PORT" RUNNER_KILL_GRACE_SECS=3 RUST_LOG=warn \
   "$ROOT/backend/target/debug/queued-runner" &
@@ -47,6 +51,7 @@ FAKE_INTAKE="http://127.0.0.1:$FAKE_INTAKE_PORT"
 DATABASE_URL="$DB_URL" RUNNER_URL="http://127.0.0.1:$RUNNER_PORT" RUNNER_TOKEN="$TOKEN" \
 DATA_DIR="$WORK/app" FRONTEND_DIR="$ROOT/frontend/dist" BIND="127.0.0.1:$APP_PORT" \
 PUBLIC_URL="http://127.0.0.1:$APP_PORT" ENABLE_MOCK_PROVIDER=true TICK_SECS=1 RUST_LOG=warn \
+METRICS_TOKEN="$METRICS_TOKEN" NOTIFY_TICK_SECS=1 ALLOW_PRIVATE_NOTIFY_TARGETS=true \
 ALLOW_LOCAL_GIT_REMOTES=true ALLOW_PRIVATE_GIT_HOSTS=true PR_POLL_SECS=1 TRIGGER_TICK_SECS=1 \
 INTAKE_TICK_SECS=1 INTAKE_GITHUB_API_URL="$FAKE_INTAKE" INTAKE_SLACK_API_URL="$FAKE_INTAKE" \
 INTAKE_LINEAR_API_URL="$FAKE_INTAKE/graphql" INTAKE_JIRA_API_URL="$FAKE_INTAKE" \

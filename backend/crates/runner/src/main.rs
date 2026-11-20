@@ -49,9 +49,17 @@ async fn main() -> Result<()> {
     if engine == queued_runner::exec::Engine::None {
         tracing::warn!("RUNNER_ENGINE=none: agents run without isolation. Development only!");
     }
+    let token = var("RUNNER_TOKEN").context("RUNNER_TOKEN is required")?;
+    let metrics = queued_common::metrics::Access::parse(
+        var("RUNNER_METRICS_TOKEN"),
+        var("RUNNER_METRICS_BIND"),
+        "RUNNER_",
+        Some(&token),
+    )
+    .map_err(anyhow::Error::msg)?;
     let cfg = RunnerConfig {
         data_dir,
-        token: var("RUNNER_TOKEN").context("RUNNER_TOKEN is required")?,
+        token,
         engine,
         image: var("RUNNER_IMAGE").unwrap_or_else(|| "localhost/queued-agent:latest".into()),
         memory: var("RUNNER_MEMORY").unwrap_or_else(|| "4g".into()),
@@ -74,6 +82,7 @@ async fn main() -> Result<()> {
                 .context("RUNNER_SESSION_TTL_DAYS must be a number of days")?,
             None => queued_runner::sessions::DEFAULT_TTL_DAYS,
         },
+        metrics,
     };
     if cfg.kill_grace_secs > 60 {
         // The app's exec HTTP timeout allows for at most 60 s of grace.
@@ -88,7 +97,20 @@ async fn main() -> Result<()> {
         "queued-runner listening on {bind} (engine {:?})",
         cfg.engine
     );
-    axum::serve(listener, router(RunnerState::new(cfg)))
+    let metrics_bind = cfg.metrics.bind;
+    let st = RunnerState::new(cfg);
+    if let Some(addr) = metrics_bind {
+        // WP10: own listener that serves only /metrics.
+        let l = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!("metrics on {addr}");
+        let r = queued_runner::metrics_router(st.clone());
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(l, r).await {
+                tracing::error!("metrics listener failed: {e:#}");
+            }
+        });
+    }
+    axum::serve(listener, router(st))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })

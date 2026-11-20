@@ -24,7 +24,7 @@ use crate::ui::dialog::{Confirm, Modal};
 use crate::ui::{uid, Empty, Field, FieldIds, HelpTip, Ic, Icon, SecretBox};
 
 /// Time zone of the browser (IANA name), `UTC` if unknown.
-fn browser_tz() -> String {
+pub(crate) fn browser_tz() -> String {
     let o = js_sys::Intl::DateTimeFormat::new(&js_sys::Array::new(), &js_sys::Object::new())
         .resolved_options();
     js_sys::Reflect::get(&o, &"timeZone".into())

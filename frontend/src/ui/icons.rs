@@ -74,12 +74,16 @@ pub enum Ic {
     Camera,
     Paperclip,
     ListChecks,
+    Chart,
 }
 
 impl Ic {
     pub fn paths(self) -> &'static str {
         match self {
             Ic::Logo => r#"<path d="M5 6h14"/><path d="M5 12h10"/><path d="M5 18h6"/>"#,
+            Ic::Chart => {
+                r#"<path d="M3 3v18h18"/><path d="M8 17v-4"/><path d="M13 17V8"/><path d="M18 17V5"/>"#
+            }
             Ic::Plus => r#"<path d="M5 12h14"/><path d="M12 5v14"/>"#,
             Ic::Queue => {
                 r#"<path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/>"#

@@ -437,6 +437,56 @@ pub async fn call(
     }
 }
 
+/// WP10: [`call`] inside a `chat` span (CLIENT). No model name (it is
+/// free text of the connector), no prompt, no answer, no error text.
+pub async fn call_traced(
+    st: &crate::state::AppState,
+    http: &reqwest::Client,
+    ep: &Endpoint,
+    r: &Request,
+    task: uuid::Uuid,
+    step: &str,
+) -> Result<Response, CallError> {
+    let mut span = crate::otel::Span::start(
+        st.otel.as_ref(),
+        || "chat".into(),
+        crate::otel::Kind::Client,
+        None,
+    );
+    span.str("gen_ai.operation.name", "chat");
+    span.str(
+        "gen_ai.provider.name",
+        crate::otel::provider_name("", Some(&ep.kind)),
+    );
+    span.str("queue.task.id", &task.to_string());
+    span.str(
+        "queue.step",
+        match step {
+            "plan" | "review" | "analyze" | "critic" => step,
+            _ => "other",
+        },
+    );
+    let res = call(http, ep, r).await;
+    match &res {
+        Ok(resp) => {
+            let u = &resp.usage;
+            span.int(
+                "gen_ai.usage.input_tokens",
+                u.input_tokens
+                    .saturating_add(u.cache_read_tokens)
+                    .saturating_add(u.cache_write_tokens),
+            );
+            span.int("gen_ai.usage.output_tokens", u.output_tokens);
+            if u.cache_read_tokens > 0 {
+                span.int("gen_ai.usage.cache_read.input_tokens", u.cache_read_tokens);
+            }
+        }
+        Err(e) => span.error(e.category.class().as_str()),
+    }
+    span.end();
+    res
+}
+
 fn unexpected(v: &Value) -> CallError {
     CallError {
         category: ErrorCategory::Unknown(None),

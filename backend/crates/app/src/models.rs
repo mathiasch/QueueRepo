@@ -23,6 +23,28 @@ pub mod status {
     pub const CANCELLED: &str = "cancelled";
 }
 
+/// A task status as metric label / span attribute (fixed set; anything
+/// unknown is `other`).
+pub fn status_label(s: &str) -> &'static str {
+    use status::*;
+    [
+        PENDING_APPROVAL,
+        QUEUED,
+        RUNNING,
+        WAITING_BATCH,
+        WAITING_INPUT,
+        HELD,
+        MERGING,
+        DONE,
+        FAILED,
+        BLOCKED,
+        CANCELLED,
+    ]
+    .into_iter()
+    .find(|x| *x == s)
+    .unwrap_or("other")
+}
+
 /// Database row of a project. Internal: the API returns [`ProjectView`].
 #[derive(Debug, Clone, FromRow)]
 pub struct Project {

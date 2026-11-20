@@ -307,7 +307,13 @@ pub struct RetryInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     Text(String),
-    Tool(String),
+    /// A tool call: `name` as reported by the CLI (never shown with
+    /// arguments; WP10 spans and insights use only the sanitized name),
+    /// `summary` with the most telling argument for the task log.
+    Tool {
+        name: String,
+        summary: String,
+    },
     /// Incremental usage while the run is in progress.
     UsageDelta(Usage),
     /// Authoritative usage of the whole run (replaces the sum of deltas).
@@ -561,6 +567,14 @@ pub(crate) fn trunc(s: &str, n: usize) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
+}
+
+/// Tool event of a CLI tool call (`name: detail`).
+pub(crate) fn tool_event(name: &str, input: &Value) -> AgentEvent {
+    AgentEvent::Tool {
+        name: name.to_string(),
+        summary: tool_summary(name, input),
+    }
 }
 
 pub(crate) fn tool_summary(name: &str, input: &Value) -> String {

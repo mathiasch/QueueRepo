@@ -23,7 +23,7 @@ use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
 use super::{
-    classify::ErrorCategory, error_event, n, s, tool_summary, trunc, usd, AgentEvent, ConnCfg,
+    classify::ErrorCategory, error_event, n, s, tool_event, trunc, usd, AgentEvent, ConnCfg,
     Credential, Invocation, ParseState, RunKind, Session,
 };
 use crate::models::Usage;
@@ -138,10 +138,7 @@ pub(super) fn parse(v: &Value, st: &mut ParseState) -> Vec<AgentEvent> {
         }
         "tool_use" => {
             let state = &part["state"];
-            let mut out = vec![AgentEvent::Tool(tool_summary(
-                &s(part, "tool"),
-                &state["input"],
-            ))];
+            let mut out = vec![tool_event(&s(part, "tool"), &state["input"])];
             if s(state, "status") == "error" {
                 out.push(AgentEvent::Text(format!(
                     "⚠ Werkzeugfehler: {}",
@@ -340,7 +337,13 @@ mod tests {
             r#"{"type":"tool_use","part":{"tool":"bash","state":{"status":"error","input":{"command":"ls"},"error":"denied"}}}"#,
             &mut st,
         );
-        assert_eq!(ev[0], AgentEvent::Tool("bash: ls".into()));
+        assert_eq!(
+            ev[0],
+            AgentEvent::Tool {
+                name: "bash".into(),
+                summary: "bash: ls".into()
+            }
+        );
         assert!(matches!(&ev[1], AgentEvent::Text(t) if t.contains("denied")));
         let ev = parse_line(
             "opencode",
