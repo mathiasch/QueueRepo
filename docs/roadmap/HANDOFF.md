@@ -75,8 +75,8 @@ Plan, Details und Reihenfolge stehen in `work-packages.md`. Die Artefakte liegen
 | 11 | WP08 Intake | fertig | `4eff80a` |
 | 12 | WP09 Memory, Dedupe, Anhänge | fertig | `2b936f7` |
 | 13 | WP10 Observability & Benachrichtigungen | fertig | `5543b95` |
-| 14 | **WP11 Enterprise & Betrieb** | **in Arbeit**, WIP-Commit `10161aa`, Migration 0014 | – |
-| 15 | WP12 Best-of-N, Preview, Routing | offen | – |
+| 14 | WP11 Enterprise & Betrieb | fertig (Migration 0014) | `389f657` |
+| 15 | **WP12 Best-of-N, Preview, Routing** | **in Arbeit** | – |
 | 16 | WP15 Modell-Chooser | offen | – |
 | 17 | WP14 Bezahlzugang | offen | – |
 | 18 | WP16 Abschluss-Audit | offen (allerletztes Paket) | – |
@@ -115,13 +115,15 @@ cd ../frontend && cargo fmt --all -- --check && cargo clippy --target wasm32-unk
 cd ../e2e && npx playwright test   # Projekte system, desktop, iphone, iphone-landscape (inkl. axe)
 ```
 
-Referenzwerte nach WP10:
+Referenzwerte nach WP11:
 
-| Suite | Tests | Laufzeit |
-|---|---|---|
-| Backend | 579 | – |
-| Frontend | 62 | – |
-| Playwright | 109 | ca. 7,6 min |
+| Suite | Tests |
+|---|---|
+| Backend | 609 |
+| Frontend | 66 |
+| Playwright | 119 |
+
+Die Suite nie per `&` aus einem Skript starten. Ein so gestarteter Prozess erbt SIGINT als ignoriert, und die Trap-Tests schlagen dann falsch fehl. Stattdessen im Vordergrund oder über einen Wrapper starten.
 
 ## 5. Betriebliche Fallstricke (unbedingt lesen)
 
@@ -172,16 +174,13 @@ Referenzwerte nach WP10:
 
 ## 7. Nächste Schritte (konkret)
 
-1. **WP11 fortsetzen.** Der Agent brach beim Rate-Limit ab, als er gerade das Abnahme-Skript startete.
-   - Vorhanden: Plan, Impl, Review und Migration 0014; der Code liegt im WIP-Commit `10161aa`.
-   - Es fehlt `WP11-test.md` samt zwei grünen Läufen.
-   - Danach `feat: WP11 …` committen und pushen.
-2. **WP12** mit `agent-prompts/next-WP12-best-of-n-preview-routing.md`.
-3. **WP15** mit `agent-prompts/next-WP15-model-chooser.md`.
-4. **WP14** mit `agent-prompts/next-WP14-paid-access.md`.
+1. **WP12** läuft mit `agent-prompts/next-WP12-best-of-n-preview-routing.md`.
+2. **WP15** mit `agent-prompts/next-WP15-model-chooser.md`.
+3. **WP14** mit `agent-prompts/next-WP14-paid-access.md`.
    - Das Lizenz- und ToS-Thema wird hier als Entscheidungspunkt für den Betreiber dokumentiert, nicht entschieden.
-5. **WP16** mit `agent-prompts/next-WP16-final-audit.md`.
+4. **WP16** mit `agent-prompts/next-WP16-final-audit.md`.
    - Läuft mit frischem Kontext, ohne Vorwissen aus den Paketen.
-6. **Abschluss:** Gesamtbericht an den Nutzer. Danach ggf. die offenen Themen ansprechen:
+   - Zusätzlich bekannt: Das Docker-Image hat `pg_dump` 15, die DB ist 16 (WP11-review).
+5. **Abschluss:** Gesamtbericht an den Nutzer. Danach ggf. die offenen Themen ansprechen:
    - Lizenz- und Credential-Modell.
    - Funde, die nur dokumentiert und nicht behoben sind.
