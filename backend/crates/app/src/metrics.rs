@@ -38,6 +38,10 @@ pub struct AppMetrics {
     pub runner_up: Arc<Family>,
     pub otel_dropped: Arc<Family>,
     pub otel_errors: Arc<Family>,
+    /// WP11: audit entries that could not be written.
+    pub audit_errors: Arc<Family>,
+    /// WP11: login/second-factor failures and lockouts (`kind`).
+    pub auth_failures: Arc<Family>,
     refreshed: tokio::sync::Mutex<Option<Instant>>,
 }
 
@@ -145,6 +149,16 @@ impl AppMetrics {
                 "queued_otel_export_errors_total",
                 "Failed OTLP export requests.",
                 &[],
+            ),
+            audit_errors: r.counter(
+                "queued_audit_write_errors_total",
+                "Audit log entries that could not be written.",
+                &[],
+            ),
+            auth_failures: r.counter(
+                "queued_auth_failures_total",
+                "Failed sign-ins by kind (password, mfa, locked).",
+                &["kind"],
             ),
             refreshed: tokio::sync::Mutex::new(None),
             registry: r,

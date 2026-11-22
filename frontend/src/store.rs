@@ -436,8 +436,21 @@ pub fn connect_live(store: Store) {
                 set_timeout(
                     move || {
                         drop(live);
-                        store.reload();
-                        connect_live(store);
+                        // WP11: a revoked session (signed out elsewhere, account
+                        // locked) ends the stream: back to the sign-in page.
+                        leptos::task::spawn_local(async move {
+                            match crate::api::get::<queued_api::User>("/auth/me").await {
+                                Err(e) if e.status == 401 || e.status == 403 => {
+                                    if let Some(w) = web_sys::window() {
+                                        let _ = w.location().set_href("/?signed_out=1");
+                                    }
+                                }
+                                _ => {
+                                    store.reload();
+                                    connect_live(store);
+                                }
+                            }
+                        });
                     },
                     Duration::from_secs(3),
                 );

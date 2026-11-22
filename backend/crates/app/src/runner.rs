@@ -919,7 +919,8 @@ async fn run_inner(
     let user_cancel = cancel.is_cancelled();
     let contract = if early(&out, user_cancel, &acc.provider, &lim, usage).is_none() {
         let file = st
-            .runner
+            .runner(task.project_id)
+            .await
             .queue_file(crate::runner_client::task_ws(task.id), "result.json")
             .await?;
         let (c, note) = load_contract(out.structured.as_ref(), file.as_deref());
@@ -1024,7 +1025,8 @@ async fn main_ready(
     project: &Project,
     remote: Option<GitRemote>,
 ) -> Result<(), RunError> {
-    st.runner
+    st.runner(project.id)
+        .await
         .init(
             project.id,
             &queued_common::InitWorkspace {
@@ -1034,7 +1036,8 @@ async fn main_ready(
         )
         .await?;
     let begin = st
-        .runner
+        .runner(project.id)
+        .await
         .begin(project.id, remote, &project.secret_allowlist)
         .await?;
     for w in &begin.warnings {
@@ -1447,7 +1450,8 @@ impl Committer<'_> {
                 .flatten();
         let out = self
             .st
-            .runner
+            .runner(self.task.project_id)
+            .await
             .commit(
                 crate::runner_client::task_ws(self.task.id),
                 &self.message(suffix),
@@ -1764,6 +1768,7 @@ async fn check_budget(st: &AppState, user: Uuid, provider: &str) {
 /// Runs a process through the runner; cancellation is forwarded.
 async fn exec(
     st: &AppState,
+    project: Uuid,
     req: ExecRequest,
     cancel: &CancellationToken,
     tx: mpsc::Sender<ExecFrame>,
@@ -1785,8 +1790,9 @@ async fn exec(
             changed_total: 0,
         });
     }
+    let client = st.runner(project).await;
     let watcher = {
-        let (c, client, name) = (cancel.clone(), st.runner.clone(), req.name.clone());
+        let (c, client, name) = (cancel.clone(), client.clone(), req.name.clone());
         tokio::spawn(async move {
             c.cancelled().await;
             // Repeated: a cancel that arrives while the start request is in
@@ -1797,14 +1803,14 @@ async fn exec(
             }
         })
     };
-    let res = st.runner.exec(&req, tx).await;
+    let res = client.exec(&req, tx).await;
     watcher.abort();
     if res.is_err() {
         // The stream broke (network drop, proxy) or the start was refused
         // (409: an orphaned run with this name is still active). The runner
         // only notices a vanished client on its next output line, so a
         // silent agent would keep running and block every retry of the task.
-        if let Err(e) = st.runner.cancel(&req.name).await {
+        if let Err(e) = client.cancel(&req.name).await {
             tracing::debug!("cancel of {} after a stream error failed: {e:#}", req.name);
         }
     }
@@ -1863,7 +1869,8 @@ struct RunSpec<'a> {
 /// WP09: places the task's attachments in `.queue/attachments/` of `ws`.
 async fn provide_attachments(st: &AppState, task: &Task, ws: &str) -> Result<(), RunError> {
     let files = crate::attachments::files_for_run(st, task.id).await?;
-    st.runner
+    st.runner(task.project_id)
+        .await
         .put_attachments(ws, &files)
         .await
         .map_err(RunError::Infra)?;
@@ -1954,7 +1961,9 @@ async fn agent_run(
         RunKind::Plan => "Plan",
         RunKind::Agent => "Agent",
     };
-    let enforced = environment::sandbox(st).await.egress_enforced;
+    let enforced = environment::sandbox(st, task.project_id)
+        .await
+        .egress_enforced;
     event(
         st,
         task,
@@ -2014,6 +2023,7 @@ async fn agent_run(
         },
         read_only: spec.read_only,
         session: spec.store.clone(),
+        lease_secs: None,
     };
     // WP10: one `invoke_agent` span and one `task_runs` row per run.
     let run_started = Utc::now();
@@ -2191,7 +2201,8 @@ async fn agent_run(
         elog.finish(st, task, enforced).await;
         (o, meter, tools)
     };
-    let (last, (mut o, meter, tools)) = tokio::join!(exec(st, req, &run_cancel, tx), consumer);
+    let (last, (mut o, meter, tools)) =
+        tokio::join!(exec(st, task.project_id, req, &run_cancel, tx), consumer);
     if let Some(w) = steer_watch {
         w.abort();
     }
@@ -2420,7 +2431,9 @@ async fn run_setup(
         .await
         .map_err(RunError::Infra)?;
     let egress = env.setup_policy();
-    let enforced = environment::sandbox(st).await.egress_enforced;
+    let enforced = environment::sandbox(st, task.project_id)
+        .await
+        .egress_enforced;
     // WP04: the cache belongs to the project, not to the task's working tree.
     let cache = env.cache_spec().map(|c| queued_common::CacheSpec {
         scope: Some(project.id.to_string()),
@@ -2464,6 +2477,7 @@ async fn run_setup(
         home_env: vec![],
         read_only: false,
         session: None,
+        lease_secs: None,
     };
     let values: Vec<String> = secrets.into_iter().map(|(_, v)| v).collect();
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(512);
@@ -2495,7 +2509,7 @@ async fn run_setup(
         elog.finish(st, task, enforced).await;
         tail_buf
     };
-    let (last, output) = tokio::join!(exec(st, req, cancel, tx), collect);
+    let (last, output) = tokio::join!(exec(st, task.project_id, req, cancel, tx), collect);
     if cancel.is_cancelled() {
         return Ok(SetupOutcome::Cancelled);
     }
@@ -2582,8 +2596,11 @@ async fn run_verify(
         home_env: vec![],
         read_only: false,
         session: None,
+        lease_secs: None,
     };
-    let enforced = environment::sandbox(st).await.egress_enforced;
+    let enforced = environment::sandbox(st, task.project_id)
+        .await
+        .egress_enforced;
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(512);
     let collect = async {
         let mut buf = String::new();
@@ -2604,7 +2621,7 @@ async fn run_verify(
         elog.finish(st, task, enforced).await;
         buf
     };
-    let (last, output) = tokio::join!(exec(st, req, cancel, tx), collect);
+    let (last, output) = tokio::join!(exec(st, task.project_id, req, cancel, tx), collect);
     let output = tail(&output, 4000);
     let (ok, timed_out, code) = match last? {
         ExecFrame::Exit {
@@ -2786,7 +2803,8 @@ async fn run_review(
     }
     event(st, task, "review", &format!("Review via {}", acc.label)).await;
     let diff = st
-        .runner
+        .runner(project.id)
+        .await
         .diff(project.id, rc.before, rc.after, prompt::MAX_DIFF)
         .await?
         .diff;
@@ -2858,7 +2876,8 @@ async fn run_review(
         });
     }
     let file = st
-        .runner
+        .runner(task.project_id)
+        .await
         .queue_file(crate::runner_client::task_ws(task.id), "review.json")
         .await?;
     let review = load_review(out.structured.as_ref(), file.as_deref());
@@ -2985,7 +3004,12 @@ async fn step_connector(
 
 /// Stable prefix of single-shot prompts (cacheable).
 async fn stable_prefix(st: &AppState, project: &Project) -> String {
-    let files = st.runner.files(project.id).await.unwrap_or_default();
+    let files = st
+        .runner(project.id)
+        .await
+        .files(project.id)
+        .await
+        .unwrap_or_default();
     // WP09: approved project rules first (stable between calls → cached).
     format!(
         "{}{}",
@@ -3095,7 +3119,8 @@ async fn defer_review(
             }
         };
     let diff = st
-        .runner
+        .runner(project.id)
+        .await
         .diff(
             project.id,
             &pending.before,

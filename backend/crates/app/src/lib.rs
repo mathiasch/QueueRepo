@@ -5,7 +5,9 @@
 pub mod agent;
 pub mod api;
 pub mod attachments;
+pub mod audit;
 pub mod auth;
+pub mod backup;
 pub mod batch;
 pub mod budget;
 pub mod config;
@@ -17,14 +19,17 @@ pub mod environment;
 pub mod error;
 pub mod estimate;
 pub mod eval;
+pub mod fleet;
 pub mod gateway;
 pub mod githost;
 pub mod health;
+pub mod instance;
 pub mod intake;
 pub mod knowledge;
 pub mod limits;
 pub mod llm;
 pub mod metrics;
+pub mod mfa;
 pub mod models;
 pub mod notify;
 pub mod oidc;
@@ -67,6 +72,8 @@ pub async fn start_worker(st: &state::AppState) -> anyhow::Result<()> {
     batch::recover(st).await?;
     pr::recover(st).await?;
     tokio::spawn(worker::run(st.clone()));
+    // WP11: heartbeats and run leases of the runner fleet.
+    tokio::spawn(fleet::run(st.clone()));
     tokio::spawn(batch::run(st.clone()));
     // 0 = tests drive the pull request poller themselves.
     if st.cfg.pr_poll_secs > 0 {

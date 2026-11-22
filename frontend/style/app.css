@@ -881,3 +881,26 @@ dl.kv dd { margin: 0; font-weight: 600; }
 .notify-channels .check { min-height: 44px; }
 .time-row { display: flex; flex-wrap: wrap; gap: var(--sp-3); }
 .time-row .field { flex: 1 1 140px; min-width: 0; }
+
+/* WP11: security, admin console ------------------------------------------ */
+.qr-wrap { display: flex; justify-content: center; }
+.qr { width: min(240px, 70vw); height: auto; border-radius: var(--r-sm); border: 1px solid var(--border); background: #fff; }
+.setup-steps { margin: 0; padding-left: 1.3em; display: flex; flex-direction: column; gap: var(--sp-2); }
+.manual-key summary { cursor: pointer; min-height: var(--touch); display: flex; align-items: center; color: var(--primary-text); }
+.selectable { user-select: all; -webkit-user-select: all; overflow-wrap: anywhere; }
+.recovery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(9.5em, 1fr)); gap: var(--sp-2); }
+.recovery-grid li { padding: 8px 10px; border-radius: var(--r-sm); background: var(--surface-2); font-size: var(--fs-md, 1rem); letter-spacing: .04em; text-align: center; }
+.list-row { padding: var(--sp-3); border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface-1, var(--surface)); min-width: 0; }
+.list-row .row { gap: var(--sp-2); }
+.radio-card { display: flex; gap: var(--sp-3); align-items: flex-start; padding: var(--sp-3); border: 1px solid var(--border); border-radius: var(--r-sm); cursor: pointer; min-height: var(--touch); }
+.radio-card input { width: 18px; height: 18px; margin-top: 3px; accent-color: var(--primary); flex: none; }
+.radio-card:has(input:checked) { border-color: var(--primary); background: var(--primary-soft); }
+fieldset.stack { border: 0; padding: 0; margin: 0; min-width: 0; }
+fieldset.stack legend { padding: 0; margin-bottom: var(--sp-2); }
+.h3 { font-size: var(--fs-lg, 1.15rem); margin: 0; }
+.h4 { font-size: var(--fs-md, 1rem); margin: var(--sp-3) 0 0; }
+.admin-tabs { flex-wrap: wrap; margin-bottom: var(--sp-4); }
+.admin-tabs button { min-height: var(--touch); }
+.break { overflow-wrap: anywhere; word-break: break-word; }
+.center-text { text-align: center; }
+.audit-list li { display: flex; flex-direction: column; gap: 2px; }

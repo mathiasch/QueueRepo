@@ -1,3 +1,5 @@
+pub(crate) mod account;
+pub(crate) mod admin;
 mod analytics;
 mod attachments;
 mod credentials;
@@ -54,6 +56,76 @@ pub fn router(st: AppState) -> Router {
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
+        // WP11: second login step, invitations.
+        .route("/auth/mfa", get(auth::mfa_pending))
+        .route("/auth/mfa/totp", post(auth::mfa_totp))
+        .route("/auth/mfa/recovery", post(auth::mfa_recovery))
+        .route("/auth/mfa/webauthn/start", post(auth::mfa_webauthn_start))
+        .route("/auth/mfa/webauthn/finish", post(auth::mfa_webauthn_finish))
+        .route("/auth/invite/{token}", get(auth::invite_preview))
+        // WP11: account security (cookie only).
+        .route("/account/security", get(account::security))
+        .route("/account/password", post(account::change_password))
+        .route("/account/mfa/totp/setup", post(account::totp_setup))
+        .route("/account/mfa/totp/confirm", post(account::totp_confirm))
+        .route("/account/mfa/totp/disable", post(account::totp_disable))
+        .route("/account/mfa/recovery", post(account::regenerate_recovery))
+        .route(
+            "/account/webauthn/register/start",
+            post(account::passkey_start),
+        )
+        .route(
+            "/account/webauthn/register/finish",
+            post(account::passkey_finish),
+        )
+        .route(
+            "/account/webauthn/{id}/remove",
+            post(account::passkey_remove),
+        )
+        .route("/account/sessions", get(account::sessions))
+        .route(
+            "/account/sessions/revoke-others",
+            post(account::revoke_other_sessions),
+        )
+        .route("/account/sessions/{id}", delete(account::revoke_session))
+        .route("/account/quota", get(account::quota))
+        // WP11: admin console (cookie sessions of admins only).
+        .route("/admin/users", get(admin::users))
+        .route(
+            "/admin/users/{id}",
+            axum::routing::patch(admin::update_user),
+        )
+        .route("/admin/users/{id}/quota", put(admin::put_quota))
+        .route(
+            "/admin/invitations",
+            get(admin::invitations).post(admin::create_invitation),
+        )
+        .route(
+            "/admin/invitations/{id}/revoke",
+            post(admin::revoke_invitation),
+        )
+        .route(
+            "/admin/settings",
+            get(admin::get_settings).put(admin::put_settings),
+        )
+        .route("/admin/audit", get(admin::audit_log))
+        .route("/admin/audit/export", get(admin::audit_export))
+        .route("/admin/audit/verify", get(admin::audit_verify))
+        .route(
+            "/admin/runners",
+            get(admin::runners).post(admin::create_runner),
+        )
+        .route(
+            "/admin/runners/{id}",
+            axum::routing::patch(admin::update_runner).delete(admin::delete_runner),
+        )
+        .route(
+            "/admin/runners/{id}/token",
+            post(admin::rotate_runner_token),
+        )
+        .route("/admin/runners/{id}/revoke", post(admin::revoke_runner))
+        .route("/admin/projects", get(admin::projects))
+        .route("/admin/projects/{id}/move", post(admin::move_project))
         .route("/auth/oidc/{provider}/start", get(auth::oidc_start))
         .route(
             "/auth/oidc/{provider}/callback",
@@ -320,9 +392,10 @@ pub fn router(st: AppState) -> Router {
         .with_state(st)
 }
 
-async fn meta(State(st): State<AppState>) -> Json<Meta> {
+async fn meta(State(st): State<AppState>) -> ApiResult<Json<Meta>> {
     let providers = st.cfg.providers();
-    Json(Meta {
+    let mode = crate::instance::settings(&st).await?.registration_mode;
+    Ok(Json(Meta {
         providers: providers.iter().map(|p| p.to_string()).collect(),
         credential_kinds: providers
             .iter()
@@ -340,7 +413,8 @@ async fn meta(State(st): State<AppState>) -> Json<Meta> {
                 name: p.name.clone(),
             })
             .collect(),
-        allow_registration: st.cfg.allow_registration,
+        allow_registration: mode == queued_api::security::RegistrationMode::Open,
+        registration_mode: mode,
         provider_capabilities: providers
             .iter()
             .map(|p| (p.to_string(), crate::agent::capabilities(p)))
@@ -352,7 +426,7 @@ async fn meta(State(st): State<AppState>) -> Json<Meta> {
         connector_types: crate::connectors::types(st.cfg.enable_mock_provider),
         cli_notes: crate::agent::cli_notes(),
         price_catalog_version: crate::pricing::builtin().version.clone(),
-    })
+    }))
 }
 
 /// Lifts an auth pause and a detected subscription limit of `provider`.
@@ -570,6 +644,7 @@ async fn events(
     State(st): State<AppState>,
     AuthUser(u): AuthUser,
     tok: Option<axum::Extension<auth::TokenAuth>>,
+    session: Option<axum::Extension<auth::SessionAuth>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let uid = u.id;
     let stream = BroadcastStream::new(st.bus.subscribe()).filter_map(move |m| match m {
@@ -579,7 +654,7 @@ async fn events(
         Err(_) => Some(Ok(sse_data(&ServerEvent::Resync))),
     });
     // Token streams end at the token's expiry or after TOKEN_STREAM_MAX.
-    let stop: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = match tok {
+    let expiry: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = match &tok {
         Some(axum::Extension(t)) => {
             let left = (t.expires_at - chrono::Utc::now())
                 .to_std()
@@ -589,5 +664,26 @@ async fn events(
         }
         None => Box::pin(futures::future::pending()),
     };
+    // WP11 (WP07-N6): a revoked session or token or a locked account ends
+    // the stream within STREAM_RECHECK, not only at the next reconnect.
+    let (sid, tid) = (session.map(|s| s.0.session_id), tok.map(|t| t.0.token_id));
+    let st2 = st.clone();
+    let revoked = async move {
+        loop {
+            tokio::time::sleep(STREAM_RECHECK).await;
+            if !auth::still_valid(&st2, sid, tid).await {
+                return;
+            }
+        }
+    };
+    let stop = async move {
+        tokio::select! {
+            _ = expiry => {}
+            _ = revoked => {}
+        }
+    };
     Sse::new(futures::StreamExt::take_until(stream, stop)).keep_alive(KeepAlive::default())
 }
+
+/// WP11: how often a live stream re-checks its session/token.
+const STREAM_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);

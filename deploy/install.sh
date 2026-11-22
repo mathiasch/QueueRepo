@@ -7,7 +7,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 [[ $EUID -eq 0 ]] || { echo "run with sudo (one-time setup)"; exit 1; }
 
 apt-get update
-apt-get install -y --no-install-recommends podman uidmap slirp4netns fuse-overlayfs git ca-certificates curl build-essential pkg-config podman-compose
+apt-get install -y --no-install-recommends podman uidmap slirp4netns fuse-overlayfs git ca-certificates curl build-essential pkg-config podman-compose \
+  libssl-dev postgresql-client
 
 id queued >/dev/null 2>&1 || useradd --system --create-home --home-dir /home/queued --shell /usr/sbin/nologin queued
 # Subordinate ids for rootless containers.
@@ -15,6 +16,8 @@ grep -q '^queued:' /etc/subuid || usermod --add-subuids 200000-265535 --add-subg
 loginctl enable-linger queued
 
 install -d -o queued -g queued /var/lib/queued/app /var/lib/queued/runner /etc/queued /opt/queued/web
+# WP11: backups only for the service user.
+install -d -m 700 -o queued -g queued /var/backups/queued
 install -d /opt/queued/bin
 install -d /opt/queued/deploy && cp "$ROOT/deploy/compose.yml" /opt/queued/deploy/
 
@@ -39,9 +42,14 @@ sudo -u queued -H bash -lc "cd $SRC && podman build -t localhost/queued-agent:la
 for f in queued runner; do
   [[ -f /etc/queued/$f.env ]] || install -m 600 -o queued -g queued "$ROOT/deploy/$f.env.example" /etc/queued/$f.env
 done
-install -m 644 "$ROOT/deploy/queued.service" "$ROOT/deploy/queued-runner.service" /etc/systemd/system/
+# WP11: backup key (≠ MASTER_KEY), generated once, readable only by the service user.
+[[ -f /etc/queued/backup.key ]] || sudo -u queued /opt/queued/bin/queued backup-key /etc/queued/backup.key
+install -m 644 "$ROOT/deploy/queued.service" "$ROOT/deploy/queued-runner.service" \
+  "$ROOT/deploy/queued-backup.service" "$ROOT/deploy/queued-backup.timer" /etc/systemd/system/
 systemctl daemon-reload
 echo
 echo "Next: edit /etc/queued/queued.env + runner.env (same RUNNER_TOKEN: openssl rand -hex 32),"
 echo "      start Postgres:  sudo -iu queued POSTGRES_PASSWORD=… podman-compose -f /opt/queued/deploy/compose.yml up -d"
-echo "      then:            sudo systemctl enable --now queued-runner queued"
+echo "      then:            sudo systemctl enable --now queued-runner queued queued-backup.timer"
+echo "Copy /etc/queued/backup.key AND the MASTER_KEY to a safe place outside this host (password manager):"
+echo "without them a backup cannot be restored."

@@ -224,6 +224,7 @@ pub async fn probe(cfg: &RunnerConfig) -> Result<Vec<CliProbe>> {
             home_env: vec![],
             read_only: false,
             session: None,
+            lease_secs: None,
         };
         let mut cmd = build_command(cfg, &req, &ws, &home, &Sandbox::default());
         let version = match tokio::time::timeout(Duration::from_secs(20), cmd.output()).await {
@@ -755,6 +756,7 @@ mod tests {
             home_env: vec![],
             read_only: false,
             session: None,
+            lease_secs: None,
         }
     }
 

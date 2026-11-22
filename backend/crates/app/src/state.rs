@@ -5,7 +5,7 @@ use tokio::sync::{broadcast, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{config::Config, push::Vapid, runner_client::RunnerClient};
+use crate::{config::Config, fleet::Fleet, push::Vapid, runner_client::RunnerClient};
 
 /// Event fanned out to the SSE stream of one user.
 #[derive(Clone, Debug)]
@@ -19,7 +19,9 @@ pub struct AppState {
     pub db: PgPool,
     pub cfg: Arc<Config>,
     pub http: reqwest::Client,
-    pub runner: RunnerClient,
+    /// WP11: clients of all runners; `AppState::runner(project)` picks the
+    /// project's runner.
+    pub fleet: Fleet,
     pub bus: broadcast::Sender<BusEvent>,
     /// Wakes the scheduler immediately (new task, finished task, settings change).
     pub wake: Arc<Notify>,
@@ -42,7 +44,9 @@ pub struct AppState {
     /// Effective price catalog, cached per override version (see `pricing::current`).
     pub prices: Arc<std::sync::RwLock<Option<PriceCache>>>,
     /// What the runner enforces (`GET /v1/info`), cached (see `environment::sandbox`).
-    pub sandbox: Arc<std::sync::RwLock<Option<(std::time::Instant, queued_api::env::SandboxInfo)>>>,
+    /// Per runner (WP11).
+    pub sandbox:
+        Arc<std::sync::RwLock<HashMap<Uuid, (std::time::Instant, queued_api::env::SandboxInfo)>>>,
     /// WP10: Prometheus metrics.
     pub metrics: Arc<crate::metrics::AppMetrics>,
     /// WP10: OTLP trace exporter (`None` = tracing off).
@@ -69,7 +73,10 @@ impl AppState {
         });
         Ok(Self {
             db,
-            runner: RunnerClient::new(&cfg.runner_url, &cfg.runner_token),
+            fleet: Fleet::new(
+                RunnerClient::new(&cfg.runner_url, &cfg.runner_token)
+                    .with_lease(cfg.runner_lease_secs),
+            ),
             cfg: Arc::new(cfg),
             http: reqwest::Client::builder()
                 .user_agent("queued/0.2")
@@ -86,7 +93,7 @@ impl AppState {
             steers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             vapid: Arc::new(vapid),
             prices: Arc::new(std::sync::RwLock::new(None)),
-            sandbox: Arc::new(std::sync::RwLock::new(None)),
+            sandbox: Default::default(),
             metrics,
             otel,
             ready: Arc::new(tokio::sync::Mutex::new(None)),

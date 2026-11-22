@@ -123,7 +123,8 @@ pub(crate) async fn prepare(
         .fetch_one(&st.db)
         .await?;
     let r = st
-        .runner
+        .runner(project.id)
+        .await
         .prepare_task(
             project.id,
             task.id,
@@ -182,7 +183,10 @@ pub(crate) async fn sync(
         .fetch_one(&st.db)
         .await?;
     if let Some(b) = branch {
-        st.runner.sync_task(project, task, &b, sha).await?;
+        st.runner(project)
+            .await
+            .sync_task(project, task, &b, sha)
+            .await?;
     }
     Ok(())
 }
@@ -376,7 +380,8 @@ async fn merge_inner(
     .await;
     for round in 0..3 {
         let m = st
-            .runner
+            .runner(project.id)
+            .await
             .merge_task(
                 project.id,
                 task.id,
@@ -470,7 +475,8 @@ async fn merge_inner(
             }
         }
         let fin = st
-            .runner
+            .runner(project.id)
+            .await
             .merge_finish(
                 project.id,
                 task.id,
@@ -602,7 +608,8 @@ pub(crate) async fn cleanup_task(st: &AppState, project: Uuid, id: Uuid, branch:
         // WP06: a throwaway plan working tree left by a crash (normally
         // removed right after the plan run).
         let _ = st
-            .runner
+            .runner(project)
+            .await
             .remove_task(project, super::plan::plan_ws_id(id), None)
             .await;
     }
@@ -623,7 +630,8 @@ async fn remove(st: &AppState, project: Uuid, id: Uuid, drop_branch: bool) {
         return;
     };
     match st
-        .runner
+        .runner(project)
+        .await
         .remove_task(project, id, drop_branch.then_some(b.as_str()))
         .await
     {
@@ -676,7 +684,12 @@ pub async fn working_trees(st: &AppState, project: Uuid) -> sqlx::Result<Vec<Uui
 /// Removes the working trees of a deleted project's tasks (best effort).
 pub async fn remove_working_trees(st: &AppState, project: Uuid, tasks: &[Uuid]) {
     for id in tasks {
-        if let Err(e) = st.runner.remove_task(project, *id, None).await {
+        if let Err(e) = st
+            .runner(project)
+            .await
+            .remove_task(project, *id, None)
+            .await
+        {
             tracing::warn!("working tree of task {id} not removed: {e:#}");
         }
     }

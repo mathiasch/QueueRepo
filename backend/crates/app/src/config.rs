@@ -78,6 +78,35 @@ pub struct Config {
     /// WP10: days of `usage_log` kept for analytics (env
     /// `USAGE_RETENTION_DAYS`, default 400, at least 35 for the budgets).
     pub usage_retention_days: i64,
+    /// WP11: interval of runner heartbeats (env `RUNNER_HEARTBEAT_SECS`,
+    /// default 5).
+    pub runner_heartbeat_secs: u64,
+    /// WP11: a runner without a successful heartbeat for this long is
+    /// offline, and runs whose lease the app no longer renews are stopped
+    /// by the runner (env `RUNNER_LEASE_SECS`, default 30, at least three
+    /// heartbeats).
+    pub runner_lease_secs: u64,
+    /// WP11: audit entries kept (env `AUDIT_RETENTION_DAYS`, default 730,
+    /// at least 365 – the database refuses to delete younger entries).
+    pub audit_retention_days: i64,
+}
+
+/// WP11: the lease must outlive a few heartbeats, and the runner clamps it
+/// to its own bounds.
+pub fn check_lease(heartbeat: u64, lease: u64) -> Result<()> {
+    if heartbeat == 0 || heartbeat > 60 {
+        anyhow::bail!("RUNNER_HEARTBEAT_SECS must be between 1 and 60");
+    }
+    if lease < 3 * heartbeat
+        || !(queued_common::MIN_LEASE_SECS..=queued_common::MAX_LEASE_SECS).contains(&lease)
+    {
+        anyhow::bail!(
+            "RUNNER_LEASE_SECS must be at least 3 × RUNNER_HEARTBEAT_SECS and between {} and {}",
+            queued_common::MIN_LEASE_SECS,
+            queued_common::MAX_LEASE_SECS
+        );
+    }
+    Ok(())
 }
 
 fn api_url(k: &str, default: &str) -> String {
@@ -107,6 +136,9 @@ impl Config {
         std::fs::create_dir_all(&data_dir).context("create DATA_DIR")?;
         let data_dir = data_dir.canonicalize()?;
         let http = reqwest::Client::new();
+        let runner_heartbeat_secs = num::<u64>("RUNNER_HEARTBEAT_SECS", 5);
+        let runner_lease_secs = num::<u64>("RUNNER_LEASE_SECS", 30);
+        check_lease(runner_heartbeat_secs, runner_lease_secs)?;
         Ok(Self {
             database_url: var("DATABASE_URL").context("DATABASE_URL is required")?,
             bind: var("BIND").unwrap_or_else(|| "127.0.0.1:8080".into()),
@@ -162,6 +194,10 @@ impl Config {
             notify_tick_secs: num::<u64>("NOTIFY_TICK_SECS", 15),
             allow_private_notify_targets: flag("ALLOW_PRIVATE_NOTIFY_TARGETS", false),
             usage_retention_days: num::<i64>("USAGE_RETENTION_DAYS", 400).max(35),
+            runner_heartbeat_secs,
+            runner_lease_secs,
+            audit_retention_days: num::<i64>("AUDIT_RETENTION_DAYS", 730)
+                .max(queued_api::security::AUDIT_MIN_RETENTION_DAYS),
             data_dir,
         })
     }
@@ -219,6 +255,9 @@ impl Config {
             // Fake ntfy/webhook receivers listen on 127.0.0.1.
             allow_private_notify_targets: true,
             usage_retention_days: 400,
+            runner_heartbeat_secs: 1,
+            runner_lease_secs: 30,
+            audit_retention_days: 730,
         }
     }
 
@@ -275,7 +314,17 @@ fn load_or_create_key(data_dir: &std::path::Path) -> Result<[u8; 32]> {
                 let mut k = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut k);
                 let enc = STANDARD.encode(k);
-                std::fs::write(&path, &enc)?;
+                // WP11: owner-only, like every other secret file.
+                {
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&path)?;
+                    f.write_all(enc.as_bytes())?;
+                }
                 tracing::warn!("generated MASTER_KEY at {} – back it up!", path.display());
                 enc
             }

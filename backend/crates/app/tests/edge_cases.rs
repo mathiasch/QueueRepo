@@ -413,8 +413,9 @@ async fn recover_cancels_orphaned_runner_runs(pool: PgPool) {
         home_env: vec![],
         read_only: false,
         session: None,
+        lease_secs: None,
     };
-    let runner = h.st.runner.clone();
+    let runner = h.st.runner(Uuid::parse_str(&p).unwrap()).await;
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
     let orphan = tokio::spawn(async move { runner.exec(&req, tx).await });
     assert!(rx.recv().await.is_some(), "orphan is running");

@@ -1,7 +1,9 @@
 //! Sign-in and registration.
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use queued_api::{LoginRequest, Meta, RegisterRequest};
+use queued_api::security::{InvitePreview, LoginOutcome, RegistrationMode};
+use queued_api::{LoginRequest, Meta};
+use serde_json::json;
 
 use crate::api;
 use crate::nav::{query_param, set_title};
@@ -14,27 +16,62 @@ pub fn Login(meta: Meta, on_login: Callback<()>) -> impl IntoView {
     let name = RwSignal::new(String::new());
     let email = RwSignal::new(String::new());
     let password = RwSignal::new(String::new());
-    let error = RwSignal::new(query_param("login_error").unwrap_or_default());
+    let error = RwSignal::new(query_param("login_error").unwrap_or_else(|| {
+        if query_param("signed_out").is_some() {
+            "Du wurdest abgemeldet – zum Beispiel auf einem anderen Gerät oder durch die Verwaltung. Bitte melde dich erneut an.".into()
+        } else {
+            String::new()
+        }
+    }));
     let busy = RwSignal::new(false);
-    let allow_registration = meta.allow_registration;
+    // WP11: second step after password or OIDC (`?mfa=1`), invitation links.
+    let mfa = RwSignal::new(None::<LoginOutcome>);
+    let invite = query_param("invite").filter(|i| !i.trim().is_empty());
+    let invite_info = RwSignal::new(None::<InvitePreview>);
+    let allow_registration = meta.allow_registration || invite.is_some();
+    if let Some(i) = invite.clone() {
+        register.set(true);
+        spawn_local(async move {
+            if let Ok(p) =
+                api::get::<InvitePreview>(&format!("/auth/invite/{}", api::enc(&i))).await
+            {
+                if let Some(e) = &p.email {
+                    email.set(e.clone());
+                }
+                invite_info.set(Some(p));
+            }
+        });
+    }
+    if query_param("mfa").is_some() {
+        spawn_local(async move {
+            match api::get::<LoginOutcome>("/auth/mfa").await {
+                Ok(o) => mfa.set(Some(o)),
+                Err(e) => error.set(e.message),
+            }
+        });
+    }
+    let closed = meta.registration_mode != RegistrationMode::Open && invite.is_none();
+    let invite2 = invite.clone();
 
     let submit = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         busy.set(true);
         error.set(String::new());
+        let invite = invite2.clone();
         spawn_local(async move {
             let res = if register.get_untracked() {
-                api::post_ok(
+                api::post::<_, LoginOutcome>(
                     "/auth/register",
-                    &RegisterRequest {
-                        email: email.get_untracked(),
-                        password: password.get_untracked(),
-                        name: name.get_untracked(),
-                    },
+                    &json!({
+                        "email": email.get_untracked(),
+                        "password": password.get_untracked(),
+                        "name": name.get_untracked(),
+                        "invite": invite,
+                    }),
                 )
                 .await
             } else {
-                api::post_ok(
+                api::post::<_, LoginOutcome>(
                     "/auth/login",
                     &LoginRequest {
                         email: email.get_untracked(),
@@ -45,7 +82,11 @@ pub fn Login(meta: Meta, on_login: Callback<()>) -> impl IntoView {
             };
             busy.set(false);
             match res {
-                Ok(()) => on_login.run(()),
+                Ok(o) if o.mfa_required => {
+                    password.set(String::new());
+                    mfa.set(Some(o));
+                }
+                Ok(_) => on_login.run(()),
                 Err(e) => error.set(e.message),
             }
         });
@@ -57,9 +98,26 @@ pub fn Login(meta: Meta, on_login: Callback<()>) -> impl IntoView {
         FieldIds::new("password"),
     );
     let oidc = meta.oidc.clone();
+    let invite3 = invite.clone();
+    let done = Callback::new(move |_| {
+        // Drop `?mfa=1` / `?invite=` from the address.
+        if let Some(w) = web_sys::window() {
+            if let Ok(h) = w.history() {
+                let _ = h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some("/"));
+            }
+        }
+        on_login.run(());
+    });
+    let cancel = Callback::new(move |_| {
+        mfa.set(None);
+        spawn_local(async move {
+            let _ = api::action("/auth/logout").await;
+        });
+    });
     view! {
         <main class="center">
-            <form class="card login" on:submit=submit novalidate=false>
+            {move || mfa.get().map(|o| view! { <super::security::MfaStep outcome=o on_done=done on_cancel=cancel/> })}
+            <form class="card login" on:submit=submit novalidate=false hidden=move || mfa.get().is_some()>
                 <h1 class="brand">
                     <span class="logo"><Icon icon=Ic::Logo/></span>
                     "Queue"
@@ -71,10 +129,18 @@ pub fn Login(meta: Meta, on_login: Callback<()>) -> impl IntoView {
                         "Deine KI-Agenten erledigen Aufträge der Reihe nach – du behältst den Überblick."
                     }}
                 </p>
+                {move || invite_info.get().map(|p| if p.valid {
+                    view! { <div class="alert tone-info"><Icon icon=Ic::Send class="sm"/>"Du wurdest eingeladen. Leg jetzt dein Konto an."</div> }.into_any()
+                } else {
+                    view! { <div class="alert tone-danger"><Icon icon=Ic::Alert class="sm"/>"Diese Einladung ist abgelaufen, schon benutzt oder widerrufen. Bitte frag nach einer neuen."</div> }.into_any()
+                })}
                 {(!oidc.is_empty()).then(|| view! {
                     <div class="stack">
                         {oidc.iter().map(|p| view! {
-                            <a class="btn block lg" href=format!("/api/auth/oidc/{}/start", p.id)>
+                            <a class="btn block lg" href=match &invite3 {
+                                Some(i) => format!("/api/auth/oidc/{}/start?invite={}", p.id, api::enc(i)),
+                                None => format!("/api/auth/oidc/{}/start", p.id),
+                            }>
                                 {format!("Mit {} anmelden", p.name)}
                             </a>
                         }).collect_view()}
@@ -122,7 +188,8 @@ pub fn Login(meta: Meta, on_login: Callback<()>) -> impl IntoView {
                         (false, false) => "Anmelden",
                     }}
                 </button>
-                {allow_registration.then(|| view! {
+                {closed.then(|| view! { <p class="small muted center-text">"Neue Konten gibt es hier nur auf Einladung der Verwaltung."</p> })}
+                {(allow_registration && !closed).then(|| view! {
                     <button
                         type="button"
                         class="btn ghost block"

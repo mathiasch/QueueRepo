@@ -10,8 +10,10 @@ pub mod snapshot;
 pub mod tasks;
 #[cfg(test)]
 mod wp09_tests;
+#[cfg(test)]
+mod wp11_tests;
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     body::{Body, Bytes},
@@ -104,6 +106,9 @@ pub struct RunnerState {
     running: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /// Workspace of each active run (run name → workspace id).
     active: Arc<Mutex<HashMap<String, String>>>,
+    /// WP11: lease deadline of runs started with `lease_secs` (run name →
+    /// deadline), renewed by `POST /v1/heartbeat`.
+    leases: Arc<std::sync::Mutex<HashMap<String, tokio::time::Instant>>>,
     /// WP10: Prometheus metrics of this runner.
     pub metrics: Arc<metrics::RunnerMetrics>,
 }
@@ -115,6 +120,7 @@ impl RunnerState {
             locks: Default::default(),
             running: Default::default(),
             active: Default::default(),
+            leases: Default::default(),
             metrics: Arc::new(metrics::RunnerMetrics::new()),
         }
     }
@@ -126,6 +132,15 @@ impl RunnerState {
             .entry(id.to_string())
             .or_default()
             .clone()
+    }
+
+    /// WP11: the run has a lease and it has expired.
+    fn lease_expired(&self, name: &str) -> bool {
+        self.leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .is_some_and(|d| *d <= tokio::time::Instant::now())
     }
 
     /// A process runs in this workspace right now.
@@ -230,6 +245,13 @@ pub fn router(st: RunnerState) -> Router {
         )
         .route("/workspaces/{id}/state/check", post(state_check))
         .route("/workspaces/{id}/knowledge/export", post(knowledge_export))
+        .route("/workspaces", get(list_workspaces))
+        .route("/workspaces/{id}/bundle", get(bundle))
+        .route(
+            "/workspaces/{id}/restore",
+            post(restore).layer(DefaultBodyLimit::max(16 * 1024 * 1024 * 1024)),
+        )
+        .route("/heartbeat", post(heartbeat))
         .route("/exec", post(exec_start))
         .route("/exec/{name}/cancel", post(exec_cancel))
         .route("/cli-status", get(cli_status))
@@ -766,6 +788,155 @@ async fn knowledge_export(
 }
 
 /// Streams NDJSON frames. If the client disconnects, the run is cancelled.
+/// WP11: the app is alive; renews the leases of the listed runs.
+async fn heartbeat(
+    State(st): State<RunnerState>,
+    Json(req): Json<HeartbeatRequest>,
+) -> Json<HeartbeatResponse> {
+    let lease = Duration::from_secs(req.lease_secs.clamp(MIN_LEASE_SECS, MAX_LEASE_SECS));
+    let deadline = tokio::time::Instant::now() + lease;
+    {
+        let mut leases = st.leases.lock().unwrap_or_else(|e| e.into_inner());
+        for r in &req.runs {
+            if let Some(d) = leases.get_mut(r) {
+                *d = deadline;
+            }
+        }
+    }
+    let mut active: Vec<String> = st.running.lock().await.keys().cloned().collect();
+    active.sort();
+    Json(HeartbeatResponse {
+        info: st.cfg.info(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        active,
+    })
+}
+
+/// WP11: workspace ids on this runner (backups).
+async fn list_workspaces(State(st): State<RunnerState>) -> R<Json<WorkspaceList>> {
+    let mut out = vec![];
+    let mut rd = match tokio::fs::read_dir(st.cfg.workspaces()).await {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Json(WorkspaceList::default()))
+        }
+        Err(e) => return Err(anyhow::Error::from(e).into()),
+    };
+    while let Some(e) = rd.next_entry().await.map_err(anyhow::Error::from)? {
+        let name = e.file_name().to_string_lossy().to_string();
+        let real_dir = tokio::fs::symlink_metadata(e.path())
+            .await
+            .is_ok_and(|m| m.is_dir());
+        if real_dir && valid_name(&name) && Repo::new(&st.cfg.workspaces(), &name).exists() {
+            out.push(name);
+        }
+    }
+    out.sort();
+    Ok(Json(WorkspaceList { workspaces: out }))
+}
+
+fn tmp_file(st: &RunnerState, what: &str) -> R<PathBuf> {
+    let dir = st.cfg.data_dir.join("tmp");
+    std::fs::create_dir_all(&dir).map_err(anyhow::Error::from)?;
+    let mut b = [0u8; 12];
+    getrandom_bytes(&mut b);
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(dir.join(format!("{what}-{hex}")))
+}
+
+/// Random bytes from the OS (no extra crate: `/dev/urandom`).
+fn getrandom_bytes(buf: &mut [u8]) {
+    use std::io::Read;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(buf).is_ok() {
+            return;
+        }
+    }
+    // Uniqueness only (temporary file names), not secrecy.
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = (n >> ((i % 16) * 8)) as u8;
+    }
+}
+
+/// WP11: `git bundle` of a workspace, streamed; the symbolic HEAD comes in
+/// the [`BUNDLE_HEAD_HEADER`] header.
+async fn bundle(State(st): State<RunnerState>, Path(id): Path<String>) -> R<Response> {
+    let repo = existing(&st, &id)?;
+    let path = tmp_file(&st, "bundle")?;
+    let head = {
+        let l = st.lock(&id).await;
+        let _g = l.lock().await;
+        match repo.bundle(&path).await {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(e.into());
+            }
+        }
+    };
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let len = file.metadata().await.map_err(anyhow::Error::from)?.len();
+    // Unlinked while open: the data stays readable until the stream ends,
+    // and nothing is left behind if the client goes away.
+    let _ = tokio::fs::remove_file(&path).await;
+    let stream = tokio_util::io::ReaderStream::new(file);
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/x-git-bundle".to_string()),
+            (header::CONTENT_LENGTH, len.to_string()),
+        ],
+        [(BUNDLE_HEAD_HEADER, head)],
+        Body::from_stream(stream),
+    )
+        .into_response())
+}
+
+/// WP11: creates a workspace (that must not exist yet) from a bundle body.
+async fn restore(
+    State(st): State<RunnerState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Body,
+) -> R<Json<Sha>> {
+    let repo = st.repo(&id)?;
+    if repo.exists() {
+        return Err(ApiErr(
+            StatusCode::CONFLICT,
+            "workspace already exists".into(),
+        ));
+    }
+    let head = headers
+        .get(BUNDLE_HEAD_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if !head.is_empty() && !git::valid_head_ref(&head) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "invalid HEAD ref".into()));
+    }
+    let path = tmp_file(&st, "restore")?;
+    let res = async {
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::File::create(&path).await?;
+        let mut s = body.into_data_stream();
+        while let Some(chunk) = s.next().await {
+            f.write_all(&chunk.map_err(anyhow::Error::msg)?).await?;
+        }
+        f.flush().await?;
+        let l = st.lock(&id).await;
+        let _g = l.lock().await;
+        repo.restore_bundle(&path, &head).await
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&path).await;
+    Ok(Json(Sha { sha: res? }))
+}
+
 async fn exec_start(State(st): State<RunnerState>, Json(req): Json<ExecRequest>) -> R<Response> {
     if !valid_name(&req.name) || !valid_name(&req.workspace) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "invalid name".into()));
@@ -785,11 +956,25 @@ async fn exec_start(State(st): State<RunnerState>, Json(req): Json<ExecRequest>)
                 "run with this name is active".into(),
             ));
         }
+        let mut active = st.active.lock().await;
+        // WP11: one process per workspace. A run the app lost (runner
+        // unreachable, lease not yet expired) must end before the retry
+        // starts, or two agents would work in the same tree.
+        if active.values().any(|w| *w == req.workspace) {
+            return Err(ApiErr(
+                StatusCode::CONFLICT,
+                "a process runs in this workspace".into(),
+            ));
+        }
         running.insert(req.name.clone(), cancel.clone());
-        st.active
-            .lock()
-            .await
-            .insert(req.name.clone(), req.workspace.clone());
+        active.insert(req.name.clone(), req.workspace.clone());
+        if let Some(l) = req.lease_secs {
+            let l = l.clamp(MIN_LEASE_SECS, MAX_LEASE_SECS);
+            st.leases.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                req.name.clone(),
+                tokio::time::Instant::now() + Duration::from_secs(l),
+            );
+        }
     }
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(256);
     let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(256);
@@ -802,7 +987,23 @@ async fn exec_start(State(st): State<RunnerState>, Json(req): Json<ExecRequest>)
         let runner = tokio::spawn(async move { exec::run(&cfg, req, c2, tx).await });
         let mut ended = false;
         let mut run = run;
-        while let Some(frame) = rx.recv().await {
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            let frame = tokio::select! {
+                f = rx.recv() => match f {
+                    Some(f) => f,
+                    None => break,
+                },
+                _ = tick.tick() => {
+                    // WP11: no heartbeat renewed the lease in time (app gone
+                    // or cut off): stop the run (SIGINT, grace, SIGKILL).
+                    if !cancel.is_cancelled() && st2.lease_expired(&name) {
+                        tracing::warn!("run {name}: lease expired, stopping it");
+                        cancel.cancel();
+                    }
+                    continue;
+                }
+            };
             st2.metrics.on_frame(&mut run, &frame);
             if matches!(frame, ExecFrame::Exit { .. } | ExecFrame::Fail { .. }) {
                 ended = true;
@@ -819,6 +1020,10 @@ async fn exec_start(State(st): State<RunnerState>, Json(req): Json<ExecRequest>)
         }
         let _ = runner.await;
         st2.metrics.exec_ended(run);
+        st2.leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&name);
         if !ended {
             // (A run with the same name may already have started otherwise.)
             st2.running.lock().await.remove(&name);
@@ -930,6 +1135,7 @@ mod tests {
             home_env: vec![],
             read_only: false,
             session: None,
+            lease_secs: None,
         };
         c.post(format!("{a}/v1/exec"))
             .bearer_auth("test-token")
@@ -1203,6 +1409,7 @@ mod tests {
             home_env: vec![],
             read_only: false,
             session: None,
+            lease_secs: None,
         };
         let body = c
             .post(format!("{a}/v1/exec"))

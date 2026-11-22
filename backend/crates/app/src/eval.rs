@@ -119,10 +119,11 @@ async fn run_script(
         home_env: vec![],
         read_only: false,
         session: None,
+        lease_secs: None,
     };
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let last = st.runner.exec(&req, tx).await?;
+    let last = st.runner(project).await.exec(&req, tx).await?;
     let _ = drain.await;
     Ok(matches!(last, ExecFrame::Exit { success: true, .. }))
 }
@@ -184,7 +185,8 @@ pub async fn start(
         .bind(user)
         .execute(&st.db)
         .await?;
-        st.runner
+        st.runner(pid)
+            .await
             .init(
                 pid,
                 &InitWorkspace {
@@ -197,7 +199,8 @@ pub async fn start(
             anyhow::bail!("setup of eval case {} failed", case.id);
         }
         let committed = st
-            .runner
+            .runner(pid)
+            .await
             .commit(
                 pid,
                 &format!("eval setup: {}", case.id),
@@ -446,7 +449,7 @@ pub async fn delete(st: &AppState, user: Uuid, id: Uuid) -> anyhow::Result<bool>
             .execute(&st.db)
             .await?;
         crate::runner::merge::remove_working_trees(st, p, &trees).await;
-        if let Err(e) = st.runner.delete(p).await {
+        if let Err(e) = st.runner(p).await.delete(p).await {
             tracing::warn!("eval workspace {p} not deleted: {e:#}");
         }
     }

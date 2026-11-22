@@ -223,7 +223,47 @@ pub struct ExecRequest {
     /// WP06: persisted CLI session files (resume across runs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionSpec>,
+    /// WP11: lease of the run in seconds. The app renews it with every
+    /// [`HeartbeatRequest`]; a run whose lease expires (app gone, network
+    /// cut) is stopped by the runner. `None` = no lease (the run lives as
+    /// long as its stream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_secs: Option<u64>,
 }
+
+/// WP11: shortest/longest run lease the runner accepts.
+pub const MIN_LEASE_SECS: u64 = 5;
+pub const MAX_LEASE_SECS: u64 = 600;
+
+/// WP11 `POST /v1/heartbeat`: the app is alive and still wants `runs`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HeartbeatRequest {
+    /// New lease of every listed run (clamped to [`MIN_LEASE_SECS`]..=[`MAX_LEASE_SECS`]).
+    pub lease_secs: u64,
+    /// Names of the runs the app is streaming from this runner.
+    #[serde(default)]
+    pub runs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HeartbeatResponse {
+    pub info: RunnerInfo,
+    /// Runner version (`CARGO_PKG_VERSION`).
+    pub version: String,
+    /// Runs active on the runner right now.
+    pub active: Vec<String>,
+}
+
+/// WP11 `GET /v1/workspaces`: workspace ids on this runner (backups).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WorkspaceList {
+    pub workspaces: Vec<String>,
+}
+
+/// WP11: header of `GET /v1/workspaces/{id}/bundle` and
+/// `POST /v1/workspaces/{id}/restore` with the symbolic `HEAD` of the repo
+/// (e.g. `refs/heads/main`), which a bundle does not carry.
+pub const BUNDLE_HEAD_HEADER: &str = "x-queue-head";
 
 /// CLI session files kept between runs of a task (WP06). The runner copies
 /// the store `sessions/<scope>/<key>` (or `seed` when that is empty) into the
@@ -289,7 +329,7 @@ pub struct CacheInfo {
 }
 
 /// `GET /v1/info`: what the runner can enforce.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RunnerInfo {
     /// podman | docker | none
     pub engine: String,

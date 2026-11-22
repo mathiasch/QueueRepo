@@ -16,7 +16,7 @@ queued-common = { path = "../common", features = ["scan", "metrics"] }
 anyhow.workspace = true
 axum.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 tokio-stream = "0.1"
 serde.workspace = true
 serde_json.workspace = true

@@ -1,6 +1,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, type APIRequestContext, type Page } from "@playwright/test";
 import { execFileSync } from "node:child_process";
+import { createHmac } from "node:crypto";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -165,4 +166,45 @@ export async function prProject(
 /** The pull request of a task as the app reports it (null while there is none). */
 export async function taskPull(request: APIRequestContext, task: string) {
   return ((await (await request.get(`/api/tasks/${task}`)).json()).pull_request ?? null) as Record<string, any> | null;
+}
+
+// ---------------------------------------------------------------------------
+// WP11: admin account (registered by global-setup.ts), TOTP codes
+// ---------------------------------------------------------------------------
+
+export const ADMIN_EMAIL = "admin@e2e.test";
+
+/** Signs a page in as the instance admin (through the UI form). */
+export async function uiLogin(page: Page, email: string, password = PASSWORD) {
+  await page.goto("/");
+  await page.getByLabel("E-Mail").fill(email);
+  await page.getByLabel("Passwort", { exact: true }).fill(password);
+  await page.getByRole("button", { name: "Anmelden", exact: true }).click();
+}
+
+function base32(s: string): Buffer {
+  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = 0;
+  let value = 0;
+  const out: number[] = [];
+  for (const c of s.replace(/[\s=]/g, "").toUpperCase()) {
+    value = (value << 5) | A.indexOf(c);
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 255);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(out);
+}
+
+/** RFC 6238 code (SHA-1, 6 digits, 30 s) for the current step + `offset`. */
+export function totp(secret: string, offset = 0): string {
+  const step = Math.floor(Date.now() / 1000 / 30) + offset;
+  const msg = Buffer.alloc(8);
+  msg.writeBigUInt64BE(BigInt(step));
+  const h = createHmac("sha1", base32(secret)).update(msg).digest();
+  const o = h[h.length - 1] & 15;
+  const n = ((h[o] & 127) << 24) | (h[o + 1] << 16) | (h[o + 2] << 8) | h[o + 3];
+  return String(n % 1_000_000).padStart(6, "0");
 }

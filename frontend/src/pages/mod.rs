@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod analytics;
 pub mod attachments;
 pub mod automation;
@@ -18,6 +19,7 @@ pub mod projects;
 pub mod protection;
 pub mod providers;
 pub mod queue;
+pub mod security;
 pub mod settings;
 pub mod shell;
 pub mod steer;

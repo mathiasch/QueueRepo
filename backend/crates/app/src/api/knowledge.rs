@@ -158,6 +158,15 @@ pub async fn approve(
 ) -> ApiResult<Json<KnowledgeView>> {
     require(&st, id, u.id, Role::Owner).await?;
     decide(&st, id, kid, u.id, true, &d.note).await?;
+    crate::audit::log(
+        &st,
+        &u,
+        "approval.knowledge_approved",
+        ("knowledge", &kid.to_string()),
+        Some(id),
+        serde_json::json!({}),
+    )
+    .await;
     Ok(Json(view(&st, id, Role::Owner).await?))
 }
 
@@ -169,6 +178,15 @@ pub async fn reject(
 ) -> ApiResult<Json<KnowledgeView>> {
     require(&st, id, u.id, Role::Owner).await?;
     decide(&st, id, kid, u.id, false, &d.note).await?;
+    crate::audit::log(
+        &st,
+        &u,
+        "approval.knowledge_rejected",
+        ("knowledge", &kid.to_string()),
+        Some(id),
+        serde_json::json!({}),
+    )
+    .await;
     Ok(Json(view(&st, id, Role::Owner).await?))
 }
 
@@ -236,15 +254,15 @@ pub async fn import(
             "Nur AGENTS.md, CLAUDE.md oder GEMINI.md.",
         ));
     }
-    let f = st.runner.file(id, &b.file).await.map_err(
-        |e| match crate::runner_client::runner_status(&e) {
+    let f = st.runner(id).await.file(id, &b.file).await.map_err(|e| {
+        match crate::runner_client::runner_status(&e) {
             Some(_) => AppError::bad_request(format!(
                 "{} gibt es im Repository nicht (oder sie ist zu groß).",
                 b.file
             )),
             None => runner_err(e),
-        },
-    )?;
+        }
+    })?;
     let mut content = f.content;
     if content.starts_with(queued_common::MANAGED_MARKER) {
         // A file Queue wrote itself: drop the marker line (and a bridge
@@ -306,7 +324,8 @@ pub async fn export(
             .bind(u.id)
             .fetch_one(&st.db)
             .await?;
-    st.runner
+    st.runner(id)
+        .await
         .init(
             id,
             &queued_common::InitWorkspace {
@@ -318,12 +337,14 @@ pub async fn export(
         .map_err(runner_err)?;
     // Leftovers of the runner-only main tree first (WIP or quarantine), so
     // the export commit holds exactly the managed files. No pull.
-    st.runner
+    st.runner(id)
+        .await
         .begin(id, None, &project.secret_allowlist)
         .await
         .map_err(runner_err)?;
     let out = st
-        .runner
+        .runner(id)
+        .await
         .knowledge_export(
             id,
             &queued_common::KnowledgeExport {
@@ -351,7 +372,8 @@ pub async fn export(
     let mut baseline_updated = false;
     if project.trust_repo_config && !out.written.is_empty() {
         let res = st
-            .runner
+            .runner(id)
+            .await
             .baseline_check(
                 id,
                 &queued_common::gate::BaselineCheck {
@@ -366,7 +388,8 @@ pub async fn export(
             .await
             .map_err(runner_err)?;
         if !res.changed.is_empty() && res.changed.iter().all(|p| out.written.contains(p)) {
-            st.runner
+            st.runner(id)
+                .await
                 .baseline_approve(id, "agent-config", &res.head)
                 .await
                 .map_err(runner_err)?;

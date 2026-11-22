@@ -105,6 +105,15 @@ pub async fn create(
     let row = connectors::load_row(&st, id)
         .await?
         .ok_or_else(AppError::not_found)?;
+    crate::audit::log(
+        &st,
+        &u,
+        "credential.connector_created",
+        ("connector", &id.to_string()),
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     Ok(Json(
         with_status(&st, u.id, connectors::view(&row, true)).await?,
     ))
@@ -158,6 +167,15 @@ pub async fn update(
     let row = connectors::load_row(&st, id)
         .await?
         .ok_or_else(AppError::not_found)?;
+    crate::audit::log(
+        &st,
+        &u,
+        "credential.connector_updated",
+        ("connector", &id.to_string()),
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     Ok(Json(
         with_status(&st, u.id, connectors::view(&row, true)).await?,
     ))
@@ -199,6 +217,15 @@ pub async fn remove(
         .bind(connectors::limit_key(id))
         .execute(&st.db)
         .await?;
+    crate::audit::log(
+        &st,
+        &u,
+        "credential.connector_deleted",
+        ("connector", &id.to_string()),
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -320,6 +347,15 @@ pub async fn put_overrides(
         .bind(u.id)
         .execute(&st.db)
         .await?;
+    crate::audit::log(
+        &st,
+        &u,
+        "admin.prices_changed",
+        ("prices", ""),
+        None,
+        serde_json::json!({"entries": o.entries.len()}),
+    )
+    .await;
     Ok(Json((*pricing::current(&st).await).clone()))
 }
 
@@ -658,7 +694,8 @@ pub async fn cli_status(
     AuthUser(_u): AuthUser,
 ) -> ApiResult<Json<Vec<CliStatus>>> {
     let found = st
-        .runner
+        .fleet
+        .builtin()
         .cli_status()
         .await
         .map_err(|e| AppError::from(e.context("Runner nicht erreichbar")))?;

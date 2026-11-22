@@ -157,7 +157,12 @@ pub async fn propose_from_agent(
 /// Reads the agent's `.queue/knowledge.md` after a run and stores it.
 pub async fn collect(st: &AppState, task: &Task) {
     let ws = crate::runner_client::task_ws(task.id);
-    match st.runner.queue_file(ws, "knowledge.md").await {
+    match st
+        .runner(task.project_id)
+        .await
+        .queue_file(ws, "knowledge.md")
+        .await
+    {
         Ok(Some(text)) => match propose_from_agent(st, task, &text).await {
             Ok(Some(msg)) => queue::event(st, task, "status", &msg).await,
             Ok(None) => {}

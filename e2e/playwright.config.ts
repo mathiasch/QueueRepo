@@ -10,6 +10,8 @@ export default defineConfig({
   fullyParallel: true,
   retries: process.env.CI ? 1 : 0,
   reporter: [["list"], ["html", { open: "never", outputFolder: "report" }]],
+  // WP11: registers the instance admin (first account) before any test.
+  globalSetup: "./global-setup.ts",
   outputDir: "test-results",
   use: {
     baseURL: `http://127.0.0.1:${port}`,

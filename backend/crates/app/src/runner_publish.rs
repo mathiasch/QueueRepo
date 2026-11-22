@@ -78,7 +78,8 @@ pub(crate) async fn publish(
     )
     .await;
     let r = st
-        .runner
+        .runner(project.id)
+        .await
         .push(
             project.id,
             &PushRequest {
@@ -95,6 +96,17 @@ pub(crate) async fn publish(
             },
         )
         .await?;
+    if r.held.is_empty() {
+        crate::audit::system(
+            st,
+            if r.ok { "git.push" } else { "git.push_failed" },
+            "task",
+            &task.id.to_string(),
+            Some(project.id),
+            serde_json::json!({"auto": true, "branch": head, "user": task.user_id}),
+        )
+        .await;
+    }
     if !r.held.is_empty() {
         sqlx::query("UPDATE tasks SET merge_state='queued' WHERE id=$1")
             .bind(task.id)

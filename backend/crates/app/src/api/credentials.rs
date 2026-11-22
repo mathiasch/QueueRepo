@@ -63,6 +63,15 @@ pub async fn put(
         .execute(&st.db)
         .await?;
     st.wake.notify_one();
+    crate::audit::log(
+        &st,
+        &u,
+        "credential.saved",
+        ("credential", &provider),
+        None,
+        serde_json::json!({"provider": provider}),
+    )
+    .await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -73,8 +82,17 @@ pub async fn remove(
 ) -> ApiResult<Json<Value>> {
     sqlx::query("DELETE FROM provider_credentials WHERE user_id=$1 AND provider=$2")
         .bind(u.id)
-        .bind(provider)
+        .bind(&provider)
         .execute(&st.db)
         .await?;
+    crate::audit::log(
+        &st,
+        &u,
+        "credential.deleted",
+        ("credential", &provider),
+        None,
+        serde_json::json!({"provider": provider}),
+    )
+    .await;
     Ok(Json(json!({"ok": true})))
 }

@@ -241,7 +241,12 @@ pub async fn task_diff(st: &AppState, t: &Task) -> anyhow::Result<String> {
     let (Some(a), Some(b)) = (t.diff_base(), t.snapshot_after.as_deref()) else {
         return Ok(String::new());
     };
-    match st.runner.diff(t.project_id, a, b, 2_000_000).await {
+    match st
+        .runner(t.project_id)
+        .await
+        .diff(t.project_id, a, b, 2_000_000)
+        .await
+    {
         Ok(d) => Ok(queued_common::secrets::redact(&d.diff)),
         Err(e) if crate::runner_client::runner_status(&e) == Some(422) => Ok(String::new()),
         Err(e) => Err(e),

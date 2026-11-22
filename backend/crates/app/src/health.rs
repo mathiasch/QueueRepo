@@ -64,7 +64,7 @@ async fn check(st: &AppState) -> Readiness {
         }
     };
     let runner = async {
-        match tokio::time::timeout(CHECK_TIMEOUT, st.runner.info()).await {
+        match tokio::time::timeout(CHECK_TIMEOUT, st.fleet.builtin().info()).await {
             Ok(Ok(_)) => true,
             Ok(Err(e)) => {
                 tracing::warn!("readiness: runner: {e:#}");

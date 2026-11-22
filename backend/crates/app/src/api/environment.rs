@@ -35,7 +35,7 @@ async fn view(st: &AppState, id: Uuid) -> ApiResult<EnvironmentView> {
         cache_enabled: e.cache_enabled,
         cache_files: e.cache_files,
         updated_at: e.updated_at,
-        sandbox: environment::sandbox(st).await,
+        sandbox: environment::sandbox(st, id).await,
         provider_hosts,
     })
 }
@@ -118,6 +118,15 @@ pub async fn put(
     require(&st, id, u.id, Role::Owner).await?;
     let valid = env::validate(&body).map_err(AppError::bad_request)?;
     environment::save(&st.db, id, &valid).await?;
+    crate::audit::log(
+        &st,
+        &u,
+        "credential.environment_changed",
+        ("project", &id.to_string()),
+        Some(id),
+        serde_json::json!({}),
+    )
+    .await;
     Ok(Json(view(&st, id).await?))
 }
 
@@ -152,6 +161,15 @@ pub async fn put_secret(
     .bind(enc)
     .execute(&st.db)
     .await?;
+    crate::audit::log(
+        &st,
+        &u,
+        "credential.secret_saved",
+        ("secret", &name),
+        Some(id),
+        serde_json::json!({"name": name}),
+    )
+    .await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -170,6 +188,15 @@ pub async fn delete_secret(
     if n == 0 {
         return Err(AppError::not_found());
     }
+    crate::audit::log(
+        &st,
+        &u,
+        "credential.secret_deleted",
+        ("secret", &name),
+        Some(id),
+        serde_json::json!({"name": name}),
+    )
+    .await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -181,6 +208,10 @@ pub async fn clear_cache(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     require(&st, id, u.id, Role::Editor).await?;
-    st.runner.clear_cache(id).await.map_err(runner_err)?;
+    st.runner(id)
+        .await
+        .clear_cache(id)
+        .await
+        .map_err(runner_err)?;
     Ok(Json(json!({"ok": true})))
 }

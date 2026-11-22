@@ -27,15 +27,19 @@ pub async fn recover(st: &AppState) -> Result<()> {
     // The runner may outlive the app: stop orphaned runs of these tasks, or
     // they keep changing the workspace and every retry is refused with 409
     // until they end (best effort, the runner may be down as well).
-    let orphans: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM tasks WHERE status='running' OR (status='merging' AND merge_state='merging')",
+    let orphans: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT id, project_id FROM tasks WHERE status='running' OR (status='merging' AND merge_state='merging')",
     )
     .fetch_all(&st.db)
     .await?;
-    let cancels = orphans.iter().flat_map(|id| {
+    let mut clients = vec![];
+    for (id, project) in &orphans {
+        clients.push((*id, st.runner(*project).await));
+    }
+    let cancels = clients.iter().flat_map(|(id, client)| {
         ["agent", "review", "verify"].map(|l| {
             let name = runner::run_name(*id, l);
-            async move { st.runner.cancel(&name).await }
+            async move { client.cancel(&name).await }
         })
     });
     if tokio::time::timeout(Duration::from_secs(10), futures::future::join_all(cancels))
@@ -120,6 +124,14 @@ pub async fn run(st: AppState) {
             if let Err(e) = crate::attachments::sweep_drafts(&st).await {
                 tracing::warn!("attachment draft sweep failed: {e:#}");
             }
+            // WP11: audit retention (the database refuses entries < 365 days).
+            if let Err(e) = crate::audit::prune(&st.db, st.cfg.audit_retention_days).await {
+                tracing::warn!("audit prune failed: {e:#}");
+            }
+            // WP11: expired login flows and old throttle rows.
+            if let Err(e) = crate::mfa::sweep(&st.db).await {
+                tracing::warn!("auth flow sweep failed: {e:#}");
+            }
         }
         tokio::select! {
             _ = st.wake.notified() => {}
@@ -136,16 +148,30 @@ async fn tick(st: &AppState) -> Result<()> {
     if let Err(e) = crate::steer::sweep(st).await {
         tracing::warn!("message sweep failed: {e:#}");
     }
-    let users: Vec<Settings> = sqlx::query_as("SELECT * FROM user_settings")
-        .fetch_all(&st.db)
-        .await?;
+    // WP11: locked accounts start nothing (their tasks stay queued).
+    let users: Vec<Settings> = sqlx::query_as(
+        "SELECT s.* FROM user_settings s JOIN users u ON u.id = s.user_id WHERE u.disabled_at IS NULL",
+    )
+    .fetch_all(&st.db)
+    .await?;
     for s in users {
         let running: i64 =
             sqlx::query_scalar("SELECT count(*) FROM tasks WHERE user_id=$1 AND status='running'")
                 .bind(s.user_id)
                 .fetch_one(&st.db)
                 .await?;
-        let mut slots = s.parallelism.max(1) as i64 - running;
+        // WP11: admin quota – parallelism cap, cost of the last 30 days.
+        let quota = crate::instance::quota(&st.db, s.user_id).await?;
+        let mut parallelism = s.parallelism.max(1);
+        if let Some(cap) = quota.max_parallel {
+            parallelism = parallelism.min(cap.max(1));
+        }
+        if let Some(max) = quota.max_cost_30d_usd {
+            if crate::instance::cost_30d(&st.db, s.user_id).await? >= max {
+                continue;
+            }
+        }
+        let mut slots = parallelism as i64 - running;
         let mut started = 0;
         let blocked = if slots > 0 {
             Blocked::load(st, s.user_id).await?
@@ -216,6 +242,12 @@ const RUNNABLE: &str = "t.user_id = $1 AND t.status = 'queued'
       AND CASE WHEN t.connector_id IS NULL THEN NOT (t.provider = ANY($2))
                ELSE NOT (t.provider = ANY($3)) AND NOT (('connector:' || t.connector_id::text) = ANY($4)) END";
 
+/// WP11: the runner `rn` takes new runs: active (not draining/revoked),
+/// reachable, below its capacity (running tasks claimed on it).
+const RUNNER_USABLE: &str = "rn.status = 'active' AND rn.offline_since IS NULL
+      AND (rn.capacity IS NULL
+           OR (SELECT count(*) FROM tasks c WHERE c.runner_id = rn.id AND c.status = 'running') < rn.capacity)";
+
 /// Claims the next runnable task of the user. A project has as many tasks
 /// in flight as its parallelism allows – running, or finished and waiting
 /// in its merge queue (with the default 1 a task starts on the target
@@ -238,10 +270,12 @@ pub async fn claim_next(
     let mut skip: Vec<Uuid> = vec![];
     loop {
         let mut tx = db.begin().await?;
-        let candidate: Option<Uuid> = sqlx::query_scalar(&format!(
-            "SELECT t.project_id FROM tasks t JOIN projects p ON p.id = t.project_id
+        let candidate: Option<(Uuid, Uuid)> = sqlx::query_as(&format!(
+            "SELECT t.project_id, p.runner_id FROM tasks t JOIN projects p ON p.id = t.project_id
+             JOIN runners rn ON rn.id = p.runner_id
              WHERE {RUNNABLE} AND NOT (t.project_id = ANY($5))
                AND (SELECT count(*) FROM tasks r WHERE r.project_id = t.project_id AND r.status IN ('running','merging')) < p.parallelism
+               AND {RUNNER_USABLE}
              ORDER BY t.position LIMIT 1"
         ))
         .bind(user_id)
@@ -251,26 +285,37 @@ pub async fn claim_next(
         .bind(&skip)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(project) = candidate else {
+        let Some((project, runner)) = candidate else {
             return Ok(None);
         };
-        let locked: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE id = $1 FOR UPDATE SKIP LOCKED")
-                .bind(project)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let locked: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM projects WHERE id = $1 AND runner_id = $2 FOR UPDATE SKIP LOCKED",
+        )
+        .bind(project)
+        .bind(runner)
+        .fetch_optional(&mut *tx)
+        .await?;
         if locked.is_none() {
             skip.push(project);
             continue;
         }
+        // WP11: the runner's capacity is shared by its projects: its row is
+        // locked (after the project, as everywhere) and the next statement
+        // counts with a fresh snapshot.
+        sqlx::query("SELECT id FROM runners WHERE id = $1 FOR UPDATE")
+            .bind(runner)
+            .execute(&mut *tx)
+            .await?;
         let task = sqlx::query_as::<_, Task>(&format!(
-            "UPDATE tasks SET status='running', started_at=now(), updated_at=now(), error=NULL, not_before=NULL
+            "UPDATE tasks SET status='running', started_at=now(), updated_at=now(), error=NULL, not_before=NULL,
+                    runner_id=$6
              WHERE id = (
                 SELECT t.id FROM tasks t WHERE {RUNNABLE} AND t.project_id = $5
                 ORDER BY t.position LIMIT 1
                 FOR UPDATE SKIP LOCKED)
                AND (SELECT count(*) FROM tasks r WHERE r.project_id = $5 AND r.status IN ('running','merging'))
                    < (SELECT parallelism FROM projects WHERE id = $5)
+               AND (SELECT {RUNNER_USABLE} FROM runners rn WHERE rn.id = $6)
              RETURNING *"
         ))
         .bind(user_id)
@@ -278,6 +323,7 @@ pub async fn claim_next(
         .bind(&blocked.budget)
         .bind(&blocked.connectors)
         .bind(project)
+        .bind(runner)
         .fetch_optional(&mut *tx)
         .await?;
         match task {
@@ -298,8 +344,10 @@ pub async fn claim_merge(db: &sqlx::PgPool) -> Result<Option<Task>> {
         let mut tx = db.begin().await?;
         let candidate: Option<Uuid> = sqlx::query_scalar(
             "SELECT t.project_id FROM tasks t
+             JOIN projects p ON p.id = t.project_id JOIN runners rn ON rn.id = p.runner_id
              WHERE t.status = 'merging' AND t.merge_state = 'queued'
                AND (t.not_before IS NULL OR t.not_before <= now())
+               AND rn.status <> 'revoked' AND rn.offline_since IS NULL
                AND NOT (t.project_id = ANY($1))
                AND NOT EXISTS (SELECT 1 FROM tasks m WHERE m.project_id = t.project_id
                                AND m.status = 'merging' AND m.merge_state = 'merging')

@@ -19,8 +19,8 @@ use crate::ui::dialog::{ConfirmDialog, Modal};
 use crate::ui::{uid, Ic, Icon};
 
 use super::{
-    analytics::AnalyticsPage, drawer::TaskDrawer, inbox::InboxPage, project::ProjectPage,
-    projects::ProjectsPage, queue::QueuePage, settings::SettingsPage,
+    admin::AdminPage, analytics::AnalyticsPage, drawer::TaskDrawer, inbox::InboxPage,
+    project::ProjectPage, projects::ProjectsPage, queue::QueuePage, settings::SettingsPage,
 };
 
 #[component]
@@ -44,6 +44,7 @@ pub fn Shell(meta: Meta, user: User) -> impl IntoView {
                         <Route path=path!("/projects/:id") view=ProjectPage/>
                         <Route path=path!("/analytics") view=AnalyticsPage/>
                         <Route path=path!("/settings") view=SettingsPage/>
+                        <Route path=path!("/admin") view=AdminPage/>
                     </Routes>
                 </main>
             </div>
@@ -210,6 +211,11 @@ fn AppBar() -> impl IntoView {
                     <strong class="truncate">{move || store.me.with(|u| u.name.clone())}</strong>
                     <span class="truncate">{move || store.me.with(|u| u.email.clone())}</span>
                 </span>
+                {move || store.me.with(|u| u.is_admin).then(|| view! {
+                    <a class="btn icon-only" href="/admin" aria-label="Verwaltung" title="Verwaltung" data-testid="admin-link">
+                        <Icon icon=Ic::Shield/>
+                    </a>
+                })}
                 <button class="btn icon-only" type="button" aria-label="Abmelden" title="Abmelden" on:click=logout>
                     <Icon icon=Ic::LogOut/>
                 </button>

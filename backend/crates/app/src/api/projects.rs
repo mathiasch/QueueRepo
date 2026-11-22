@@ -176,11 +176,32 @@ pub async fn create(
         None => None,
     };
 
+    // WP11: admin quota on projects.
+    if let Some(max) = crate::instance::quota(&st.db, u.id).await?.max_projects {
+        let owned: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM projects WHERE owner_id=$1 AND NOT is_eval")
+                .bind(u.id)
+                .fetch_one(&st.db)
+                .await?;
+        if owned >= i64::from(max) {
+            return Err(AppError(
+                axum::http::StatusCode::FORBIDDEN,
+                format!("Dein Kontingent erlaubt höchstens {max} Projekte. Wende dich an die Verwaltung."),
+            ));
+        }
+    }
     let id = Uuid::new_v4();
+    // WP11: the project's workspaces live on one runner of the fleet.
+    let runner_id = crate::fleet::assign(&st).await.map_err(|e| {
+        AppError(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!("{e:#}"),
+        )
+    })?;
     let mut tx = st.db.begin().await?;
     let project = sqlx::query_as::<_, Project>(
-        "INSERT INTO projects (id, owner_id, name, description, goal, git_remote_url, git_branch, git_token_enc)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *",
+        "INSERT INTO projects (id, owner_id, name, description, goal, git_remote_url, git_branch, git_token_enc, runner_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *",
     )
     .bind(id)
     .bind(u.id)
@@ -190,6 +211,7 @@ pub async fn create(
     .bind(&remote_url)
     .bind(&branch)
     .bind(token_enc)
+    .bind(runner_id)
     .fetch_one(&mut *tx)
     .await?;
     sqlx::query("INSERT INTO project_members (project_id, user_id, role) VALUES ($1,$2,'owner')")
@@ -204,8 +226,10 @@ pub async fn create(
         branch: branch.clone(),
         token,
     });
-    let head = st
-        .runner
+    let client = st.fleet.client(runner_id).unwrap_or_else(|| {
+        crate::runner_client::RunnerClient::faulty("Der gewählte Runner ist nicht mehr verfügbar.")
+    });
+    let head = client
         .init(
             id,
             &InitWorkspace {
@@ -219,6 +243,15 @@ pub async fn create(
             AppError::bad_request(format!("Repository konnte nicht angelegt werden: {e}"))
         })?;
     tx.commit().await?;
+    crate::audit::log(
+        &st,
+        &u,
+        "project.created",
+        ("project", &id.to_string()),
+        Some(id),
+        serde_json::json!({"runner": runner_id}),
+    )
+    .await;
     Ok(Json(CreatedProject {
         project: project.view(ProjectRole::Owner),
         head,
@@ -375,6 +408,15 @@ pub async fn update(
     .await?;
     st.wake.notify_one();
     let role = role(&st, id, u.id).await?.ok_or_else(AppError::not_found)?;
+    crate::audit::log(
+        &st,
+        &u,
+        "project.updated",
+        ("project", &id.to_string()),
+        Some(id),
+        serde_json::json!({}),
+    )
+    .await;
     Ok(Json(project.view(role.into())))
 }
 
@@ -386,14 +428,25 @@ pub async fn remove(
     require(&st, id, u.id, Role::Owner).await?;
     ensure_idle(&st, id).await?;
     let trees = crate::runner::merge::working_trees(&st, id).await?;
+    // Resolved before the row goes (the runner binding is cached).
+    let client = st.runner(id).await;
     sqlx::query("DELETE FROM projects WHERE id=$1")
         .bind(id)
         .execute(&st.db)
         .await?;
     crate::runner::merge::remove_working_trees(&st, id, &trees).await;
-    if let Err(e) = st.runner.delete(id).await {
+    if let Err(e) = client.delete(id).await {
         tracing::warn!("workspace {id} not deleted: {e:#}");
     }
+    crate::audit::log(
+        &st,
+        &u,
+        "project.deleted",
+        ("project", &id.to_string()),
+        Some(id),
+        serde_json::json!({}),
+    )
+    .await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -447,6 +500,15 @@ pub async fn add_member(
     .bind(&m.role)
     .execute(&st.db)
     .await?;
+    crate::audit::log(
+        &st,
+        &u,
+        "project.member_added",
+        ("user", &uid.to_string()),
+        Some(id),
+        serde_json::json!({"role": m.role}),
+    )
+    .await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -465,6 +527,15 @@ pub async fn remove_member(
     .bind(user_id)
     .execute(&st.db)
     .await?;
+    crate::audit::log(
+        &st,
+        &u,
+        "project.member_removed",
+        ("user", &user_id.to_string()),
+        Some(id),
+        serde_json::json!({}),
+    )
+    .await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -474,7 +545,9 @@ pub async fn files(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Vec<String>>> {
     require(&st, id, u.id, Role::Viewer).await?;
-    Ok(Json(st.runner.files(id).await.map_err(runner_err)?))
+    Ok(Json(
+        st.runner(id).await.files(id).await.map_err(runner_err)?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -489,7 +562,12 @@ pub async fn file(
     Query(q): Query<FileQuery>,
 ) -> ApiResult<Json<FileView>> {
     require(&st, id, u.id, Role::Viewer).await?;
-    let f = st.runner.file(id, &q.path).await.map_err(runner_err)?;
+    let f = st
+        .runner(id)
+        .await
+        .file(id, &q.path)
+        .await
+        .map_err(runner_err)?;
     Ok(Json(FileView {
         path: f.path,
         content: f.content,
@@ -503,7 +581,7 @@ pub async fn zip(
 ) -> ApiResult<impl IntoResponse> {
     require(&st, id, u.id, Role::Viewer).await?;
     let name = load(&st, id).await?.name;
-    let data = st.runner.zip(id).await.map_err(runner_err)?;
+    let data = st.runner(id).await.zip(id).await.map_err(runner_err)?;
     let fname: String = name
         .chars()
         .map(|c| {
@@ -535,7 +613,8 @@ pub async fn import(
     require(&st, id, u.id, Role::Editor).await?;
     ensure_idle(&st, id).await?;
     let r = st
-        .runner
+        .runner(id)
+        .await
         .import(id, body.to_vec(), &u.name, &u.email)
         .await
         .map_err(runner_err)?;
@@ -551,7 +630,7 @@ pub async fn commits(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Vec<Commit>>> {
     require(&st, id, u.id, Role::Viewer).await?;
-    let log = st.runner.log(id, 100).await.map_err(runner_err)?;
+    let log = st.runner(id).await.log(id, 100).await.map_err(runner_err)?;
     Ok(Json(
         log.into_iter()
             .map(|c| Commit {
@@ -584,7 +663,12 @@ pub async fn push(
         scan_base: None,
         expect: None,
     };
-    let r = st.runner.push(id, &req).await.map_err(runner_err)?;
+    let r = st
+        .runner(id)
+        .await
+        .push(id, &req)
+        .await
+        .map_err(runner_err)?;
     if !r.held.is_empty() {
         return Err(AppError::conflict(format!(
             "Push blockiert – mögliches Geheimnis in noch nicht hochgeladenen Commits: {}. Bitte entfernen (neuer Commit reicht nicht, der alte Commit enthält es weiterhin) oder außerhalb von Queue pushen.",
@@ -598,6 +682,15 @@ pub async fn push(
     if !r.ok {
         return Err(AppError::bad_request(format!("push failed: {}", r.output)));
     }
+    crate::audit::log(
+        &st,
+        &u,
+        "git.push",
+        ("project", &id.to_string()),
+        Some(id),
+        serde_json::json!({"manual": true}),
+    )
+    .await;
     Ok(Json(PushResult {
         ok: true,
         output: r.output,

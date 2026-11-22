@@ -122,12 +122,18 @@ pub(super) async fn run(
     main_ready(st, task, project, remote).await?;
     let pid = plan_ws_id(task.id);
     // Never reuse what an earlier (crashed) plan run left behind.
-    if let Err(e) = st.runner.remove_task(project.id, pid, None).await {
+    if let Err(e) = st
+        .runner(project.id)
+        .await
+        .remove_task(project.id, pid, None)
+        .await
+    {
         tracing::debug!("task {}: no old plan working tree: {e:#}", task.id);
     }
     let carry = merge::carry_of(st, task).await?.map(|(c, _)| c);
     let start = merge::pr_start(st, task, project).await?;
-    st.runner
+    st.runner(project.id)
+        .await
         .prepare_task(
             project.id,
             pid,
@@ -148,7 +154,12 @@ pub(super) async fn run(
     // plan is shown to anyone.
     let mut removed = false;
     for _ in 0..5 {
-        match st.runner.remove_task(project.id, pid, None).await {
+        match st
+            .runner(project.id)
+            .await
+            .remove_task(project.id, pid, None)
+            .await
+        {
             Ok(()) => {
                 removed = true;
                 break;
