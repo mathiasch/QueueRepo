@@ -305,11 +305,20 @@ async fn more_than_two_generated_tasks_need_approval(pool: PgPool) {
             .all(|x| x["parent_id"] == t.as_str()),
         "handoff chain to parent"
     );
-    assert!(a
+    // The notification follows the inserted tasks (same run): poll for it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !a
         .notifications()
         .await
         .iter()
-        .any(|n| n["kind"] == "approval"));
+        .any(|n| n["kind"] == "approval")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "approval notification missing"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     // Nothing runs before approval.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(

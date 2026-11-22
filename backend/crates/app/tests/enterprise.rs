@@ -163,10 +163,12 @@ async fn totp_login_replay_and_lockout(pool: PgPool) {
     }
     assert_eq!(login(&h.anon(), "nobody@x.org", "x").await.0, 429);
     // Unknown addresses never reach the (append-only) audit log.
-    let anon_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE actor_id IS NULL AND action LIKE 'auth.%'")
-        .fetch_one(&h.st.db)
-        .await
-        .unwrap();
+    let anon_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE actor_id IS NULL AND action LIKE 'auth.%'",
+    )
+    .fetch_one(&h.st.db)
+    .await
+    .unwrap();
     assert_eq!(anon_rows, 0);
     // The existing admin session still works.
     assert_eq!(a.get("/api/auth/me").await.0, 200);
@@ -1211,8 +1213,14 @@ async fn fake_idp() -> (String, Arc<std::sync::Mutex<(String, String)>>) {
                 "email_verified": true, "name": "Per OIDC",
             });
             let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-            let jwt = format!("{}.{}.sig", b64.encode(br#"{"alg":"none"}"#), b64.encode(claims.to_string()));
-            async move { axum::Json(json!({"id_token": jwt, "access_token": "at", "token_type": "Bearer"})) }
+            let jwt = format!(
+                "{}.{}.sig",
+                b64.encode(br#"{"alg":"none"}"#),
+                b64.encode(claims.to_string())
+            );
+            async move {
+                axum::Json(json!({"id_token": jwt, "access_token": "at", "token_type": "Bearer"}))
+            }
         }),
     );
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
@@ -1237,11 +1245,17 @@ async fn oidc_login(
     let q: std::collections::HashMap<String, String> = loc.query_pairs().into_owned().collect();
     *next.lock().unwrap() = (q["nonce"].clone(), email.to_string());
     let r = c
-        .get(format!("{}/api/auth/oidc/fake/callback?code=c0de&state={}", h.base, q["state"]))
+        .get(format!(
+            "{}/api/auth/oidc/fake/callback?code=c0de&state={}",
+            h.base, q["state"]
+        ))
         .send()
         .await
         .unwrap();
-    (r.status().as_u16(), r.headers()["location"].to_str().unwrap().to_string())
+    (
+        r.status().as_u16(),
+        r.headers()["location"].to_str().unwrap().to_string(),
+    )
 }
 
 /// OIDC is no way around a local second factor: the callback ends in the
@@ -1279,43 +1293,117 @@ async fn oidc_login_still_needs_the_second_factor(pool: PgPool) {
         .build()
         .unwrap();
     let (code, to) = oidc_login(&h, &c, &next, "olga@x.org", None).await;
-    assert_eq!((code, to.as_str()), (303, "/?mfa=1"), "OIDC must not skip the second factor");
-    assert!(cookie(&h, &jar, "qsid").is_none(), "no session after OIDC alone");
-    let client = Client { base: h.base.clone(), http: c.clone() };
+    assert_eq!(
+        (code, to.as_str()),
+        (303, "/?mfa=1"),
+        "OIDC must not skip the second factor"
+    );
+    assert!(
+        cookie(&h, &jar, "qsid").is_none(),
+        "no session after OIDC alone"
+    );
+    let client = Client {
+        base: h.base.clone(),
+        http: c.clone(),
+    };
     assert_eq!(client.get("/api/tasks").await.0, 401);
     let pending = client.get("/api/auth/mfa").await.1;
     assert_eq!(pending["methods"], json!(["totp", "recovery"]));
-    let (code, v) = client.post("/api/auth/mfa/totp", json!({"code": totp_now(&secret, 1)})).await;
+    let (code, v) = client
+        .post("/api/auth/mfa/totp", json!({"code": totp_now(&secret, 1)}))
+        .await;
     assert_eq!(code, 200, "{v}");
     assert_eq!(client.get("/api/auth/me").await.1["email"], "olga@x.org");
     let methods: Vec<String> = sqlx::query_scalar("SELECT auth_method FROM sessions s JOIN users u ON u.id=s.user_id WHERE u.email='olga@x.org'")
         .fetch_all(&h.st.db)
         .await
         .unwrap();
-    assert!(methods.contains(&"oidc:Fake+totp".to_string()), "{methods:?}");
+    assert!(
+        methods.contains(&"oidc:Fake+totp".to_string()),
+        "{methods:?}"
+    );
 
     // Without a factor: straight in (new account, open registration).
-    let c2 = reqwest::Client::builder().cookie_store(true).redirect(reqwest::redirect::Policy::none()).build().unwrap();
-    assert_eq!(oidc_login(&h, &c2, &next, "pia@x.org", None).await, (303, "/".to_string()));
-    assert_eq!(Client { base: h.base.clone(), http: c2 }.get("/api/auth/me").await.1["email"], "pia@x.org");
+    let c2 = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    assert_eq!(
+        oidc_login(&h, &c2, &next, "pia@x.org", None).await,
+        (303, "/".to_string())
+    );
+    assert_eq!(
+        Client {
+            base: h.base.clone(),
+            http: c2
+        }
+        .get("/api/auth/me")
+        .await
+        .1["email"],
+        "pia@x.org"
+    );
 
     // Invitation mode: new OIDC accounts only with an invitation.
-    assert_eq!(admin.put("/api/admin/settings", json!({"registration_mode": "invite"})).await.0, 200);
-    let c3 = reqwest::Client::builder().cookie_store(true).redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    assert_eq!(
+        admin
+            .put(
+                "/api/admin/settings",
+                json!({"registration_mode": "invite"})
+            )
+            .await
+            .0,
+        200
+    );
+    let c3 = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
     let (_, to) = oidc_login(&h, &c3, &next, "neu@x.org", None).await;
     assert!(to.starts_with("/?login_error="), "{to}");
-    let (_, inv) = admin.post("/api/admin/invitations", json!({"email": "neu@x.org", "days": 1})).await;
-    let token = inv["link"].as_str().unwrap().split("invite=").nth(1).unwrap().to_string();
-    assert_eq!(oidc_login(&h, &c3, &next, "neu@x.org", Some(&token)).await, (303, "/".to_string()));
+    let (_, inv) = admin
+        .post(
+            "/api/admin/invitations",
+            json!({"email": "neu@x.org", "days": 1}),
+        )
+        .await;
+    let token = inv["link"]
+        .as_str()
+        .unwrap()
+        .split("invite=")
+        .nth(1)
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        oidc_login(&h, &c3, &next, "neu@x.org", Some(&token)).await,
+        (303, "/".to_string())
+    );
     let used: bool = sqlx::query_scalar("SELECT used_at IS NOT NULL FROM invitations")
         .fetch_one(&h.st.db)
         .await
         .unwrap();
     assert!(used);
     // A locked account cannot come in through OIDC either.
-    let olga: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email='olga@x.org'").fetch_one(&h.st.db).await.unwrap();
-    assert_eq!(admin.patch(&format!("/api/admin/users/{olga}"), json!({"disabled": true})).await.0, 200);
-    let c4 = reqwest::Client::builder().cookie_store(true).redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let olga: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email='olga@x.org'")
+        .fetch_one(&h.st.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        admin
+            .patch(
+                &format!("/api/admin/users/{olga}"),
+                json!({"disabled": true})
+            )
+            .await
+            .0,
+        200
+    );
+    let c4 = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
     let (_, to) = oidc_login(&h, &c4, &next, "olga@x.org", None).await;
     assert!(to.starts_with("/?login_error="), "{to}");
 }

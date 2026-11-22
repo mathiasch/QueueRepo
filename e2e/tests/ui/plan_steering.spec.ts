@@ -36,7 +36,14 @@ test("plan view: the plan waits; edit and approve, ask for a new one, discard", 
   await page.getByRole("button", { name: "Erweitert" }).click();
   await expect(page.getByTestId("plan-first")).toBeChecked();
   await page.getByRole("button", { name: "Einreihen" }).click();
-  const tasks = (await (await page.request.get("/api/tasks")).json()) as Record<string, any>[];
+  // The click only starts the request: wait until the task exists.
+  let tasks: Record<string, any>[] = [];
+  await expect
+    .poll(async () => {
+      tasks = (await (await page.request.get("/api/tasks")).json()) as Record<string, any>[];
+      return tasks.some((t) => String(t.title).includes("Spam-Schutz"));
+    })
+    .toBe(true);
   const tid = tasks.find((t) => String(t.title).includes("Spam-Schutz"))!.id as string;
   expect(tasks.find((t) => t.id === tid)!.plan_mode).toBe(true);
   await waitTask(page.request, tid, "held");

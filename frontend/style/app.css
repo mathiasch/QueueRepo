@@ -546,7 +546,9 @@ details.block[open] > summary .chev { transform: rotate(90deg); }
   pointer-events: auto; display: flex; gap: var(--sp-3); align-items: flex-start; padding: 12px 12px 12px 14px; border-radius: var(--r-md);
   background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-lg); animation: rise var(--dur) var(--ease);
 }
-@keyframes rise { from { transform: translateY(10px); opacity: 0; } }
+/* Movement only, no fade: a half-transparent toast fails contrast checks (axe)
+   and is hard to read while it appears. */
+@keyframes rise { from { transform: translateY(10px); } }
 .toast .toast-icon { color: var(--primary-text); margin-top: 1px; }
 .toast.error .toast-icon { color: var(--danger-text); }
 .toast.success .toast-icon { color: var(--success-text); }
