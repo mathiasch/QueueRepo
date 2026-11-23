@@ -13,6 +13,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub mod analytics;
+pub mod bon;
 pub mod branch;
 mod costs;
 pub mod diff;
@@ -22,6 +23,7 @@ pub mod intake;
 pub mod memory;
 pub mod notify;
 pub mod pr;
+pub mod preview;
 mod providers;
 pub mod security;
 pub mod steer;
@@ -137,6 +139,12 @@ pub enum TaskStatus {
     /// merged into the target branch (WP04, see `Task::merge_state`).
     /// Occupies no agent slot.
     Merging,
+    /// WP12 Best-of-N group: its attempts run or wait for a selection.
+    /// Occupies no slot (like `held`).
+    Comparing,
+    /// WP12 attempt that passed gate, verify and review; waits for the
+    /// selection (then it enters the merge queue) or is discarded.
+    Candidate,
     Done,
     Failed,
     Blocked,
@@ -144,7 +152,7 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
-    pub const ALL: [TaskStatus; 11] = [
+    pub const ALL: [TaskStatus; 13] = [
         Self::PendingApproval,
         Self::Queued,
         Self::Running,
@@ -152,6 +160,8 @@ impl TaskStatus {
         Self::WaitingInput,
         Self::Held,
         Self::Merging,
+        Self::Comparing,
+        Self::Candidate,
         Self::Done,
         Self::Failed,
         Self::Blocked,
@@ -167,6 +177,8 @@ impl TaskStatus {
             Self::WaitingInput => "waiting_input",
             Self::Held => "held",
             Self::Merging => "merging",
+            Self::Comparing => "comparing",
+            Self::Candidate => "candidate",
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Blocked => "blocked",
@@ -194,6 +206,20 @@ impl TaskStatus {
         )
     }
 
+    /// WP12: an attempt in this state still runs or waits for a human
+    /// (the group is not settled yet).
+    pub fn is_open_attempt(self) -> bool {
+        matches!(
+            self,
+            Self::Queued
+                | Self::Running
+                | Self::WaitingBatch
+                | Self::WaitingInput
+                | Self::PendingApproval
+                | Self::Held
+        )
+    }
+
     /// Title, prompt, context, provider and limits may still be changed.
     pub fn is_editable(self) -> bool {
         matches!(
@@ -212,6 +238,8 @@ impl TaskStatus {
                 | Self::WaitingInput
                 | Self::Held
                 | Self::Merging
+                | Self::Comparing
+                | Self::Candidate
         )
     }
 
@@ -444,6 +472,25 @@ pub struct Task {
     /// WP09: changes were reverted (`git revert`).
     #[serde(default)]
     pub reverted_at: Option<DateTime<Utc>>,
+    /// WP12 Best-of-N: number of attempts (1 = a normal task).
+    #[serde(default = "one")]
+    pub attempts: i32,
+    /// WP12: the group (parent task) this attempt belongs to.
+    #[serde(default)]
+    pub attempt_of: Option<Uuid>,
+    /// WP12: number of the attempt within its group (1-based).
+    #[serde(default)]
+    pub attempt_no: Option<i32>,
+    /// WP12: [`bon::Bon`] of a group (targets, automatic selection, choice).
+    #[serde(default)]
+    pub bon: Option<Value>,
+    /// WP12: [`RoutingDecision`] of the agent loop (why this access/model).
+    #[serde(default)]
+    pub routing_decision: Option<Value>,
+}
+
+fn one() -> i32 {
+    1
 }
 
 impl Task {
@@ -520,6 +567,23 @@ impl Task {
             .and_then(|r| serde_json::from_value(r.clone()).ok())
     }
 
+    pub fn bon_parsed(&self) -> Option<bon::Bon> {
+        self.bon
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    pub fn routing_decision_parsed(&self) -> Option<RoutingDecision> {
+        self.routing_decision
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    /// WP12: a Best-of-N group (parent of attempts).
+    pub fn is_group(&self) -> bool {
+        self.attempts > 1 && self.attempt_of.is_none()
+    }
+
     pub fn usage_parsed(&self) -> Option<Usage> {
         self.usage
             .as_ref()
@@ -557,6 +621,9 @@ pub struct TaskDetail {
     /// WP09: attachments (own; a fix task also lists those it inherits).
     #[serde(default)]
     pub attachments: Vec<memory::AttachmentView>,
+    /// WP12: screenshots of the dev server after the run (desktop, mobile).
+    #[serde(default)]
+    pub screenshots: Vec<preview::ScreenshotView>,
 }
 
 /// `GET /api/tasks/{id}/diff`.
@@ -626,6 +693,16 @@ pub struct CreateTask {
     /// WP09: draft attachments (uploaded before) that belong to the task.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachment_ids: Vec<Uuid>,
+    /// WP12 Best-of-N: number of parallel attempts (`None`/1 = normal task).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<i32>,
+    /// WP12: access/model per attempt (empty = every attempt uses the task's
+    /// access; otherwise exactly `attempts` entries).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempt_targets: Vec<Target>,
+    /// WP12: a review agent picks the winner when all attempts are settled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_select: bool,
     #[serde(flatten)]
     pub limits: TaskLimitFields,
 }
@@ -1233,6 +1310,9 @@ mod tests {
             allow_test_changes: false,
             plan_mode: None,
             attachment_ids: vec![],
+            attempts: None,
+            attempt_targets: vec![],
+            auto_select: false,
             limits: TaskLimitFields {
                 max_runtime_secs: Some(Some(90)),
                 ..Default::default()

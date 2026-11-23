@@ -156,6 +156,40 @@ pub async fn run_task(st: AppState, task: Task, cancel: CancellationToken, gen: 
             }
         }
     }
+    // WP12: an attempt ended its run – the group budget (booked usage of all
+    // attempts), a budget stop of this attempt, and the group's state.
+    if let Some(group) = task.attempt_of {
+        let end: Option<(String, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT status, failure_class, error FROM tasks WHERE id=$1")
+                .bind(id)
+                .fetch_optional(&st.db)
+                .await
+                .ok()
+                .flatten();
+        if let Some((s, Some(class), err)) = &end {
+            if s == "blocked" && (class == "limit_cost" || class == "limit_tokens") {
+                let why = err.clone().unwrap_or_default();
+                let reason = if why.contains("Versuche") {
+                    why
+                } else {
+                    format!(
+                        "{} Versuch {}: {why} – alle Versuche wurden gestoppt",
+                        if class == "limit_tokens" { "Token-Limit erreicht in" } else { "Kostenlimit erreicht in" },
+                        task.attempt_no.unwrap_or(0)
+                    )
+                };
+                if let Err(e) = crate::bon::abort(&st, group, &reason).await {
+                    tracing::warn!("group {group}: abort failed: {e:#}");
+                }
+            }
+        }
+        if let Err(e) = crate::bon::check_budget(&st, &task).await {
+            tracing::warn!("group {group}: budget check failed: {e:#}");
+        }
+        if let Err(e) = crate::bon::settle(&st, group).await {
+            tracing::warn!("group {group}: not settled: {e:#}");
+        }
+    }
     if let Ok(Some(status)) =
         sqlx::query_scalar::<_, String>("SELECT status FROM tasks WHERE id=$1")
             .bind(id)
@@ -667,6 +701,8 @@ async fn run_inner(
             .fetch_one(&st.db)
             .await?;
     let lim = limits::effective(task, &project, &st.cfg);
+    // WP12: the agent takes the working tree back from a live preview.
+    crate::preview::stop_for_task(st, task.id).await;
     event(
         st,
         task,
@@ -783,6 +819,13 @@ async fn run_inner(
                 return Ok(());
             }
         }
+    }
+
+    // WP12 Best-of-N: the group fans out into its attempts instead of
+    // running an agent itself (plan mode and plan step ran on it above).
+    if task.is_group() {
+        crate::bon::fan_out(st, task).await?;
+        return Ok(());
     }
 
     let before = prepare_workspace(st, task, &project, remote.clone()).await?;
@@ -1120,7 +1163,12 @@ pub(crate) async fn record_cost(
         .bind(serde_json::to_value(&tc).unwrap_or_default())
         .execute(&mut *tx)
         .await?;
-    tx.commit().await
+    tx.commit().await?;
+    // WP12: the step is booked – out of the group's live ledger.
+    if let Some(group) = task.attempt_of {
+        crate::bon::ledger_booked(st, group, task.id).await;
+    }
+    Ok(())
 }
 
 /// Adds a step to the task cost (same step + model + access = one line).
@@ -1298,6 +1346,36 @@ async fn finish_cancelled(
     handoff: Option<String>,
     usage: &Usage,
 ) -> sqlx::Result<()> {
+    // WP12: an attempt stopped by its group's budget ends blocked (limit),
+    // not cancelled – nobody cancelled it.
+    let aborted: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT g.bon->>'aborted' FROM tasks t JOIN tasks g ON g.id = t.attempt_of WHERE t.id=$1",
+    )
+    .bind(id)
+    .fetch_optional(&st.db)
+    .await?;
+    if let Some(Some(reason)) = aborted {
+        let class = if reason.starts_with("Token") {
+            FailureClass::LimitTokens
+        } else {
+            FailureClass::LimitCost
+        };
+        return finish(
+            st,
+            id,
+            Finish {
+                status: status::BLOCKED,
+                summary,
+                handoff,
+                error: Some(reason),
+                review: None,
+                questions: None,
+                usage,
+                failure_class: Some(class),
+            },
+        )
+        .await;
+    }
     finish(
         st,
         id,
@@ -1366,6 +1444,26 @@ async fn finish_failed(
     f: &str,
 ) -> Result<(), RunError> {
     event(st, task, "error", f).await;
+    // WP12: a failed attempt is filtered out – no fix task, no escalation
+    // (after the selection the winner is a normal task again).
+    if task.kind == "attempt" && task.status != status::MERGING {
+        finish(
+            st,
+            task.id,
+            Finish {
+                status: status::FAILED,
+                summary: Some(end.summary),
+                handoff: end.handoff,
+                error: Some(cut(f, 8000)),
+                review: end.review,
+                questions: None,
+                usage: end.usage,
+                failure_class: Some(FailureClass::Task),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
     // Eval runs measure first-pass success: no fix tasks.
     let is_eval: bool = sqlx::query_scalar("SELECT is_eval FROM projects WHERE id=$1")
         .bind(task.project_id)
@@ -2061,6 +2159,14 @@ async fn agent_run(
         })
     });
     let mut guard = caps.live_usage.then(|| Guard::new(tokens_left, cost_left));
+    // WP12: budget of a Best-of-N group over all its attempts (live ledger).
+    let gcap = if task.kind == "attempt" {
+        crate::bon::cap_for(st, task, spec.label)
+            .await
+            .map_err(RunError::Infra)?
+    } else {
+        None
+    };
 
     let (tx, mut rx) = mpsc::channel::<ExecFrame>(512);
     let provider = spec.provider;
@@ -2134,6 +2240,28 @@ async fn agent_run(
                                     u.cost_usd = c;
                                 }
                                 o.usage_delta.add(&u);
+                                if let Some(cap) = &gcap {
+                                    let total = crate::bon::ledger_delta(st, cap, &u);
+                                    if let (None, Some(k)) =
+                                        (o.guard_limit, cap.limits.exhausted(&total))
+                                    {
+                                        o.guard_limit = Some(k);
+                                        let reason =
+                                            crate::bon::budget_text(k, &cap.limits, &total);
+                                        event(st, task, "guard", &reason).await;
+                                        run_cancel.cancel();
+                                        let (st2, group) = (st.clone(), cap.group);
+                                        tokio::spawn(async move {
+                                            if let Err(e) =
+                                                crate::bon::abort(&st2, group, &reason).await
+                                            {
+                                                tracing::warn!(
+                                                    "group {group}: abort failed: {e:#}"
+                                                );
+                                            }
+                                        });
+                                    }
+                                }
                                 if let Some(k) = guard.as_mut().and_then(|g| g.on_delta(&u)) {
                                     o.guard_limit = Some(k);
                                     let g = guard.as_ref().expect("guard");
@@ -2279,6 +2407,8 @@ async fn agent_run(
     }
     o.stderr_tail = tail(&o.stderr_tail, 3000);
     o.step_cost = Some(meter.finish(&o.usage()));
+    // WP12: the ledger keeps this run's usage live until `record_cost`
+    // books it (over- rather than under-counting in between).
     finish_run_record(
         st,
         task,
@@ -3438,6 +3568,14 @@ async fn create_followups(
                 carry_from: None,
                 pr_id: None,
                 plan_mode: false,
+                routing_decision: crate::routing::inherited_json(
+                    "task",
+                    &provider,
+                    connector_id,
+                    model.as_deref(),
+                    queued_api::DecisionSource::Inherited,
+                    "Folgeauftrag mit dem Zugang des Ursprungsauftrags",
+                ),
             },
         )
         .await?;
@@ -3682,26 +3820,11 @@ async fn llm_critic(
 }
 
 async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Result<()> {
-    // Escalation along the routing chain (e.g. Haiku → Sonnet → Opus).
-    let routing: Option<queued_api::Routing> =
-        sqlx::query_scalar::<_, Option<Value>>("SELECT routing FROM projects WHERE id=$1")
-            .bind(failed.project_id)
-            .fetch_one(&st.db)
-            .await?
-            .and_then(|r| serde_json::from_value(r).ok());
-    let (model, level) = match crate::routing::escalate(routing.as_ref(), failed) {
-        Some((m, l)) => {
-            event(
-                st,
-                failed,
-                "status",
-                &format!("Eskalation: der nächste Versuch nutzt {m}"),
-            )
-            .await;
-            (Some(m), l)
-        }
-        None => (failed.model.clone(), failed.escalation_level),
-    };
+    let project: Project = sqlx::query_as("SELECT * FROM projects WHERE id=$1")
+        .bind(failed.project_id)
+        .fetch_one(&st.db)
+        .await?;
+    let routing = project.routing();
     let mut root = failed.clone();
     while root.kind == "fix" {
         match root.parent_id {
@@ -3711,6 +3834,54 @@ async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Resu
             },
             None => break,
         }
+    }
+    let prompt = prompt::fix_prompt(&root.title, &root.prompt, failure);
+    let title = format!("Fix #{}: {}", failed.attempt + 1, root.title);
+    // WP12: escalation along the routing chain (e.g. Haiku → Sonnet → Opus),
+    // a rule for fix tasks, or the failed task's access – with the reason.
+    let ask = crate::routing::Ask::new("fix", &title, &prompt, &root.context, 0);
+    let mut decision = crate::routing::decide_fix(routing.as_ref(), failed, &ask);
+    let level = decision.escalation_level.unwrap_or(failed.escalation_level);
+    if decision.source == queued_api::DecisionSource::Rule {
+        // A rule may name another access: checked like a new task; refused
+        // (rights, residency) ⇒ the failed task's access, with the reason.
+        match crate::routing::check_decision(st, failed.user_id, &project, decision.clone(), &failed.provider).await? {
+            Ok(_) => {}
+            Err(why) => {
+                let mut d = crate::routing::decide_fix(None, failed, &ask);
+                d.reason = format!("{} (Regel „{}“ nicht nutzbar: {why})", d.reason, decision.rule.clone().unwrap_or_default());
+                decision = d;
+            }
+        }
+    }
+    let (provider, connector_id, model) = match crate::routing::check_decision(
+        st,
+        failed.user_id,
+        &project,
+        decision.clone(),
+        &failed.provider,
+    )
+    .await?
+    {
+        Ok(e) => {
+            decision = e.decision.clone();
+            (e.provider, e.connector_id, e.model)
+        }
+        // The failed task's own access is no longer usable: the fix keeps it
+        // and the run blocks with the access message (as before WP12).
+        Err(_) => (failed.provider.clone(), failed.connector_id, decision.target.model.clone()),
+    };
+    if decision.source == queued_api::DecisionSource::Escalation {
+        event(
+            st,
+            failed,
+            "status",
+            &format!(
+                "Eskalation: der nächste Versuch nutzt {}",
+                model.as_deref().unwrap_or("das Standardmodell")
+            ),
+        )
+        .await;
     }
     // WP04: the fix continues the failed task's unmerged changes (its
     // working tree starts with them on top of the current target branch).
@@ -3729,10 +3900,10 @@ async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Resu
             project_id: failed.project_id,
             parent_id: Some(failed.id),
             kind: "fix",
-            title: format!("Fix #{}: {}", failed.attempt + 1, root.title),
-            prompt: prompt::fix_prompt(&root.title, &root.prompt, failure),
+            title,
+            prompt,
             context: root.context.clone(),
-            provider: failed.provider.clone(),
+            provider,
             model,
             status: status::QUEUED,
             attempt: failed.attempt + 1,
@@ -3741,12 +3912,13 @@ async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Resu
             front: true,
             // A fix inherits the task-level limits of the failed task.
             limits: TaskLimits::of(failed),
-            connector_id: failed.connector_id,
+            connector_id,
             escalation_level: level,
             allow_test_changes: false,
             carry_from,
             pr_id: failed.pr_id,
             plan_mode: false,
+            routing_decision: serde_json::to_value(&decision).ok(),
         },
     )
     .await?;

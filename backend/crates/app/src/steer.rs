@@ -302,6 +302,14 @@ pub async fn continuation(
             carry_from: carry,
             pr_id: origin.pr_id,
             plan_mode,
+            routing_decision: crate::routing::inherited_json(
+                "continue",
+                &origin.provider,
+                origin.connector_id,
+                origin.model.as_deref(),
+                queued_api::DecisionSource::Inherited,
+                "Fortsetzung mit dem Zugang des Ursprungsauftrags",
+            ),
         },
     )
     .await?;

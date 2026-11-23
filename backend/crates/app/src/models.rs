@@ -17,6 +17,8 @@ pub mod status {
     pub const WAITING_INPUT: &str = "waiting_input";
     pub const HELD: &str = "held";
     pub const MERGING: &str = "merging";
+    pub const COMPARING: &str = "comparing";
+    pub const CANDIDATE: &str = "candidate";
     pub const DONE: &str = "done";
     pub const FAILED: &str = "failed";
     pub const BLOCKED: &str = "blocked";
@@ -35,6 +37,8 @@ pub fn status_label(s: &str) -> &'static str {
         WAITING_INPUT,
         HELD,
         MERGING,
+        COMPARING,
+        CANDIDATE,
         DONE,
         FAILED,
         BLOCKED,

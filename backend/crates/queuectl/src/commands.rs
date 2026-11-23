@@ -23,6 +23,8 @@ pub fn status_label(s: &str) -> &'static str {
         Some(TaskStatus::WaitingInput) => "wartet auf Antwort",
         Some(TaskStatus::Held) => "Freigabe nötig",
         Some(TaskStatus::Merging) => "wird übernommen",
+        Some(TaskStatus::Comparing) => "Versuche laufen / Auswahl offen",
+        Some(TaskStatus::Candidate) => "Versuch fertig, wartet auf Auswahl",
         Some(TaskStatus::Done) => "erledigt",
         Some(TaskStatus::Failed) => "fehlgeschlagen",
         Some(TaskStatus::Blocked) => "blockiert",
@@ -154,6 +156,9 @@ pub struct AddArgs {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub max_cost: Option<f64>,
+    /// WP12 Best-of-N.
+    pub attempts: Option<i32>,
+    pub auto_select: bool,
     pub text: Vec<String>,
     pub json: bool,
 }
@@ -173,6 +178,9 @@ pub async fn add(api: &Api, a: AddArgs) -> Result<Task> {
         allow_test_changes: false,
         plan_mode: a.plan,
         attachment_ids: vec![],
+        attempts: a.attempts,
+        attempt_targets: vec![],
+        auto_select: a.auto_select,
         limits: TaskLimitFields {
             max_cost_usd: a.max_cost.map(Some),
             ..Default::default()

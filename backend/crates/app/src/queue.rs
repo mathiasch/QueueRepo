@@ -62,6 +62,8 @@ pub struct NewTask {
     pub pr_id: Option<Uuid>,
     /// WP06: plan first (human-created tasks only).
     pub plan_mode: bool,
+    /// WP12: [`queued_api::RoutingDecision`] of the agent loop as JSON.
+    pub routing_decision: Option<Value>,
 }
 
 pub async fn insert_task(st: &AppState, t: NewTask) -> sqlx::Result<Task> {
@@ -90,11 +92,11 @@ pub async fn insert_task_in(conn: &mut sqlx::PgConnection, t: NewTask) -> sqlx::
         "INSERT INTO tasks (id, user_id, project_id, parent_id, kind, title, prompt, context, provider, model, status,
                             attempt, depth, created_by_agent, position,
                             max_runtime_secs, max_cost_usd, max_tokens, max_turns, connector_id, escalation_level,
-                            allow_test_changes, carry_from, pr_id, plan_mode)
+                            allow_test_changes, carry_from, pr_id, plan_mode, routing_decision)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
                  CASE WHEN $15 THEN (SELECT COALESCE(MIN(position), 0) - 1 FROM tasks WHERE user_id = $2 AND status = 'queued')
                       ELSE nextval('task_position_seq') END,
-                 $16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+                 $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
          RETURNING *",
     )
     .bind(Uuid::new_v4())
@@ -122,6 +124,7 @@ pub async fn insert_task_in(conn: &mut sqlx::PgConnection, t: NewTask) -> sqlx::
     .bind(t.carry_from)
     .bind(t.pr_id)
     .bind(t.plan_mode && !t.created_by_agent)
+    .bind(t.routing_decision)
     .fetch_one(conn)
     .await
 }

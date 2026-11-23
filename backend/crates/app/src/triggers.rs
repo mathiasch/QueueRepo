@@ -353,20 +353,6 @@ async fn new_task(
         .fetch_one(&mut *conn)
         .await?;
     let settings = queue::load_settings(st, t.user_id).await?;
-    let exec = match crate::routing::resolve_execute(
-        st,
-        t.user_id,
-        &project,
-        None,
-        tpl.provider.as_deref(),
-        tpl.model.clone(),
-        &settings.default_provider,
-    )
-    .await?
-    {
-        Ok(e) => e,
-        Err(why) => return Ok(Err(format!("Kein Auftrag möglich: {why}"))),
-    };
     let context = match &f.data {
         Some((intro, entries)) => {
             crate::prompt::event_section(intro, &crate::prompt::nonce(), entries)
@@ -377,6 +363,26 @@ async fn new_task(
         .chars()
         .take(200)
         .collect();
+    let ask = crate::routing::Ask::new("task", &title, &tpl.prompt, &context, 0);
+    let exec = match crate::routing::resolve_execute(
+        st,
+        t.user_id,
+        &project,
+        crate::routing::Explicit {
+            connector: None,
+            provider: tpl.provider.clone(),
+            model: tpl.model.clone(),
+            attempt: false,
+        },
+        Some(&ask),
+        &settings.default_provider,
+    )
+    .await?
+    {
+        Ok(e) => e,
+        Err(why) => return Ok(Err(format!("Kein Auftrag möglich: {why}"))),
+    };
+    let routing_decision = exec.decision_json();
     let mut task = queue::insert_task_in(
         conn,
         NewTask {
@@ -406,6 +412,7 @@ async fn new_task(
             carry_from: None,
             pr_id: None,
             plan_mode: tpl.plan_mode.unwrap_or(project.plan_mode),
+            routing_decision,
         },
     )
     .await?;

@@ -428,70 +428,200 @@ pub async fn estimate(
     require(&st, r.project_id, u.id, Role::Editor).await?;
     let project = super::projects::load(&st, r.project_id).await?;
     let settings = crate::queue::load_settings(&st, u.id).await?;
-    let exec = routing::resolve_execute(
-        &st,
-        u.id,
-        &project,
-        r.connector_id,
-        r.provider.as_deref(),
-        r.model.clone(),
-        &settings.default_provider,
-    )
-    .await?
-    .map_err(AppError::bad_request)?;
+    let resolve = |connector, provider: Option<String>, model, attempt| {
+        let (st, project, settings) = (&st, &project, &settings);
+        async move {
+            routing::resolve_execute(
+                st,
+                u.id,
+                project,
+                routing::Explicit {
+                    connector,
+                    provider,
+                    model,
+                    attempt,
+                },
+                None,
+                &settings.default_provider,
+            )
+            .await
+        }
+    };
+    let exec = resolve(r.connector_id, r.provider.clone(), r.model.clone(), false)
+        .await?
+        .map_err(AppError::bad_request)?;
     let all = routing::accesses(&st, u.id, project.id).await?;
     let cat = pricing::current(&st).await;
+    let route = project.routing();
+    let mut notes = vec![];
+    let mut steps = vec![];
+    if let Some(rt) = route.as_ref().filter(|r| r.plan.mode != StepMode::Off) {
+        steps.push(single_step(&cat, &all, &exec, false, "plan", &rt.plan, estimate::PLAN));
+    }
+    let location = location_of(&st, &exec).await?;
+    if r.attempts.is_empty() && !r.auto_select {
+        steps.extend(exec_steps(&st, u.id, &cat, &all, &project, &exec).await?);
+        if exec.model.is_none() {
+            notes.push(
+                "Ohne Modellangabe ist der Preis unbekannt (die CLI wählt ihr Standardmodell)."
+                    .into(),
+            );
+        }
+        return Ok(Json(estimate::assemble(steps, &location, notes)));
+    }
+    // WP12 Best-of-N: plan once, agent loop + review per attempt, plus the
+    // selection by the review agent.
+    let n = r.attempts.len();
+    if !(2..=queued_api::bon::MAX_ATTEMPTS as usize).contains(&n) {
+        return Err(AppError::bad_request(format!(
+            "Mehrere Versuche: 2 bis {} Zugänge angeben",
+            queued_api::bon::MAX_ATTEMPTS
+        )));
+    }
+    let mut per = vec![];
+    let mut models = vec![];
+    for (i, t) in r.attempts.iter().enumerate() {
+        let e = resolve(t.connector_id, t.provider.clone(), t.model.clone(), true)
+            .await?
+            .map_err(|m| AppError::bad_request(format!("Versuch {}: {m}", i + 1)))?;
+        let s = exec_steps(&st, u.id, &cat, &all, &project, &e).await?;
+        let one = estimate::assemble(s.clone(), &location, vec![]);
+        per.push(queued_api::AttemptEstimate {
+            attempt_no: i as i32 + 1,
+            label: format!(
+                "{}{}",
+                s.first()
+                    .and_then(|x| x.connector.clone())
+                    .unwrap_or_else(|| e.provider.clone()),
+                e.model.as_deref().map(|m| format!(" · {m}")).unwrap_or_default()
+            ),
+            low: one.low,
+            mid: one.mid,
+            high: one.high,
+        });
+        if e.model.is_none() {
+            notes.push(format!(
+                "Versuch {}: ohne Modellangabe ist der Preis unbekannt.",
+                i + 1
+            ));
+        }
+        models.push(e.model.clone());
+        steps.extend(s);
+    }
+    if r.auto_select {
+        match crate::bon::pick_selector(
+            &all,
+            &cat,
+            project.residency(),
+            &models,
+            route.as_ref().map(|r| &r.review),
+        ) {
+            Ok((t, _)) => {
+                let sr = queued_api::StepRoute {
+                    mode: StepMode::Sync,
+                    target: Some(t),
+                };
+                steps.push(single_step(&cat, &all, &exec, false, "select", &sr, estimate::REVIEW));
+            }
+            Err(why) => return Err(AppError::bad_request(why)),
+        }
+    }
+    notes.push(format!(
+        "{n} Versuche: Planung einmal, Umsetzung und Review je Versuch{}.",
+        if r.auto_select {
+            ", dazu die automatische Auswahl"
+        } else {
+            ""
+        }
+    ));
+    let mut e = estimate::assemble(steps, &location, notes);
+    e.attempts = per;
+    Ok(Json(e))
+}
+
+/// Data location of the agent loop's access.
+async fn location_of(st: &AppState, exec: &routing::Exec) -> anyhow::Result<String> {
+    Ok(match exec.connector_id {
+        Some(id) => connectors::load_row(st, id)
+            .await?
+            .map(|r| connectors::location(&r.3, &r.5).0),
+        None => Some(connectors::legacy_location(&exec.provider)),
+    }
+    .map(|l| l.label().to_string())
+    .unwrap_or_default())
+}
+
+/// A single-shot (or agentic) step next to the agent loop of `exec`.
+fn single_step(
+    cat: &queued_api::PriceCatalog,
+    all: &[routing::Access],
+    exec: &routing::Exec,
+    flex: bool,
+    name: &'static str,
+    sr: &queued_api::StepRoute,
+    u: Usage,
+) -> queued_api::StepEstimate {
+    let exec_target = queued_api::Target {
+        connector_id: exec.connector_id,
+        provider: exec.connector_id.is_none().then(|| exec.provider.clone()),
+        model: exec.model.clone(),
+    };
+    let exec_acc = routing::find(all, &exec_target);
+    let t = sr.target.as_ref();
+    // An agentic step on the agent loop's own access runs with its (Flex) tier.
+    let same_access = t.is_none_or(|t| t.connector_id == exec.connector_id);
+    let acc = t.and_then(|t| routing::find(all, t)).or(exec_acc);
+    let model = t
+        .and_then(|t| t.model.as_deref())
+        .filter(|m| !m.is_empty())
+        .or(exec.model.as_deref());
+    estimate::step(
+        cat,
+        StepInput {
+            step: name,
+            mode: sr.mode,
+            access: acc,
+            config: None,
+            model,
+            profile: Profile::single(u, estimate::REPORT_BASIS),
+            flex: flex && sr.mode == StepMode::Harness && same_access,
+        },
+    )
+}
+
+/// Agent loop and review of one task on `exec`.
+async fn exec_steps(
+    st: &AppState,
+    user: Uuid,
+    cat: &queued_api::PriceCatalog,
+    all: &[routing::Access],
+    project: &crate::models::Project,
+    exec: &routing::Exec,
+) -> anyhow::Result<Vec<queued_api::StepEstimate>> {
     let target = queued_api::Target {
         connector_id: exec.connector_id,
         provider: exec.connector_id.is_none().then(|| exec.provider.clone()),
         model: exec.model.clone(),
     };
-    let exec_acc = routing::find(&all, &target);
+    let exec_acc = routing::find(all, &target);
     let exec_cfg = match exec.connector_id {
-        Some(id) => connectors::load_row(&st, id).await?.map(|r| r.5),
+        Some(id) => connectors::load_row(st, id).await?.map(|r| r.5),
         None => None,
     };
     let profile = match &exec.model {
         Some(m) => {
-            Profile::from_history(history(&st, u.id, m).await?).unwrap_or_else(Profile::report)
+            Profile::from_history(history(st, user, m).await?).unwrap_or_else(Profile::report)
         }
         None => Profile::report(),
     };
     let route = project.routing();
-    let mut notes = vec![];
-    let mut steps = vec![];
     let flex = route.as_ref().is_some_and(|r| {
         r.execute.flex
             && r.execute.target.as_ref().and_then(|t| t.connector_id) == exec.connector_id
             && exec.connector_id.is_some()
     });
-    let single = |name: &'static str, sr: &queued_api::StepRoute, u: Usage| {
-        let t = sr.target.as_ref();
-        // An agentic step on the agent loop's own access runs with its (Flex) tier.
-        let same_access = t.is_none_or(|t| t.connector_id == exec.connector_id);
-        let acc = t.and_then(|t| routing::find(&all, t)).or(exec_acc);
-        let model = t
-            .and_then(|t| t.model.as_deref())
-            .filter(|m| !m.is_empty())
-            .or(exec.model.as_deref());
-        estimate::step(
-            &cat,
-            StepInput {
-                step: name,
-                mode: sr.mode,
-                access: acc,
-                config: None,
-                model,
-                profile: Profile::single(u, estimate::REPORT_BASIS),
-                flex: flex && sr.mode == StepMode::Harness && same_access,
-            },
-        )
-    };
-    if let Some(r) = route.as_ref().filter(|r| r.plan.mode != StepMode::Off) {
-        steps.push(single("plan", &r.plan, estimate::PLAN));
-    }
-    steps.push(estimate::step(
-        &cat,
+    let mut steps = vec![estimate::step(
+        cat,
         StepInput {
             step: "execute",
             mode: StepMode::Harness,
@@ -501,40 +631,26 @@ pub async fn estimate(
             profile,
             flex,
         },
-    ));
+    )];
     if project.review_enabled {
-        let rr =
-            route
-                .as_ref()
-                .map(|r| r.review.clone())
-                .unwrap_or_else(|| queued_api::StepRoute {
-                    mode: StepMode::Harness,
-                    target: project
-                        .review_provider
-                        .clone()
-                        .filter(|p| !p.is_empty())
-                        .map(|p| queued_api::Target {
-                            connector_id: None,
-                            provider: Some(p),
-                            model: project.review_model.clone(),
-                        }),
-                });
-        steps.push(single("review", &rr, estimate::REVIEW));
+        let rr = route
+            .as_ref()
+            .map(|r| r.review.clone())
+            .unwrap_or_else(|| queued_api::StepRoute {
+                mode: StepMode::Harness,
+                target: project
+                    .review_provider
+                    .clone()
+                    .filter(|p| !p.is_empty())
+                    .map(|p| queued_api::Target {
+                        connector_id: None,
+                        provider: Some(p),
+                        model: project.review_model.clone(),
+                    }),
+            });
+        steps.push(single_step(cat, all, exec, flex, "review", &rr, estimate::REVIEW));
     }
-    if exec.model.is_none() {
-        notes.push(
-            "Ohne Modellangabe ist der Preis unbekannt (die CLI wählt ihr Standardmodell).".into(),
-        );
-    }
-    let location = match exec.connector_id {
-        Some(id) => connectors::load_row(&st, id)
-            .await?
-            .map(|r| connectors::location(&r.3, &r.5).0),
-        None => Some(connectors::legacy_location(&exec.provider)),
-    }
-    .map(|l| l.label().to_string())
-    .unwrap_or_default();
-    Ok(Json(estimate::assemble(steps, &location, notes)))
+    Ok(steps)
 }
 
 #[derive(Deserialize)]

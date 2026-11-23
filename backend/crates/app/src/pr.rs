@@ -644,6 +644,14 @@ async fn apply(st: &AppState, project: &Project, row: &PrRow, p: Polled) -> anyh
                     carry_from: None,
                     pr_id: Some(row.id),
                     plan_mode: false,
+                    routing_decision: crate::routing::inherited_json(
+                        "pr_fix",
+                        &origin.provider,
+                        origin.connector_id,
+                        origin.model.as_deref(),
+                        queued_api::DecisionSource::Inherited,
+                        "Pull-Request-Folgeauftrag mit dem Zugang des Ursprungsauftrags",
+                    ),
                 },
             )
             .await?;

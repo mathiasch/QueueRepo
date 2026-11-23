@@ -7,8 +7,9 @@
 //!   accepted diff costs more than the saved cents);
 //! * single-shot steps need an access with a direct API (sync) or a batch API.
 use queued_api::{
-    DataLocation, ExecuteRoute, ModelTier, PresetInfo, PriceCatalog, Residency, Routing, StepMode,
-    StepRoute, Target,
+    DataLocation, DecisionSource, ExecuteRoute, ModelTier, PresetInfo, PriceCatalog, Residency,
+    Routing, RoutingDecision, RoutingRule, RuleWhen, StepMode, StepRoute, TaskFacts, Target,
+    MAX_RULES,
 };
 use uuid::Uuid;
 
@@ -30,6 +31,8 @@ pub struct Access {
     pub single_shot: bool,
     pub batch: bool,
     pub flex: bool,
+    /// WP12: wire API of a mock connector (`anthropic|openai|mistral`).
+    pub wire_api: Option<String>,
 }
 
 impl Access {
@@ -82,6 +85,7 @@ pub async fn accesses(st: &AppState, user: Uuid, project: Uuid) -> anyhow::Resul
             single_shot: false,
             batch: false,
             flex: false,
+            wire_api: None,
         });
     }
     Ok(out)
@@ -98,6 +102,12 @@ pub fn access_of(r: &Row) -> Access {
         single_shot: connectors::wire(&r.3, &r.5).is_some(),
         batch: connectors::batch_api(&r.3, &r.5).is_some(),
         flex: connectors::type_info(&r.3, true).is_some_and(|t| t.flex),
+        wire_api: (r.3 == "mock").then(|| {
+            r.5.get("api")
+                .and_then(|v| v.as_str())
+                .unwrap_or("anthropic")
+                .to_string()
+        }),
     }
 }
 
@@ -207,7 +217,362 @@ pub fn validate(
             }
         }
     }
+    validate_rules(&r.rules, residency, all)
+}
+
+/// WP12: rule list checks (German messages).
+pub fn validate_rules(rules: &[RoutingRule], residency: Residency, all: &[Access]) -> Result<(), String> {
+    if rules.len() > MAX_RULES {
+        return Err(format!("Höchstens {MAX_RULES} Regeln"));
+    }
+    for (i, r) in rules.iter().enumerate() {
+        let name = r.name.trim();
+        let label = format!("Regel {} („{}“)", i + 1, name);
+        if name.is_empty() || name.chars().count() > 80 {
+            return Err(format!("Regel {}: Name fehlt oder ist zu lang (max. 80 Zeichen)", i + 1));
+        }
+        let w = &r.when;
+        if w.kinds.len() > 2 || w.kinds.iter().any(|k| k != "task" && k != "fix") {
+            return Err(format!("{label}: Auftragsart nur „task“ oder „fix“"));
+        }
+        if let (Some(a), Some(b)) = (w.min_chars, w.max_chars) {
+            if a > b {
+                return Err(format!("{label}: „mindestens“ ist größer als „höchstens“"));
+            }
+        }
+        if w.max_chars.is_some_and(|m| m > 1_000_000) || w.min_chars.is_some_and(|m| m > 1_000_000) {
+            return Err(format!("{label}: Zeichenzahl zu groß"));
+        }
+        if w.keywords.len() > 10
+            || w.keywords
+                .iter()
+                .any(|k| k.trim().is_empty() || k.chars().count() > 60)
+        {
+            return Err(format!("{label}: höchstens 10 Stichworte mit je 1–60 Zeichen"));
+        }
+        let acc = find(all, &r.target).ok_or(format!("{label}: Zugang nicht gefunden"))?;
+        check_location(residency, acc, &format!("Der Zugang von {label}"))?;
+        let model = model_of(&r.target);
+        if model.is_some_and(|m| m.len() > 200) {
+            return Err(format!("{label}: Modellname zu lang"));
+        }
+        if model.is_none() && (acc.harness == "opencode" || acc.kind == "bedrock") {
+            return Err(format!("{label}: für „{}“ muss ein Modell angegeben werden", acc.label));
+        }
+    }
     Ok(())
+}
+
+/// Features of a task for the routing (deterministic, no model call).
+pub fn facts(kind: &str, prompt: &str, context: &str, attachments: usize) -> TaskFacts {
+    TaskFacts {
+        kind: kind.to_string(),
+        chars: u32::try_from(prompt.trim().chars().count() + context.trim().chars().count())
+            .unwrap_or(u32::MAX),
+        attachments: u32::try_from(attachments).unwrap_or(u32::MAX),
+    }
+}
+
+/// What the routing decides on: the task's features and its text (title +
+/// prompt, for keyword rules).
+#[derive(Debug, Clone, Default)]
+pub struct Ask {
+    pub facts: TaskFacts,
+    pub text: String,
+}
+
+impl Ask {
+    pub fn new(kind: &str, title: &str, prompt: &str, context: &str, attachments: usize) -> Self {
+        Self {
+            facts: facts(kind, prompt, context, attachments),
+            text: format!("{title}\n{prompt}"),
+        }
+    }
+}
+
+/// Whether a rule's conditions hold for the task.
+pub fn rule_matches(w: &RuleWhen, f: &TaskFacts, text: &str) -> bool {
+    let kind_ok = if w.kinds.is_empty() {
+        f.kind == "task"
+    } else {
+        w.kinds.iter().any(|k| *k == f.kind)
+    };
+    let lower = text.to_lowercase();
+    kind_ok
+        && w.max_chars.is_none_or(|m| f.chars <= m)
+        && w.min_chars.is_none_or(|m| f.chars >= m)
+        && (w.keywords.is_empty()
+            || w.keywords
+                .iter()
+                .any(|k| lower.contains(&k.trim().to_lowercase())))
+        && w.has_attachments.is_none_or(|h| (f.attachments > 0) == h)
+}
+
+/// Short German description of a rule's conditions.
+pub fn describe_when(w: &RuleWhen) -> String {
+    let mut parts = vec![];
+    if !w.kinds.is_empty() {
+        parts.push(
+            w.kinds
+                .iter()
+                .map(|k| if k == "fix" { "Fix-Aufträge" } else { "neue Aufträge" })
+                .collect::<Vec<_>>()
+                .join(" und "),
+        );
+    }
+    if let Some(m) = w.max_chars {
+        parts.push(format!("höchstens {m} Zeichen"));
+    }
+    if let Some(m) = w.min_chars {
+        parts.push(format!("mindestens {m} Zeichen"));
+    }
+    if !w.keywords.is_empty() {
+        parts.push(format!("Stichwort {}", w.keywords.join("/")));
+    }
+    match w.has_attachments {
+        Some(true) => parts.push("mit Anhängen".into()),
+        Some(false) => parts.push("ohne Anhänge".into()),
+        None => {}
+    }
+    if parts.is_empty() {
+        "alle neuen Aufträge".into()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn target_text(t: &Target) -> String {
+    match (t.model.as_deref(), t.provider.as_deref(), t.connector_id) {
+        (Some(m), _, _) => m.to_string(),
+        (None, Some(p), _) => format!("Standardmodell von {p}"),
+        (None, None, Some(_)) => "Standardmodell des Zugangs".into(),
+        _ => "Standardmodell".into(),
+    }
+}
+
+/// The explicit choice of a task (composer, API, template, Best-of-N).
+#[derive(Debug, Clone, Default)]
+pub struct Explicit {
+    pub connector: Option<Uuid>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    /// Best-of-N attempt (changes only the explanation).
+    pub attempt: bool,
+}
+
+/// WP12 routing decision of a new task's agent loop (pure, deterministic):
+/// explicit choice > first matching rule > the project's agent-loop route >
+/// the user's default provider. Access rights and residency are checked by
+/// [`resolve_execute`] afterwards.
+pub fn decide(
+    routing: Option<&Routing>,
+    ask: &Ask,
+    explicit: &Explicit,
+    default_provider: &str,
+) -> RoutingDecision {
+    let model = explicit
+        .model
+        .as_ref()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    let route = routing.and_then(|r| r.execute.target.clone());
+    let mk = |source, target: Target, rule: Option<(usize, &RoutingRule)>, reason: String| {
+        RoutingDecision {
+            step: "execute".into(),
+            source,
+            target,
+            rule: rule.map(|(_, r)| r.name.trim().to_string()),
+            rule_index: rule.and_then(|(i, _)| u32::try_from(i).ok()),
+            escalation_level: None,
+            reason,
+            facts: ask.facts.clone(),
+        }
+    };
+    let provider = explicit.provider.as_deref().filter(|p| !p.is_empty());
+    let src = if explicit.attempt {
+        DecisionSource::Attempt
+    } else {
+        DecisionSource::Explicit
+    };
+    let src_text = if explicit.attempt {
+        "Für diesen Versuch gewählt"
+    } else {
+        "Am Auftrag gewählt"
+    };
+    match (explicit.connector, provider) {
+        (Some(c), _) => {
+            // The route's model applies when the task picked the route's access.
+            let rm = route
+                .as_ref()
+                .filter(|t| t.connector_id == Some(c))
+                .and_then(|t| t.model.clone());
+            let t = Target {
+                connector_id: Some(c),
+                provider: None,
+                model: model.or(rm),
+            };
+            let reason = format!("{src_text}: {}", target_text(&t));
+            return mk(src, t, None, reason);
+        }
+        (None, Some(p)) => {
+            let t = Target {
+                connector_id: None,
+                provider: Some(p.to_string()),
+                model,
+            };
+            let reason = format!("{src_text}: {}", target_text(&t));
+            return mk(src, t, None, reason);
+        }
+        (None, None) => {}
+    }
+    if let Some(r) = routing {
+        if let Some((i, rule)) = r
+            .rules
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| rule_matches(&rule.when, &ask.facts, &ask.text))
+        {
+            let mut t = rule.target.clone();
+            if model.is_some() {
+                t.model = model.clone();
+            }
+            let reason = format!(
+                "Regel {} „{}“ ({}) → {}",
+                i + 1,
+                rule.name.trim(),
+                describe_when(&rule.when),
+                target_text(&t)
+            );
+            return mk(DecisionSource::Rule, t, Some((i, rule)), reason);
+        }
+    }
+    match route {
+        Some(mut t) => {
+            if model.is_some() {
+                t.model = model;
+            }
+            let preset = routing.and_then(|r| r.preset.as_deref()).filter(|p| *p != "custom");
+            let reason = match (preset, routing.is_some_and(|r| !r.rules.is_empty())) {
+                (Some(p), true) => format!("Keine Regel passt – Umsetzung laut Vorlage „{p}“: {}", target_text(&t)),
+                (Some(p), false) => format!("Umsetzung laut Vorlage „{p}“: {}", target_text(&t)),
+                (None, true) => format!("Keine Regel passt – Umsetzung laut Projekt-Routing: {}", target_text(&t)),
+                (None, false) => format!("Umsetzung laut Projekt-Routing: {}", target_text(&t)),
+            };
+            mk(DecisionSource::Route, t, None, reason)
+        }
+        None => {
+            let t = Target {
+                connector_id: None,
+                provider: Some(default_provider.to_string()),
+                model,
+            };
+            let reason = format!("Kein Projekt-Routing – Standard-Anbieter: {}", target_text(&t));
+            mk(DecisionSource::Default, t, None, reason)
+        }
+    }
+}
+
+/// Decision for tasks that keep the access of their origin (follow-ups,
+/// pull-request fixes, continuations, OnEmpty analyses) as JSON.
+pub fn inherited_json(
+    kind: &str,
+    provider: &str,
+    connector: Option<Uuid>,
+    model: Option<&str>,
+    source: DecisionSource,
+    why: &str,
+) -> Option<serde_json::Value> {
+    let target = Target {
+        connector_id: connector,
+        provider: connector.is_none().then(|| provider.to_string()),
+        model: model.map(String::from),
+    };
+    serde_json::to_value(RoutingDecision {
+        step: "execute".into(),
+        source,
+        reason: format!("{why}: {}", target_text(&target)),
+        target,
+        rule: None,
+        rule_index: None,
+        escalation_level: None,
+        facts: TaskFacts {
+            kind: kind.into(),
+            ..Default::default()
+        },
+    })
+    .ok()
+}
+
+/// WP12 routing decision of a fix task (pure): escalation along the chain
+/// of the routing's agent-loop access > a rule for fix tasks > the failed
+/// task's access and model.
+pub fn decide_fix(
+    routing: Option<&Routing>,
+    failed: &crate::models::Task,
+    ask: &Ask,
+) -> RoutingDecision {
+    let inherited = Target {
+        connector_id: failed.connector_id,
+        provider: failed.connector_id.is_none().then(|| failed.provider.clone()),
+        model: failed.model.clone(),
+    };
+    if let Some((m, level)) = escalate(routing, failed) {
+        let from = failed.model.clone().unwrap_or_else(|| "Standardmodell".into());
+        return RoutingDecision {
+            step: "execute".into(),
+            source: DecisionSource::Escalation,
+            target: Target {
+                model: Some(m.clone()),
+                ..inherited
+            },
+            rule: None,
+            rule_index: None,
+            escalation_level: Some(level),
+            reason: format!("Eskalation nach Fehlversuch (Stufe {level}): {from} → {m}"),
+            facts: ask.facts.clone(),
+        };
+    }
+    if let Some(r) = routing {
+        if let Some((i, rule)) = r
+            .rules
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| !rule.when.kinds.is_empty() && rule_matches(&rule.when, &ask.facts, &ask.text))
+        {
+            return RoutingDecision {
+                step: "execute".into(),
+                source: DecisionSource::Rule,
+                target: rule.target.clone(),
+                rule: Some(rule.name.trim().to_string()),
+                rule_index: u32::try_from(i).ok(),
+                escalation_level: Some(failed.escalation_level),
+                reason: format!(
+                    "Regel {} „{}“ ({}) → {}",
+                    i + 1,
+                    rule.name.trim(),
+                    describe_when(&rule.when),
+                    target_text(&rule.target)
+                ),
+                facts: ask.facts.clone(),
+            };
+        }
+    }
+    let why = match routing.and_then(|r| r.execute.target.as_ref()) {
+        Some(_) if !routing.is_some_and(|r| r.execute.escalation.is_empty()) => {
+            "Eskalationskette ausgeschöpft oder anderer Zugang – wie der gescheiterte Auftrag"
+        }
+        _ => "Wie der gescheiterte Auftrag",
+    };
+    RoutingDecision {
+        step: "execute".into(),
+        source: DecisionSource::Inherited,
+        reason: format!("{why}: {}", target_text(&inherited)),
+        target: inherited,
+        rule: None,
+        rule_index: None,
+        escalation_level: Some(failed.escalation_level),
+        facts: ask.facts.clone(),
+    }
 }
 
 fn model_of(t: &Target) -> Option<&str> {
@@ -228,47 +593,57 @@ pub struct Exec {
     pub provider: String,
     pub connector_id: Option<Uuid>,
     pub model: Option<String>,
+    /// WP12: why (stored at the task, shown in the UI).
+    pub decision: RoutingDecision,
 }
 
-/// Resolves the access of a new/edited task: explicit connector > explicit
-/// legacy provider > project routing > user default. Checks access rights,
-/// data residency and required models. `Err` = German message for a 400.
+impl Exec {
+    pub fn decision_json(&self) -> Option<serde_json::Value> {
+        serde_json::to_value(&self.decision).ok()
+    }
+}
+
+/// Resolves the access of a new/edited task with [`decide`] (explicit >
+/// rule > project route > user default), then checks access rights, data
+/// residency and required models. `ask` = the task's features (`None`: no
+/// rule applies, e.g. a continuation with the origin's access).
+/// `Err` = German message for a 400.
 pub async fn resolve_execute(
     st: &AppState,
     user: Uuid,
     project: &crate::models::Project,
-    connector: Option<Uuid>,
-    provider: Option<&str>,
-    model: Option<String>,
+    explicit: Explicit,
+    ask: Option<&Ask>,
     default_provider: &str,
 ) -> anyhow::Result<Result<Exec, String>> {
-    let model = model
+    if explicit.model.as_ref().is_some_and(|m| m.trim().len() > 200) {
+        return Ok(Err("Modellname zu lang".into()));
+    }
+    let none = Ask::default();
+    let routing = project.routing();
+    let decision = decide(routing.as_ref(), ask.unwrap_or(&none), &explicit, default_provider);
+    check_decision(st, user, project, decision, default_provider).await
+}
+
+/// Access check of a decision (shared by new tasks, fix tasks and attempts).
+pub async fn check_decision(
+    st: &AppState,
+    user: Uuid,
+    project: &crate::models::Project,
+    mut decision: RoutingDecision,
+    default_provider: &str,
+) -> anyhow::Result<Result<Exec, String>> {
+    let model = decision
+        .target
+        .model
+        .as_ref()
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty());
     if model.as_ref().is_some_and(|m| m.len() > 200) {
         return Ok(Err("Modellname zu lang".into()));
     }
-    let route = project.routing().and_then(|r| r.execute.target);
-    let (connector, provider, model) = match (connector, provider.filter(|p| !p.is_empty())) {
-        (Some(c), _) => {
-            let rm = route
-                .as_ref()
-                .filter(|t| t.connector_id == Some(c))
-                .and_then(|t| t.model.clone());
-            (Some(c), None, model.or(rm))
-        }
-        (None, Some(p)) => (None, Some(p.to_string()), model),
-        (None, None) => match route {
-            Some(t) => (
-                t.connector_id,
-                t.provider.clone(),
-                model.or(t.model.clone()),
-            ),
-            None => (None, Some(default_provider.to_string()), model),
-        },
-    };
     let residency = project.residency();
-    let exec = match connector {
+    let exec = match decision.target.connector_id {
         Some(id) => {
             let Some(c) = connectors::load_for(st, id, user, Some(project.id)).await? else {
                 return Ok(Err("Zugang nicht gefunden".into()));
@@ -286,14 +661,22 @@ pub async fn resolve_execute(
                     c.label
                 )));
             }
+            decision.reason = format!("{} (Zugang „{}“)", decision.reason, c.label);
+            decision.target.model = model.clone();
             Exec {
                 provider: c.harness,
                 connector_id: Some(c.id),
                 model,
+                decision,
             }
         }
         None => {
-            let p = provider.unwrap_or_else(|| default_provider.to_string());
+            let p = decision
+                .target
+                .provider
+                .clone()
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| default_provider.to_string());
             if !st.cfg.providers().contains(&p.as_str()) {
                 return Ok(Err("unknown provider".into()));
             }
@@ -310,10 +693,13 @@ pub async fn resolve_execute(
                     &format!("Der Standard-Zugang „{p}“"),
                 )));
             }
+            decision.target.provider = Some(p.clone());
+            decision.target.model = model.clone();
             Exec {
                 provider: p,
                 connector_id: None,
                 model,
+                decision,
             }
         }
     };
@@ -537,6 +923,7 @@ pub fn presets(all: &[Access], cat: &PriceCatalog) -> Vec<PresetInfo> {
                 },
                 review: step(&p.review, all, residency, exec, exec_model),
                 analyze: step(&p.analyze, all, residency, exec, exec_model),
+                rules: vec![],
             };
             let valid = validate(&r, residency, all, cat);
             PresetInfo {
@@ -582,6 +969,7 @@ mod tests {
             single_shot: single,
             batch,
             flex: kind == "openai_api",
+            wire_api: None,
         }
     }
 

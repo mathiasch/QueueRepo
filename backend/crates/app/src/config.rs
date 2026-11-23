@@ -7,6 +7,9 @@ use rand::RngCore;
 use crate::oidc::{self, OidcProvider};
 
 pub struct Config {
+    /// WP12: own origin of live previews (`PREVIEW_ORIGIN`, e.g.
+    /// `https://*.preview.example.com`); `None` = no live preview.
+    pub preview_origin: Option<PreviewOrigin>,
     pub database_url: String,
     pub bind: String,
     pub public_url: String,
@@ -109,6 +112,89 @@ pub fn check_lease(heartbeat: u64, lease: u64) -> Result<()> {
     Ok(())
 }
 
+/// WP12: `PREVIEW_ORIGIN` = `<scheme>://*.<suffix>[:port]`. Every live
+/// preview gets the host `<capability>.<suffix>` – an own origin, never the
+/// app's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreviewOrigin {
+    pub scheme: String,
+    pub suffix: String,
+    pub port: Option<u16>,
+    /// Origin of the app (frame-ancestors of preview responses).
+    pub app_origin: String,
+}
+
+/// Length of a preview capability (base32 of 16 random bytes).
+pub const PREVIEW_CAP_LEN: usize = 26;
+
+impl PreviewOrigin {
+    pub fn parse(v: &str, public_url: &str) -> Result<Self, String> {
+        let err = || {
+            format!("PREVIEW_ORIGIN must look like https://*.preview.example.com[:port], got {v}")
+        };
+        let (scheme, rest) = v.trim().trim_end_matches('/').split_once("://").ok_or_else(err)?;
+        if scheme != "https" && scheme != "http" {
+            return Err(err());
+        }
+        let rest = rest.strip_prefix("*.").ok_or_else(err)?;
+        let (host, port) = match rest.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p.parse::<u16>().map_err(|_| err())?)),
+            None => (rest, None),
+        };
+        let host = host.to_ascii_lowercase();
+        if host.is_empty()
+            || host.contains(['/', '*', '@', '?', '#'])
+            || !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            return Err(err());
+        }
+        let app = url::Url::parse(public_url).map_err(|_| "PUBLIC_URL is not a URL".to_string())?;
+        let o = Self {
+            scheme: scheme.to_string(),
+            suffix: host,
+            port,
+            app_origin: app.origin().ascii_serialization(),
+        };
+        // The app's own host must never look like a preview host.
+        let app_host = match app.port() {
+            Some(p) => format!("{}:{p}", app.host_str().unwrap_or_default()),
+            None => app.host_str().unwrap_or_default().to_string(),
+        };
+        if o.cap_of(&app_host).is_some() {
+            return Err("PREVIEW_ORIGIN would include the app's own host".into());
+        }
+        Ok(o)
+    }
+
+    /// The capability of a request's `Host`, if it is a preview host.
+    pub fn cap_of(&self, host: &str) -> Option<String> {
+        let host = host.trim().to_ascii_lowercase();
+        let (name, port) = match host.rsplit_once(':') {
+            Some((h, p)) if !h.ends_with(']') => (h.to_string(), p.parse::<u16>().ok()),
+            _ => (host.clone(), None),
+        };
+        if port != self.port {
+            return None;
+        }
+        let cap = name.strip_suffix(&format!(".{}", self.suffix))?;
+        (cap.len() == PREVIEW_CAP_LEN
+            && cap
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c)))
+        .then(|| cap.to_string())
+    }
+
+    /// Public URL of a preview.
+    pub fn url(&self, cap: &str) -> String {
+        match self.port {
+            Some(p) => format!("{}://{cap}.{}:{p}/", self.scheme, self.suffix),
+            None => format!("{}://{cap}.{}/", self.scheme, self.suffix),
+        }
+    }
+}
+
 fn api_url(k: &str, default: &str) -> String {
     var(k)
         .unwrap_or_else(|| default.into())
@@ -139,13 +225,19 @@ impl Config {
         let runner_heartbeat_secs = num::<u64>("RUNNER_HEARTBEAT_SECS", 5);
         let runner_lease_secs = num::<u64>("RUNNER_LEASE_SECS", 30);
         check_lease(runner_heartbeat_secs, runner_lease_secs)?;
+        let public_url = var("PUBLIC_URL")
+            .unwrap_or_else(|| "http://localhost:8080".into())
+            .trim_end_matches('/')
+            .to_string();
+        let preview_origin = match var("PREVIEW_ORIGIN") {
+            Some(v) => Some(PreviewOrigin::parse(&v, &public_url).map_err(anyhow::Error::msg)?),
+            None => None,
+        };
         Ok(Self {
+            preview_origin,
             database_url: var("DATABASE_URL").context("DATABASE_URL is required")?,
             bind: var("BIND").unwrap_or_else(|| "127.0.0.1:8080".into()),
-            public_url: var("PUBLIC_URL")
-                .unwrap_or_else(|| "http://localhost:8080".into())
-                .trim_end_matches('/')
-                .to_string(),
+            public_url,
             master_key: load_or_create_key(&data_dir)?,
             frontend_dir: PathBuf::from(
                 var("FRONTEND_DIR").unwrap_or_else(|| "../frontend/dist".into()),
@@ -210,6 +302,7 @@ impl Config {
         runner_token: &str,
     ) -> Self {
         Self {
+            preview_origin: None,
             database_url: database_url.into(),
             bind: "127.0.0.1:0".into(),
             public_url: "http://localhost".into(),

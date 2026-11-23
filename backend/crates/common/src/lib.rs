@@ -388,6 +388,159 @@ pub enum ExecFrame {
     },
 }
 
+/// WP12: viewport of a preview screenshot (`desktop` 1280×800, `mobile` 390×844).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShotViewport {
+    Desktop,
+    Mobile,
+}
+
+impl ShotViewport {
+    /// Window size in CSS pixels.
+    pub fn size(self) -> (u32, u32) {
+        match self {
+            Self::Desktop => (1280, 800),
+            Self::Mobile => (390, 844),
+        }
+    }
+}
+
+/// WP12: one screenshot to take (`path` starts with `/`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShotSpec {
+    pub path: String,
+    pub viewport: ShotViewport,
+}
+
+/// Most screenshots per preview start.
+pub const MAX_SHOTS: usize = 10;
+/// Largest screenshot the runner returns.
+pub const MAX_SHOT_BYTES: usize = 8 * 1024 * 1024;
+
+/// `POST /v1/workspaces/{project}/tasks/{task}/preview`: start the dev
+/// server of a task's working tree in the sandbox (no network, no port
+/// binding), wait until it answers, optionally take screenshots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PreviewStart {
+    /// Run name (also the container name), [`valid_name`].
+    pub name: String,
+    /// Shell command (`sh -c`), runs in the task's working tree.
+    pub command: String,
+    /// Port the server listens on inside the sandbox (`$PORT`).
+    pub port: u16,
+    /// Readiness check: GET answers with a status below 500.
+    pub ready_path: String,
+    pub ready_timeout_secs: u64,
+    /// The server is stopped at the latest after this many seconds.
+    pub max_lifetime_secs: u64,
+    /// Project variables (never secrets: the server has no network anyway).
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    #[serde(default)]
+    pub shots: Vec<ShotSpec>,
+    /// Keep the server running after the screenshots (live preview).
+    #[serde(default)]
+    pub keep: bool,
+}
+
+/// A screenshot taken by the runner (PNG, base64).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Shot {
+    pub path: String,
+    pub viewport: ShotViewport,
+    pub png_b64: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PreviewStarted {
+    /// The server answered the readiness check.
+    pub ready: bool,
+    /// Why it is not ready (timeout, exited, …).
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Last output lines of the server (secrets redacted by the app).
+    #[serde(default)]
+    pub log_tail: String,
+    #[serde(default)]
+    pub shots: Vec<Shot>,
+    /// Still running (`keep` and ready).
+    #[serde(default)]
+    pub running: bool,
+}
+
+/// `GET /v1/previews`: running previews of this runner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PreviewList {
+    pub names: Vec<String>,
+}
+
+/// Header with the status of a proxied preview response (the runner answers
+/// `200` itself and passes the dev server's status here).
+pub const PREVIEW_STATUS_HEADER: &str = "x-queue-preview-status";
+/// Largest request body forwarded to a preview.
+pub const MAX_PREVIEW_REQUEST: usize = 2 * 1024 * 1024;
+/// Largest preview response.
+pub const MAX_PREVIEW_RESPONSE: usize = 20 * 1024 * 1024;
+
+/// Request headers that never reach a preview (credentials of the app,
+/// hop-by-hop headers, proxy metadata).
+pub fn preview_request_header_ok(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    !matches!(
+        n.as_str(),
+        "cookie"
+            | "authorization"
+            | "proxy-authorization"
+            | "host"
+            | "connection"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
+            | "forwarded"
+            | "origin"
+            | "referer"
+    ) && !n.starts_with("x-forwarded-")
+        && !n.starts_with("sec-websocket")
+        && !n.starts_with("x-queue-")
+}
+
+/// Response headers of a preview that are dropped: cookies (they would be
+/// set for the app's host – cookies do not separate by port), security
+/// policies the app sets itself, hop-by-hop headers.
+pub fn preview_response_header_ok(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    !matches!(
+        n.as_str(),
+        "set-cookie"
+            | "set-cookie2"
+            | "content-security-policy"
+            | "content-security-policy-report-only"
+            | "x-frame-options"
+            | "strict-transport-security"
+            | "clear-site-data"
+            | "service-worker-allowed"
+            | "connection"
+            | "keep-alive"
+            | "transfer-encoding"
+            | "trailer"
+            | "upgrade"
+            | "content-length"
+            | "alt-svc"
+            | "refresh"
+            | "link"
+    ) && !n.starts_with("access-control-")
+        && !n.starts_with("cross-origin-")
+        && !n.starts_with("x-queue-")
+        && !n.starts_with("report-")
+        && n != "nel"
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub error: String,

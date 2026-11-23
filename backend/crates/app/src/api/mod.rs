@@ -11,6 +11,7 @@ mod intake;
 mod knowledge;
 pub mod limits;
 mod notifications;
+mod preview;
 pub(crate) mod projects;
 mod providers;
 mod pulls;
@@ -227,6 +228,19 @@ pub fn router(st: AppState) -> Router {
         .route("/tasks/{id}", get(tasks::get).patch(tasks::update))
         .route("/tasks/{id}/cancel", post(tasks::cancel))
         .route("/tasks/{id}/retry", post(tasks::retry))
+        .route("/tasks/{id}/attempts", get(tasks::attempts))
+        .route(
+            "/tasks/{id}/preview",
+            get(preview::current)
+                .post(preview::start)
+                .delete(preview::stop),
+        )
+        .route("/tasks/{id}/screenshots/{sid}", get(preview::screenshot))
+        .route(
+            "/projects/{id}/preview",
+            get(preview::get_settings).put(preview::put_settings),
+        )
+        .route("/tasks/{id}/select", post(tasks::select))
         .route("/tasks/{id}/approve", post(tasks::approve))
         .route("/tasks/{id}/answer", post(steer::answer))
         .route("/tasks/{id}/move", post(tasks::move_task))
@@ -384,6 +398,11 @@ pub fn router(st: AppState) -> Router {
     };
     root.nest("/api", api)
         .fallback_service(web)
+        // WP12: preview hosts (own origin) never reach the API or the SPA.
+        .layer(axum::middleware::from_fn_with_state(
+            st.clone(),
+            crate::preview::layer,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             st.clone(),
             crate::metrics::track,

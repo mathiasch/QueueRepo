@@ -34,7 +34,7 @@ async fn own_task(st: &AppState, id: Uuid, user_id: Uuid) -> ApiResult<Task> {
 pub async fn list(State(st): State<AppState>, AuthUser(u): AuthUser) -> ApiResult<Json<Vec<Task>>> {
     Ok(Json(
         sqlx::query_as::<_, Task>(
-            "(SELECT * FROM tasks WHERE user_id=$1 AND status IN ('queued','running','waiting_batch','waiting_input','pending_approval','held','merging'))
+            "(SELECT * FROM tasks WHERE user_id=$1 AND status IN ('queued','running','waiting_batch','waiting_input','pending_approval','held','merging','comparing','candidate'))
              UNION ALL
              (SELECT * FROM tasks WHERE user_id=$1 AND status IN ('done','failed','blocked','cancelled') ORDER BY updated_at DESC LIMIT 150)
              ORDER BY position",
@@ -60,13 +60,24 @@ pub async fn create(
         .bind(c.project_id)
         .fetch_one(&st.db)
         .await?;
+    let ask = crate::routing::Ask::new(
+        "task",
+        c.title.as_deref().unwrap_or_default(),
+        &c.prompt,
+        &c.context,
+        c.attachment_ids.len(),
+    );
     let exec = crate::routing::resolve_execute(
         &st,
         u.id,
         &project,
-        c.connector_id,
-        c.provider.as_deref(),
-        c.model.clone(),
+        crate::routing::Explicit {
+            connector: c.connector_id,
+            provider: c.provider.clone(),
+            model: c.model.clone(),
+            attempt: false,
+        },
+        Some(&ask),
         &settings.default_provider,
     )
     .await?
@@ -82,6 +93,27 @@ pub async fn create(
             return Err(AppError::bad_request("parent task not in project"));
         }
     }
+    // WP12 Best-of-N: N attempts (checked like N tasks, plus quota, budget
+    // and the review agent of the automatic selection).
+    let n = c.attempts.unwrap_or(1);
+    let group = if n > 1 || !c.attempt_targets.is_empty() || c.auto_select {
+        Some(
+            crate::bon::plan_group(
+                &st,
+                u.id,
+                &project,
+                &exec,
+                n,
+                &c.attempt_targets,
+                c.auto_select,
+                &settings.default_provider,
+            )
+            .await?
+            .map_err(AppError::bad_request)?,
+        )
+    } else {
+        None
+    };
     let title = c.title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| {
         c.prompt
             .trim()
@@ -92,6 +124,7 @@ pub async fn create(
             .take(80)
             .collect()
     });
+    let routing_decision = exec.decision_json();
     let mut tx = st.db.begin().await?;
     let task = queue::insert_task_in(
         &mut tx,
@@ -122,9 +155,23 @@ pub async fn create(
             carry_from: None,
             pr_id: None,
             plan_mode: c.plan_mode.unwrap_or(project.plan_mode),
+            routing_decision,
         },
     )
     .await?;
+    let task = match &group {
+        Some(g) => {
+            sqlx::query_as::<_, Task>(
+                "UPDATE tasks SET attempts=$2, bon=$3 WHERE id=$1 RETURNING *",
+            )
+            .bind(task.id)
+            .bind(n)
+            .bind(crate::bon::bon_json(&g.bon))
+            .fetch_one(&mut *tx)
+            .await?
+        }
+        None => task,
+    };
     // WP09: the composer's draft attachments belong to the task before
     // anyone (the scheduler) sees it.
     super::attachments::attach_drafts(&mut tx, &c.attachment_ids, task.id, c.project_id, u.id)
@@ -154,12 +201,14 @@ pub async fn get(
     let pull_request = super::pulls::of_task(&st, &t).await?;
     let intake = crate::intake::link_view(&st, t.id).await?;
     let attachments = super::attachments::views_for_task(&st, &t, u.id).await?;
+    let screenshots = crate::preview::screenshots_of(&st, t.id).await?;
     Ok(Json(TaskDetail {
         task: t,
         events,
         pull_request,
         intake,
         attachments,
+        screenshots,
     }))
 }
 
@@ -203,9 +252,13 @@ pub async fn update(
                 &st,
                 u.id,
                 &project,
-                connector,
-                provider.as_deref(),
-                model,
+                crate::routing::Explicit {
+                    connector,
+                    provider: provider.clone(),
+                    model,
+                    attempt: false,
+                },
+                None,
                 &t.provider,
             )
             .await?
@@ -275,6 +328,45 @@ pub async fn cancel(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let t = own_task(&st, id, u.id).await?;
+    let r = cancel_inner(&st, &t).await;
+    // WP12: the group of a cancelled attempt may be settled now (a running
+    // attempt settles when its run ends).
+    if let (Ok(_), Some(group)) = (&r, t.attempt_of) {
+        if t.status != status::RUNNING {
+            crate::bon::settle(&st, group).await?;
+        }
+    }
+    r
+}
+
+async fn cancel_inner(st: &AppState, t: &Task) -> ApiResult<Json<Value>> {
+    let st = st.clone();
+    let id = t.id;
+    if t.status == status::COMPARING {
+        if !crate::bon::cancel_group(&st, id).await? {
+            return Err(AppError::conflict("task is not in a suitable state"));
+        }
+        return Ok(Json(json!({"ok": true})));
+    }
+    if t.status == status::CANDIDATE {
+        // Discard one candidate of a Best-of-N group.
+        let n = sqlx::query(
+            "UPDATE tasks SET status='cancelled', failure_class='cancelled', error='verworfen', gate_pending=NULL,
+                    finished_at=now(), updated_at=now()
+             WHERE id=$1 AND status='candidate'",
+        )
+        .bind(id)
+        .execute(&st.db)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::conflict("task is not in a suitable state"));
+        }
+        queue::emit_task(&st, id).await;
+        crate::preview::stop_for_task(&st, id).await;
+        crate::runner::merge::cleanup_task(&st, t.project_id, id, true).await;
+        return Ok(Json(json!({"ok": true})));
+    }
     if t.status == status::RUNNING {
         cancel_running(&st, id).await?;
         return Ok(Json(json!({"ok": true})));
@@ -396,6 +488,22 @@ pub async fn retry(
         return Err(AppError::conflict(
             "only failed/blocked/cancelled tasks can be retried",
         ));
+    }
+    // WP12: an attempt runs again only while its group waits for a selection
+    // (a group itself is retried as a new round).
+    if let Some(group) = t.attempt_of {
+        let open: bool = sqlx::query_scalar(
+            "SELECT status='comparing' AND bon->'choice' IS NULL FROM tasks WHERE id=$1",
+        )
+        .bind(group)
+        .fetch_optional(&st.db)
+        .await?
+        .unwrap_or(false);
+        if !open {
+            return Err(AppError::conflict(
+                "Dieser Versuch gehört zu einem abgeschlossenen Vergleich – bitte den Auftrag selbst wiederholen.",
+            ));
+        }
     }
     sqlx::query(
         "UPDATE tasks SET status='queued', attempt=0, error=NULL, finished_at=NULL, updated_at=now(),
@@ -609,3 +717,64 @@ pub async fn revert(
     .await;
     Ok(Json(json!({"ok": true, "sha": sha})))
 }
+
+/// `GET /api/tasks/{id}/attempts` (WP12): the comparison of a Best-of-N task.
+pub async fn attempts(
+    State(st): State<AppState>,
+    AuthUser(u): AuthUser,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<queued_api::bon::Comparison>> {
+    let t = queue::load_task(&st, id)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    if t.user_id != u.id {
+        require(&st, t.project_id, u.id, Role::Viewer).await?;
+    }
+    let g = match t.attempt_of {
+        Some(g) => queue::load_task(&st, g)
+            .await?
+            .ok_or_else(AppError::not_found)?,
+        None if t.is_group() => t,
+        None => return Err(AppError::not_found()),
+    };
+    Ok(Json(crate::bon::comparison(&st, &g, u.id).await?))
+}
+
+/// `POST /api/tasks/{id}/select` (WP12): the user picks the winner.
+pub async fn select(
+    State(st): State<AppState>,
+    AuthUser(u): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(r): Json<queued_api::bon::SelectAttempt>,
+) -> ApiResult<Json<Value>> {
+    let g = own_task(&st, id, u.id).await?;
+    if !g.is_group() {
+        return Err(AppError::not_found());
+    }
+    match crate::bon::select(
+        &st,
+        g.id,
+        r.attempt_id,
+        queued_api::bon::SelectedBy::User,
+        "Von Hand gewählt",
+        Some(u.id),
+    )
+    .await?
+    {
+        Ok(()) => {
+            crate::audit::log(
+                &st,
+                &u,
+                "approval.attempt_selected",
+                ("task", &g.id.to_string()),
+                Some(g.project_id),
+                json!({"attempt": r.attempt_id}),
+            )
+            .await;
+            Ok(Json(json!({"ok": true})))
+        }
+        Err(crate::bon::SelectError::NotFound) => Err(AppError::not_found()),
+        Err(crate::bon::SelectError::Conflict(m)) => Err(AppError::conflict(m)),
+    }
+}
+

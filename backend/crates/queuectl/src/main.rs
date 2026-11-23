@@ -49,9 +49,15 @@ enum Cmd {
         provider: Option<String>,
         #[arg(long)]
         model: Option<String>,
-        /// Kostenobergrenze in USD
+        /// Kostenobergrenze in USD (bei mehreren Versuchen: für alle zusammen)
         #[arg(long)]
         max_cost: Option<f64>,
+        /// Mehrere parallele Versuche (Best-of-N, 2–8)
+        #[arg(long)]
+        attempts: Option<i32>,
+        /// Den besten Versuch automatisch von einem Review-Agenten wählen lassen
+        #[arg(long, requires = "attempts")]
+        auto_select: bool,
         /// Danach verfolgen wie „watch“
         #[arg(short, long)]
         watch: bool,
@@ -133,6 +139,8 @@ async fn run(cli: Cli) -> queuectl::Result<i32> {
             provider,
             model,
             max_cost,
+            attempts,
+            auto_select,
             watch,
             text,
         } => {
@@ -152,6 +160,8 @@ async fn run(cli: Cli) -> queuectl::Result<i32> {
                     provider,
                     model,
                     max_cost,
+                    attempts,
+                    auto_select,
                     text,
                     json,
                 },

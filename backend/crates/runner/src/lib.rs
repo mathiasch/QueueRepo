@@ -4,6 +4,7 @@ pub mod egress;
 pub mod exec;
 pub mod git;
 pub mod metrics;
+pub mod preview;
 pub mod sessions;
 pub mod setup;
 pub mod snapshot;
@@ -54,6 +55,16 @@ pub struct RunnerConfig {
     pub session_ttl_days: u64,
     /// WP10: who may read `/metrics` (`RUNNER_METRICS_TOKEN`/`_BIND`).
     pub metrics: queued_common::metrics::Access,
+    /// WP12: host Chromium for preview screenshots with engine `none`
+    /// (`RUNNER_CHROMIUM`); containers use `preview_browser` in the image.
+    pub chromium: Option<PathBuf>,
+    /// WP12: start the host Chromium without its own sandbox (only when the
+    /// runner cannot provide one, e.g. as root in CI; engine `none`).
+    pub chromium_no_sandbox: bool,
+    /// WP12: browser binary inside the agent image (`RUNNER_PREVIEW_BROWSER`).
+    pub preview_browser: String,
+    /// WP12: live previews at the same time (`RUNNER_MAX_PREVIEWS`).
+    pub max_previews: usize,
 }
 
 /// Longest data dir path: `<data_dir>/e/<16 hex>/p.sock` must stay below the
@@ -83,6 +94,10 @@ impl RunnerConfig {
             }),
             session_ttl_days: sessions::DEFAULT_TTL_DAYS,
             metrics: Default::default(),
+            chromium: None,
+            chromium_no_sandbox: false,
+            preview_browser: "chromium".into(),
+            max_previews: 4,
         }
     }
 
@@ -111,6 +126,8 @@ pub struct RunnerState {
     leases: Arc<std::sync::Mutex<HashMap<String, tokio::time::Instant>>>,
     /// WP10: Prometheus metrics of this runner.
     pub metrics: Arc<metrics::RunnerMetrics>,
+    /// WP12: running dev servers (live previews).
+    pub previews: Arc<preview::Registry>,
 }
 
 impl RunnerState {
@@ -122,6 +139,7 @@ impl RunnerState {
             active: Default::default(),
             leases: Default::default(),
             metrics: Arc::new(metrics::RunnerMetrics::new()),
+            previews: Default::default(),
         }
     }
 
@@ -250,6 +268,13 @@ pub fn router(st: RunnerState) -> Router {
         .route(
             "/workspaces/{id}/restore",
             post(restore).layer(DefaultBodyLimit::max(16 * 1024 * 1024 * 1024)),
+        )
+        .route("/workspaces/{id}/tasks/{task}/preview", post(preview_start))
+        .route("/previews", get(preview_list))
+        .route("/previews/{name}/stop", post(preview_stop))
+        .route(
+            "/previews/{name}/http",
+            post(preview_http).layer(DefaultBodyLimit::max(MAX_PREVIEW_REQUEST)),
         )
         .route("/heartbeat", post(heartbeat))
         .route("/exec", post(exec_start))
@@ -507,6 +532,8 @@ async fn task_remove(
             "a process runs in this task workspace".into(),
         ));
     }
+    // WP12: a live preview of the tree goes with it.
+    preview::stop_workspace(&st.cfg, &st.previews, &t).await;
     main.remove_task(&task, &t, q.branch.as_deref()).await?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
@@ -947,6 +974,9 @@ async fn exec_start(State(st): State<RunnerState>, Json(req): Json<ExecRequest>)
             return Err(ApiErr(StatusCode::BAD_REQUEST, "invalid session".into()));
         }
     }
+    // WP12: an agent/verify run takes the working tree back from a live
+    // preview (the preview is a throwaway view of it).
+    preview::stop_workspace(&st.cfg, &st.previews, &req.workspace).await;
     let cancel = CancellationToken::new();
     {
         let mut running = st.running.lock().await;
@@ -1036,6 +1066,84 @@ async fn exec_start(State(st): State<RunnerState>, Json(req): Json<ExecRequest>)
         Body::from_stream(stream),
     )
         .into_response())
+}
+
+/// WP12: starts the dev server of a task's working tree (see `preview`).
+async fn preview_start(
+    State(st): State<RunnerState>,
+    Path((id, t)): Path<(String, String)>,
+    Json(req): Json<PreviewStart>,
+) -> R<Json<PreviewStarted>> {
+    task_repo(&st, &id, &t)?;
+    if st.workspace_busy(&t).await {
+        return Err(ApiErr(
+            StatusCode::CONFLICT,
+            "a process runs in this task workspace".into(),
+        ));
+    }
+    if preview::validate(&req).is_err() {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "invalid preview".into()));
+    }
+    Ok(Json(
+        preview::start(st.cfg.clone(), st.previews.clone(), &t, req).await?,
+    ))
+}
+
+async fn preview_list(State(st): State<RunnerState>) -> Json<PreviewList> {
+    Json(PreviewList {
+        names: st.previews.names().await,
+    })
+}
+
+async fn preview_stop(
+    State(st): State<RunnerState>,
+    Path(name): Path<String>,
+) -> R<Json<serde_json::Value>> {
+    if !valid_name(&name) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "invalid name".into()));
+    }
+    let stopped = preview::stop(&st.cfg, &st.previews, &name).await;
+    Ok(Json(serde_json::json!({"stopped": stopped})))
+}
+
+/// WP12: one request to a live preview, for the app's authenticated proxy.
+/// Method and path come in `x-queue-preview-method`/`-path`; the answer is
+/// `200` with the dev server's status in [`PREVIEW_STATUS_HEADER`].
+async fn preview_http(
+    State(st): State<RunnerState>,
+    Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> R<Response> {
+    if !valid_name(&name) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "invalid name".into()));
+    }
+    let get = |k: &str| {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let method = get("x-queue-preview-method");
+    let path = get("x-queue-preview-path");
+    let fwd: Vec<(String, Vec<u8>)> = headers
+        .iter()
+        .filter(|(k, _)| *k != header::AUTHORIZATION)
+        .map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec()))
+        .collect();
+    let f = match preview::forward(&st.previews, &name, &method, &path, &fwd, body).await {
+        Ok(f) => f,
+        Err(e) => return Err(ApiErr(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
+    };
+    let mut r = Response::builder()
+        .status(StatusCode::OK)
+        .header(PREVIEW_STATUS_HEADER, f.status.to_string());
+    for (k, v) in &f.headers {
+        r = r.header(k.as_str(), v.as_slice());
+    }
+    Ok(r.body(Body::from(f.body))
+        .map_err(|e| ApiErr(StatusCode::BAD_GATEWAY, e.to_string()))?)
 }
 
 /// Which agent CLIs exist in the sandbox, and in which version.

@@ -42,6 +42,12 @@ pub struct AppMetrics {
     pub audit_errors: Arc<Family>,
     /// WP11: login/second-factor failures and lockouts (`kind`).
     pub auth_failures: Arc<Family>,
+    /// WP12: Best-of-N groups fanned out, selections (`by`), budget stops.
+    pub bon_groups: Arc<Family>,
+    pub bon_selections: Arc<Family>,
+    pub bon_aborts: Arc<Family>,
+    /// WP12: previews started/failed and screenshots taken (`event`).
+    pub previews: Arc<Family>,
     refreshed: tokio::sync::Mutex<Option<Instant>>,
 }
 
@@ -61,6 +67,8 @@ pub const ACTIVE_STATES: &[&str] = &[
     "waiting_input",
     "held",
     "merging",
+    "comparing",
+    "candidate",
 ];
 
 impl AppMetrics {
@@ -160,9 +168,49 @@ impl AppMetrics {
                 "Failed sign-ins by kind (password, mfa, locked).",
                 &["kind"],
             ),
+            bon_groups: r.counter(
+                "queued_bon_groups_total",
+                "Best-of-N tasks that fanned out into attempts.",
+                &[],
+            ),
+            bon_selections: r.counter(
+                "queued_bon_selections_total",
+                "Best-of-N winners by who picked them (user, auto).",
+                &["by"],
+            ),
+            bon_aborts: r.counter(
+                "queued_bon_budget_aborts_total",
+                "Best-of-N groups stopped because the budget of all attempts was exhausted.",
+                &[],
+            ),
+            previews: r.counter(
+                "queued_preview_events_total",
+                "Preview dev servers and screenshots (started, failed, screenshot).",
+                &["event"],
+            ),
             refreshed: tokio::sync::Mutex::new(None),
             registry: r,
         }
+    }
+
+    pub fn bon_group(&self) {
+        self.bon_groups.inc(&[]);
+    }
+
+    pub fn bon_selection(&self, by: queued_api::bon::SelectedBy) {
+        self.bon_selections.inc(&[match by {
+            queued_api::bon::SelectedBy::User => "user",
+            queued_api::bon::SelectedBy::Auto => "auto",
+        }]);
+    }
+
+    pub fn bon_abort(&self) {
+        self.bon_aborts.inc(&[]);
+    }
+
+    /// `event`: started | failed | screenshot.
+    pub fn preview(&self, event: &'static str) {
+        self.previews.inc(&[event]);
     }
 
     /// Token usage and cost of one priced step (from `runner::record_cost`).

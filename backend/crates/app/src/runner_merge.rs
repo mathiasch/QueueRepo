@@ -593,6 +593,8 @@ async fn clean_carried(st: &AppState, project: Uuid, task: &Task) {
 /// Removes a task's working tree; with `branch` also its branch in the main
 /// repository (best effort – the hourly sweep retries).
 pub(crate) async fn cleanup_task(st: &AppState, project: Uuid, id: Uuid, branch: bool) {
+    // WP12: a live preview of the working tree ends with it.
+    crate::preview::stop_for_task(st, id).await;
     let Ok(Some((b, active, plan_mode))) = sqlx::query_as::<_, (Option<String>, bool, bool)>(
         "SELECT branch, EXISTS (SELECT 1 FROM tasks c WHERE c.carry_from = t.id AND NOT (c.status = ANY($2))), plan_mode
          FROM tasks t WHERE id=$1",

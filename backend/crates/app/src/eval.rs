@@ -219,9 +219,13 @@ pub async fn start(
             st,
             user,
             &project,
-            s.connector_id,
-            s.provider.as_deref(),
-            s.model.clone(),
+            routing::Explicit {
+                connector: s.connector_id,
+                provider: s.provider.clone(),
+                model: s.model.clone(),
+                attempt: false,
+            },
+            None,
             &settings.default_provider,
         )
         .await?
@@ -234,6 +238,7 @@ pub async fn start(
         } else {
             String::new()
         };
+        let routing_decision = exec.decision_json();
         let task = queue::insert_task(
             st,
             NewTask {
@@ -258,6 +263,7 @@ pub async fn start(
                 carry_from: None,
                 pr_id: None,
                 plan_mode: false,
+                routing_decision,
             },
         )
         .await?;

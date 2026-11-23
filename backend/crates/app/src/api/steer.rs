@@ -485,9 +485,13 @@ async fn start_continuation(
         st,
         user,
         &project,
-        t.connector_id,
-        t.connector_id.is_none().then_some(t.provider.as_str()),
-        t.model.clone(),
+        crate::routing::Explicit {
+            connector: t.connector_id,
+            provider: t.connector_id.is_none().then(|| t.provider.clone()),
+            model: t.model.clone(),
+            attempt: false,
+        },
+        None,
         &settings.default_provider,
     )
     .await?

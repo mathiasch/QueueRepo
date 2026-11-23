@@ -254,6 +254,22 @@ pub struct EstimateRequest {
     pub provider: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// WP12 Best-of-N: access/model per attempt (empty = a normal task).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<crate::Target>,
+    /// WP12: a review agent picks the winner (one more single-shot call).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_select: bool,
+}
+
+/// WP12: estimate of one attempt (agent loop + review on its access).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttemptEstimate {
+    pub attempt_no: i32,
+    pub label: String,
+    pub low: Vec<Money>,
+    pub mid: Vec<Money>,
+    pub high: Vec<Money>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -286,6 +302,10 @@ pub struct Estimate {
     /// Data location of the agent loop (e.g. "EU").
     pub location: String,
     pub notes: Vec<String>,
+    /// WP12 Best-of-N: one entry per attempt; the totals above include all
+    /// attempts, the plan once and the automatic selection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<AttemptEstimate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

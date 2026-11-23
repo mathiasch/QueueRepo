@@ -589,6 +589,11 @@ pub(crate) async fn finish_flow(
     let review = p.review.clone();
     let before = p.before.clone();
     let after = p.after.clone().unwrap_or_default();
+    // WP12: a successful attempt waits for the selection instead of the
+    // merge queue (failures go through `finish_failed`: no fix task).
+    if p.failure.is_none() && task.kind == "attempt" && task.status != status::MERGING {
+        return candidate(st, task, &p, usage).await;
+    }
     match &p.failure {
         None if task.branch.is_some()
             && (task.pr_id.is_some() || project.output().pushes_branch()) =>
@@ -662,6 +667,58 @@ pub(crate) async fn finish_flow(
     }
 }
 
+/// WP12: a successful attempt becomes a candidate of its group. Its gate
+/// state (`gate_pending`) stays for the merge after the selection. When the
+/// group already chose (another instance, a human was faster) or was
+/// cancelled, the attempt is discarded instead.
+async fn candidate(st: &AppState, task: &Task, p: &Pending, usage: &Usage) -> Result<(), RunError> {
+    if !crate::bon::accepts_candidates(st, task).await {
+        finish(
+            st,
+            task.id,
+            Finish {
+                status: status::CANCELLED,
+                summary: Some(p.summary.clone()),
+                handoff: p.handoff.clone(),
+                error: Some("Verworfen: für diesen Auftrag wurde schon gewählt".into()),
+                review: p.review.clone(),
+                questions: None,
+                usage,
+                failure_class: Some(FailureClass::Cancelled),
+            },
+        )
+        .await?;
+        super::merge::cleanup_task(st, task.project_id, task.id, true).await;
+        return Ok(());
+    }
+    let n = sqlx::query(
+        "UPDATE tasks SET status='candidate', gate_pending=$2, usage=$3, summary=COALESCE(NULLIF($4, ''), summary),
+                handoff=COALESCE($5, handoff), review=COALESCE($6, review), error=NULL, not_before=NULL,
+                gate=NULL, finished_at=now(), updated_at=now()
+         WHERE id=$1 AND status IN ('running','waiting_batch')",
+    )
+    .bind(task.id)
+    .bind(serde_json::to_value(p).unwrap_or_default())
+    .bind(serde_json::to_value(usage).unwrap_or_default())
+    .bind(secrets::redact(&p.summary))
+    .bind(p.handoff.as_deref().map(secrets::redact))
+    .bind(p.review.clone())
+    .execute(&st.db)
+    .await?
+    .rows_affected();
+    queue::emit_task(st, task.id).await;
+    if n > 0 {
+        event(
+            st,
+            task,
+            "status",
+            "Versuch erfolgreich – wartet auf die Auswahl",
+        )
+        .await;
+    }
+    Ok(())
+}
+
 /// Result flow after the commit, starting at `from`.
 pub(crate) async fn after_commit(
     f: &Flow<'_>,
@@ -720,6 +777,11 @@ pub(crate) async fn after_commit(
                     p.failure = Some(format!("Verifikation `{cmd}` fehlgeschlagen:\n{msg}"));
                 }
             }
+        }
+        // WP12: screenshots of the dev server after UI changes (before the
+        // review, so they belong to the checked state of the run).
+        if p.failure.is_none() && task.kind != "onempty" {
+            crate::preview::screenshots_after_run(st, task, &before, &after).await;
         }
     }
     if from <= Step::Review

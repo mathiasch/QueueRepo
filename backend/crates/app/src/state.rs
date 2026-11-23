@@ -55,6 +55,8 @@ pub struct AppState {
     pub ready: Arc<crate::health::ReadyCache>,
     /// WP10: wakes the notification loop (outbox, daily summary).
     pub notify_wake: Arc<Notify>,
+    /// WP12: live budget ledger per Best-of-N group (see `bon::ledger_delta`).
+    pub bon_ledger: Arc<std::sync::Mutex<HashMap<Uuid, crate::bon::Ledger>>>,
 }
 
 pub type PriceCache = (Option<i32>, Arc<queued_api::PriceCatalog>);
@@ -98,6 +100,7 @@ impl AppState {
             otel,
             ready: Arc::new(tokio::sync::Mutex::new(None)),
             notify_wake: Arc::new(Notify::new()),
+            bon_ledger: Default::default(),
         })
     }
 

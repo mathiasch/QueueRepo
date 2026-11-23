@@ -577,26 +577,6 @@ async fn request(
         .fetch_one(&mut *conn)
         .await?;
     let settings = queue::load_settings(st, user.id()).await?;
-    let exec = match crate::routing::resolve_execute(
-        st,
-        user.id(),
-        &project,
-        None,
-        None,
-        None,
-        &settings.default_provider,
-    )
-    .await?
-    {
-        Ok(e) => e,
-        Err(why) => {
-            return Ok((
-                IntakeOutcome::Failed,
-                Some(format!("Kein Auftrag möglich: {why}")),
-                None,
-            ))
-        }
-    };
     let requester = crate::steer::user_name(st, Some(user.id())).await;
     let kind = row.kind();
     let intro = format!(
@@ -613,6 +593,28 @@ async fn request(
     .chars()
     .take(200)
     .collect();
+    let prompt = task_prompt(kind, &r.label, &requester, &cfg);
+    let ask = crate::routing::Ask::new("task", &title, &prompt, &context, 0);
+    let exec = match crate::routing::resolve_execute(
+        st,
+        user.id(),
+        &project,
+        crate::routing::Explicit::default(),
+        Some(&ask),
+        &settings.default_provider,
+    )
+    .await?
+    {
+        Ok(e) => e,
+        Err(why) => {
+            return Ok((
+                IntakeOutcome::Failed,
+                Some(format!("Kein Auftrag möglich: {why}")),
+                None,
+            ))
+        }
+    };
+    let routing_decision = exec.decision_json();
     let task = queue::insert_task_in(
         conn,
         NewTask {
@@ -621,7 +623,7 @@ async fn request(
             parent_id: None,
             kind: "task",
             title,
-            prompt: task_prompt(kind, &r.label, &requester, &cfg),
+            prompt,
             context,
             provider: exec.provider,
             model: exec.model,
@@ -637,6 +639,7 @@ async fn request(
             carry_from: None,
             pr_id: None,
             plan_mode: project.plan_mode,
+            routing_decision,
         },
     )
     .await?;
@@ -795,11 +798,13 @@ async fn reply(
             st,
             user,
             &project,
-            task.connector_id,
-            task.connector_id
-                .is_none()
-                .then_some(task.provider.as_str()),
-            task.model.clone(),
+            crate::routing::Explicit {
+                connector: task.connector_id,
+                provider: task.connector_id.is_none().then(|| task.provider.clone()),
+                model: task.model.clone(),
+                attempt: false,
+            },
+            None,
             &settings.default_provider,
         )
         .await?;

@@ -83,6 +83,13 @@ async fn main() -> Result<()> {
             None => queued_runner::sessions::DEFAULT_TTL_DAYS,
         },
         metrics,
+        chromium: var("RUNNER_CHROMIUM").map(PathBuf::from),
+        chromium_no_sandbox: var("RUNNER_CHROMIUM_NO_SANDBOX").is_some_and(|v| v == "1" || v == "true"),
+        preview_browser: var("RUNNER_PREVIEW_BROWSER").unwrap_or_else(|| "chromium".into()),
+        max_previews: match var("RUNNER_MAX_PREVIEWS") {
+            Some(v) => v.parse().context("RUNNER_MAX_PREVIEWS must be a number")?,
+            None => 4,
+        },
     };
     if cfg.kill_grace_secs > 60 {
         // The app's exec HTTP timeout allows for at most 60 s of grace.

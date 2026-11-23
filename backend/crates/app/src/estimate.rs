@@ -264,6 +264,7 @@ pub fn assemble(steps: Vec<StepEstimate>, location: &str, extra_notes: Vec<Strin
         high,
         location: location.into(),
         notes,
+        attempts: vec![],
     }
 }
 
@@ -283,6 +284,7 @@ mod tests {
             single_shot: true,
             batch: true,
             flex: kind == "openai_api",
+            wire_api: None,
         }
     }
 
@@ -326,6 +328,7 @@ mod tests {
                 target: Some(a.target(Some("claude-sonnet-5-5"))),
             },
             analyze: StepRoute::default(),
+            rules: vec![],
         };
         let steps = routing_steps(&r, &all, pricing::builtin(), Profile::report(), true);
         assert_eq!(

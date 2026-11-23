@@ -590,6 +590,7 @@ pub fn audit_label(action: &str) -> &'static str {
         "approval.plan_approved" => "Plan freigegeben",
         "approval.plan_rejected" => "Plan verworfen",
         "approval.task_approved" => "Auftrag freigegeben",
+        "approval.attempt_selected" => "Versuch übernommen (Best-of-N)",
         "approval.knowledge_approved" => "Wissens-Vorschlag übernommen",
         "approval.knowledge_rejected" => "Wissens-Vorschlag abgelehnt",
         "token.created" => "API-Token erstellt",

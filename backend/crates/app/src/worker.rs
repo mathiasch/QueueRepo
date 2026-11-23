@@ -192,6 +192,14 @@ async fn tick(st: &AppState) -> Result<()> {
             maybe_onempty(st, &s).await?;
         }
     }
+    // WP12: expired live previews.
+    if let Err(e) = crate::preview::sweep(st).await {
+        tracing::warn!("preview sweep failed: {e:#}");
+    }
+    // WP12: automatic selections and groups that settled while the app was down.
+    if let Err(e) = crate::bon::sweep(st).await {
+        tracing::warn!("best-of-n sweep failed: {e:#}");
+    }
     while let Some(task) = claim_merge(&st.db).await? {
         let token = CancellationToken::new();
         let gen = st.track(task.id, token.clone()).await;
@@ -213,6 +221,19 @@ pub struct Blocked {
 }
 
 impl Blocked {
+    /// WP12: would a task on this access be held back right now?
+    pub fn blocks(&self, provider: &str, connector: Option<Uuid>) -> bool {
+        match connector {
+            None => self.legacy.iter().any(|p| p == provider),
+            Some(c) => {
+                self.budget.iter().any(|p| p == provider)
+                    || self
+                        .connectors
+                        .contains(&crate::connectors::limit_key(c))
+            }
+        }
+    }
+
     pub async fn load(st: &AppState, user: Uuid) -> Result<Self> {
         let mut b = Blocked::default();
         for p in st.cfg.providers() {
@@ -241,6 +262,12 @@ const RUNNABLE: &str = "t.user_id = $1 AND t.status = 'queued'
       AND (t.not_before IS NULL OR t.not_before <= now())
       AND CASE WHEN t.connector_id IS NULL THEN NOT (t.provider = ANY($2))
                ELSE NOT (t.provider = ANY($3)) AND NOT (('connector:' || t.connector_id::text) = ANY($4)) END";
+
+/// Slots a project uses: running and merging tasks; the attempts of a
+/// Best-of-N group share one slot (WP12: they all start from the same base
+/// and never touch the target branch before the selection).
+const PROJECT_SLOTS: &str = "(SELECT count(DISTINCT COALESCE(r.attempt_of, r.id)) FROM tasks r
+      WHERE r.project_id = t.project_id AND r.status IN ('running','merging'))";
 
 /// WP11: the runner `rn` takes new runs: active (not draining/revoked),
 /// reachable, below its capacity (running tasks claimed on it).
@@ -274,7 +301,8 @@ pub async fn claim_next(
             "SELECT t.project_id, p.runner_id FROM tasks t JOIN projects p ON p.id = t.project_id
              JOIN runners rn ON rn.id = p.runner_id
              WHERE {RUNNABLE} AND NOT (t.project_id = ANY($5))
-               AND (SELECT count(*) FROM tasks r WHERE r.project_id = t.project_id AND r.status IN ('running','merging')) < p.parallelism
+               AND ({PROJECT_SLOTS} < p.parallelism
+                    OR (t.attempt_of IS NOT NULL AND EXISTS (SELECT 1 FROM tasks r WHERE r.attempt_of = t.attempt_of AND r.status = 'running')))
                AND {RUNNER_USABLE}
              ORDER BY t.position LIMIT 1"
         ))
@@ -313,8 +341,9 @@ pub async fn claim_next(
                 SELECT t.id FROM tasks t WHERE {RUNNABLE} AND t.project_id = $5
                 ORDER BY t.position LIMIT 1
                 FOR UPDATE SKIP LOCKED)
-               AND (SELECT count(*) FROM tasks r WHERE r.project_id = $5 AND r.status IN ('running','merging'))
-                   < (SELECT parallelism FROM projects WHERE id = $5)
+               AND ((SELECT count(DISTINCT COALESCE(r.attempt_of, r.id)) FROM tasks r WHERE r.project_id = $5 AND r.status IN ('running','merging'))
+                        < (SELECT parallelism FROM projects WHERE id = $5)
+                    OR (tasks.attempt_of IS NOT NULL AND EXISTS (SELECT 1 FROM tasks r WHERE r.attempt_of = tasks.attempt_of AND r.status = 'running')))
                AND (SELECT {RUNNER_USABLE} FROM runners rn WHERE rn.id = $6)
              RETURNING *"
         ))
@@ -414,7 +443,7 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
     }
     let busy: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM tasks WHERE user_id=$1
-                        AND status IN ('queued','running','waiting_batch','waiting_input','pending_approval','held','merging'))",
+                        AND status IN ('queued','running','waiting_batch','waiting_input','pending_approval','held','merging','comparing','candidate'))",
     )
     .bind(s.user_id)
     .fetch_one(&st.db)
@@ -440,6 +469,7 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
     let target = routing
         .and_then(|r| serde_json::from_value::<queued_api::Routing>(r).ok())
         .and_then(|r| r.analyze.target.or(r.execute.target));
+    let routing_set = target.is_some();
     let (provider, connector_id, model) = match target {
         Some(t) => match t.connector_id {
             Some(c) => match crate::connectors::load_row(st, c).await? {
@@ -476,6 +506,18 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
         }
     };
 
+    let (decision_provider, decision_model) = (provider.clone(), model.clone());
+    let (decision_source, decision_why) = if routing_set {
+        (
+            queued_api::DecisionSource::Route,
+            "OnEmpty-Analyse laut Projekt-Routing",
+        )
+    } else {
+        (
+            queued_api::DecisionSource::Default,
+            "OnEmpty-Analyse mit dem Standard-Anbieter",
+        )
+    };
     sqlx::query("UPDATE user_settings SET last_onempty_at=now() WHERE user_id=$1")
         .bind(s.user_id)
         .execute(&st.db)
@@ -505,6 +547,14 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
             carry_from: None,
             pr_id: None,
             plan_mode: false,
+            routing_decision: crate::routing::inherited_json(
+                "onempty",
+                &decision_provider,
+                connector_id,
+                decision_model.as_deref(),
+                decision_source,
+                decision_why,
+            ),
         },
     )
     .await?;

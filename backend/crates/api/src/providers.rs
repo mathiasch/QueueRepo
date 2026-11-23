@@ -284,6 +284,7 @@ impl Default for Routing {
             execute: ExecuteRoute::default(),
             review: StepRoute::default(),
             analyze: StepRoute::default(),
+            rules: vec![],
         }
     }
 }
@@ -324,6 +325,97 @@ pub struct Routing {
     pub review: StepRoute,
     #[serde(default)]
     pub analyze: StepRoute,
+    /// WP12: rules for the agent loop by task features (first match wins),
+    /// applied when the task names no access itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<RoutingRule>,
+}
+
+/// Most rules per project.
+pub const MAX_RULES: usize = 20;
+
+/// WP12: one routing rule – when the task matches `when`, its agent loop
+/// runs on `target`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RoutingRule {
+    /// Shown in the explanation at the task ("Regel „Kleine Aufträge“").
+    pub name: String,
+    #[serde(default)]
+    pub when: RuleWhen,
+    pub target: Target,
+}
+
+/// Conditions of a [`RoutingRule`]; all given conditions must hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RuleWhen {
+    /// Task kinds (`task`, `fix`); empty = new tasks (`task`) only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+    /// Prompt + context at most this many characters ("small task").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<u32>,
+    /// Prompt + context at least this many characters ("large task").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_chars: Option<u32>,
+    /// Any of these words in title or prompt (case-insensitive).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keywords: Vec<String>,
+    /// With (`true`) or without (`false`) attachments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_attachments: Option<bool>,
+}
+
+/// Features of a task the routing decides on (deterministic, no model).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TaskFacts {
+    /// `task` | `fix` | `onempty` | `attempt` | `continue`.
+    pub kind: String,
+    /// Characters of prompt + context.
+    pub chars: u32,
+    #[serde(default)]
+    pub attachments: u32,
+}
+
+/// Where a [`RoutingDecision`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionSource {
+    /// Chosen at the task (composer, API, template).
+    Explicit,
+    /// Best-of-N: the access/model of this attempt.
+    Attempt,
+    /// Fix task: next model of the escalation chain.
+    Escalation,
+    /// A routing rule matched.
+    Rule,
+    /// The project's agent-loop route (preset or hand-made).
+    Route,
+    /// Fix task without escalation: same access/model as the failed task.
+    Inherited,
+    /// No routing: the user's default provider.
+    Default,
+}
+
+/// WP12: the routing decision of a task's agent loop, stored at the task
+/// and shown in the UI. WP15 (model chooser) produces the same structure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingDecision {
+    /// Pipeline step (`execute`).
+    pub step: String,
+    pub source: DecisionSource,
+    pub target: Target,
+    /// Name of the matched rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// Position of the matched rule (0-based).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_index: Option<u32>,
+    /// Escalation level after this decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_level: Option<i32>,
+    /// German explanation for the UI.
+    pub reason: String,
+    pub facts: TaskFacts,
 }
 
 /// `PUT /api/projects/{id}/routing`.

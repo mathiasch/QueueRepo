@@ -488,6 +488,80 @@ impl RunnerClient {
         Ok(())
     }
 
+    /// WP12: starts the dev server of a task's working tree (screenshots,
+    /// live preview). Takes as long as the ready timeout plus screenshots.
+    pub async fn preview_start(
+        &self,
+        main: Uuid,
+        task: Uuid,
+        req: &queued_common::PreviewStart,
+    ) -> Result<queued_common::PreviewStarted> {
+        let secs = req.ready_timeout_secs + 70 * req.shots.len() as u64 + 30;
+        let r = self
+            .send(
+                self.h()?
+                    .post(self.url(main, &format!("/tasks/{}/preview", task_ws(task))))
+                    .bearer_auth(&self.token)
+                    .timeout(Duration::from_secs(secs))
+                    .json(req),
+            )
+            .await
+            .context("runner unreachable")?;
+        Ok(Self::check(r).await?.json().await?)
+    }
+
+    /// WP12: stops a live preview (`false` = it was not running).
+    pub async fn preview_stop(&self, name: &str) -> Result<bool> {
+        let v: serde_json::Value = self
+            .post(format!("{}/previews/{name}/stop", self.base), &serde_json::json!({}))
+            .await?;
+        Ok(v["stopped"].as_bool().unwrap_or(false))
+    }
+
+    /// WP12: running previews of the runner.
+    pub async fn previews(&self) -> Result<queued_common::PreviewList> {
+        self.get(format!("{}/previews", self.base)).await
+    }
+
+    /// WP12: one request to a live preview. Returns the dev server's status,
+    /// its (runner-filtered) headers and the body.
+    pub async fn preview_http(
+        &self,
+        name: &str,
+        method: &str,
+        path: &str,
+        headers: Vec<(String, Vec<u8>)>,
+        body: bytes::Bytes,
+    ) -> Result<(u16, Vec<(String, Vec<u8>)>, bytes::Bytes)> {
+        let mut rb = self
+            .h()?
+            .post(format!("{}/previews/{name}/http", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(60))
+            .header("x-queue-preview-method", method)
+            .header("x-queue-preview-path", path);
+        for (k, v) in headers {
+            rb = rb.header(k, v);
+        }
+        let r = self
+            .send(rb.body(body))
+            .await
+            .context("runner unreachable")?;
+        let r = Self::check(r).await?;
+        let status = r
+            .headers()
+            .get(queued_common::PREVIEW_STATUS_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(502);
+        let hs = r
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec()))
+            .collect();
+        Ok((status, hs, r.bytes().await?))
+    }
+
     /// Engine and whether egress rules are enforced.
     pub async fn info(&self) -> Result<RunnerInfo> {
         self.get(format!("{}/info", self.base)).await

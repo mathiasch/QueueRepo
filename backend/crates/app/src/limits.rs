@@ -226,6 +226,11 @@ pub(crate) mod tests {
             dedupe: None,
             proposals: None,
             reverted_at: None,
+            attempts: 1,
+            attempt_of: None,
+            attempt_no: None,
+            bon: None,
+            routing_decision: None,
         }
     }
 
