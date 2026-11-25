@@ -55,7 +55,12 @@ pub async fn put_settings(
     }))
 }
 
-async fn task_for(st: &AppState, id: Uuid, user: Uuid, min: Role) -> ApiResult<crate::models::Task> {
+async fn task_for(
+    st: &AppState,
+    id: Uuid,
+    user: Uuid,
+    min: Role,
+) -> ApiResult<crate::models::Task> {
     let t = queue::load_task(st, id)
         .await?
         .ok_or_else(AppError::not_found)?;
@@ -119,7 +124,10 @@ pub async fn screenshot(
         [
             (header::CONTENT_TYPE, "image/png"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-            (header::CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "sandbox; default-src 'none'",
+            ),
             (header::CACHE_CONTROL, "private, max-age=3600"),
         ],
         png,

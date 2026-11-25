@@ -2,6 +2,7 @@
 //! `cargo test` (replaces the former Vitest suite).
 pub mod analytics;
 pub mod b64;
+pub mod bon;
 pub mod branch;
 pub mod budget;
 pub mod comments;

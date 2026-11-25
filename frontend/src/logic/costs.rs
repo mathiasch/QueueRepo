@@ -61,6 +61,7 @@ pub fn step_label(step: &str) -> &'static str {
         "review" => "Prüfung",
         "analyze" => "Analyse",
         "critic" => "Prüfung",
+        "select" => "Auswahl (Best-of-N)",
         _ => "Schritt",
     }
 }
@@ -246,6 +247,7 @@ mod tests {
             high: m(3.44),
             location: "USA".into(),
             notes: vec![],
+            attempts: vec![],
         };
         assert_eq!(
             estimate_summary(&e),

@@ -227,9 +227,7 @@ impl Blocked {
             None => self.legacy.iter().any(|p| p == provider),
             Some(c) => {
                 self.budget.iter().any(|p| p == provider)
-                    || self
-                        .connectors
-                        .contains(&crate::connectors::limit_key(c))
+                    || self.connectors.contains(&crate::connectors::limit_key(c))
             }
         }
     }

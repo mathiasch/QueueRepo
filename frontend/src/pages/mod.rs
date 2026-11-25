@@ -2,6 +2,7 @@ pub mod admin;
 pub mod analytics;
 pub mod attachments;
 pub mod automation;
+pub mod bon;
 pub mod branch;
 pub mod composer;
 pub mod delivery;

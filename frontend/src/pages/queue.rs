@@ -51,6 +51,8 @@ pub fn QueuePage() -> impl IntoView {
         })
     };
     let running = by(|s| s == TaskStatus::Running);
+    // WP12: Best-of-N tasks whose attempts run or wait for a selection.
+    let comparing = by(|s| s == TaskStatus::Comparing);
     let waiting_batch = by(|s| s == TaskStatus::WaitingBatch);
     let merging = Memo::new(move |_| {
         let mut m: Vec<Task> = store.tasks.with(|ts| {
@@ -79,7 +81,9 @@ pub fn QueuePage() -> impl IntoView {
             ts.iter()
                 .filter(|t| {
                     let s = t.status_kind();
+                    // Attempts are shown in their task's comparison.
                     s.is_final()
+                        && t.kind != "attempt"
                         && match f {
                             HistoryFilter::All => true,
                             HistoryFilter::Done => s == TaskStatus::Done,
@@ -146,6 +150,18 @@ pub fn QueuePage() -> impl IntoView {
                     <h2 id="sec-running">"Läuft gerade"</h2>
                 </div>
                 <For each=move || running.get() key=row_key children=move |t| view! { <RunningCard t=t/> }/>
+            </section>
+        })}
+
+        {move || (!comparing.with(Vec::is_empty)).then(|| view! {
+            <section class="section" aria-labelledby="sec-comparing">
+                <div class="section-head">
+                    <h2 id="sec-comparing">"Mehrere Versuche" <span class="count">{move || comparing.with(Vec::len)}</span></h2>
+                    <HelpTip topic="Mehrere Versuche" text=status_help(TaskStatus::Comparing)/>
+                </div>
+                <div class="list" data-testid="comparing-list">
+                    <For each=move || comparing.get() key=row_key children=move |t| view! { <TaskRow t=t/> }/>
+                </div>
             </section>
         })}
 
@@ -227,6 +243,14 @@ fn kind_tags(t: &Task) -> impl IntoView {
         "fix" => tags.push(view! { <Tag text="Reparatur" tone=Tone::Danger/> }.into_any()),
         "onempty" => tags.push(view! { <Tag text="Automatisch" tone=Tone::Info/> }.into_any()),
         "pr_fix" => tags.push(view! { <Tag text="PR-Folge" tone=Tone::Info/> }.into_any()),
+        "attempt" => tags.push(
+            view! { <Tag text=format!("Versuch {}", t.attempt_no.unwrap_or(0)) tone=Tone::Info/> }
+                .into_any(),
+        ),
+        _ if t.attempts > 1 => tags.push(
+            view! { <Tag text=format!("{} Versuche", t.attempts) tone=Tone::Info test_id="bon-tag"/> }
+                .into_any(),
+        ),
         _ if t.created_by_agent => tags.push(
             view! { <span class="tag tone-warning agent-tag" title="Von einem Agenten vorgeschlagen">"Vorschlag"</span> }.into_any(),
         ),

@@ -174,6 +174,23 @@ pub struct Analytics {
     pub daily: Vec<DayRow>,
     /// Pauses are per user: only for scope `mine`.
     pub pauses: Option<Vec<PauseRow>>,
+    /// WP12: Best-of-N groups and attempts of the window.
+    #[serde(default)]
+    pub best_of_n: BestOfN,
+}
+
+/// WP12: Best-of-N numbers (groups created in the window). Attempts are not
+/// counted as tasks anywhere else; their costs are part of every cost figure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct BestOfN {
+    pub groups: i64,
+    pub attempts: i64,
+    /// Attempts that passed gate, verify and review.
+    pub successful_attempts: i64,
+    pub selected_by_user: i64,
+    pub selected_auto: i64,
+    /// Groups stopped by the budget of all attempts.
+    pub budget_stops: i64,
 }
 
 /// One agent run in the session insights.

@@ -103,9 +103,11 @@ pub async fn create(
                 u.id,
                 &project,
                 &exec,
-                n,
-                &c.attempt_targets,
-                c.auto_select,
+                crate::bon::GroupRequest {
+                    n,
+                    targets: &c.attempt_targets,
+                    auto_select: c.auto_select,
+                },
                 &settings.default_provider,
             )
             .await?
@@ -231,6 +233,12 @@ pub async fn update(
     let lim = c.limits.check()?;
     // Provider/connector/model change: resolved and checked like a new task.
     let access_change = c.provider.is_some() || c.connector_id.is_some();
+    // WP12: the accesses of the attempts were checked and fixed at creation.
+    if t.is_group() && (access_change || c.model.is_some()) {
+        return Err(AppError::bad_request(
+            "Bei mehreren Versuchen sind Zugang und Modell je Versuch festgelegt – bitte den Auftrag neu anlegen.",
+        ));
+    }
     let exec = if access_change {
         let project: crate::models::Project = sqlx::query_as("SELECT * FROM projects WHERE id=$1")
             .bind(t.project_id)
@@ -388,7 +396,7 @@ async fn cancel_inner(st: &AppState, t: &Task) -> ApiResult<Json<Value>> {
         if t.gate_parsed().is_some_and(|g| g.has_diff) {
             st.runner(t.project_id)
                 .await
-                .discard_held(super::gate::held_ws(&t), t.id)
+                .discard_held(super::gate::held_ws(t), t.id)
                 .await
                 .map_err(runner_err)?;
         }
@@ -777,4 +785,3 @@ pub async fn select(
         Err(crate::bon::SelectError::Conflict(m)) => Err(AppError::conflict(m)),
     }
 }
-

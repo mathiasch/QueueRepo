@@ -1222,9 +1222,15 @@ mod tests {
             "dedupe",
             "proposals",
             "reverted_at",
+            "attempt_of",
+            "attempt_no",
+            "bon",
+            "routing_decision",
         ] {
             full[k] = Value::Null;
         }
+        // WP12: rows from before Best-of-N are a single attempt.
+        full["attempts"] = 1.into();
         full["plan_mode"] = Value::Bool(false);
         full["plan_revision"] = 0.into();
         full["steer_rounds"] = 0.into();

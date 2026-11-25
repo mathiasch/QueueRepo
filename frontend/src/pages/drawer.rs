@@ -43,6 +43,7 @@ pub fn TaskDrawer(id: Uuid) -> impl IntoView {
     let pull = RwSignal::new(None::<queued_api::pr::PullRequestView>);
     let intake = RwSignal::new(None::<queued_api::intake::IntakeLinkView>);
     let attachments = RwSignal::new(Vec::<queued_api::memory::AttachmentView>::new());
+    let screenshots = RwSignal::new(Vec::<queued_api::preview::ScreenshotView>::new());
     let events = RwSignal::new(Vec::<TaskEvent>::new());
     let loaded = RwSignal::new(false);
     let diff = RwSignal::new(None::<String>);
@@ -62,6 +63,7 @@ pub fn TaskDrawer(id: Uuid) -> impl IntoView {
                     pull.set(d.pull_request);
                     intake.set(d.intake);
                     attachments.set(d.attachments);
+                    screenshots.set(d.screenshots);
                     events.update(|evs| {
                         let live = std::mem::take(evs);
                         *evs = d.events;
@@ -124,6 +126,20 @@ pub fn TaskDrawer(id: Uuid) -> impl IntoView {
 
     // Live version from the store, otherwise the fetched one (older tasks).
     let task = Memo::new(move |_| store.task(id).or_else(|| fetched.get()));
+    // WP12: screenshots are taken during the run – refreshed when the
+    // status changes.
+    let status_now = Memo::new(move |_| task.with(|t| t.as_ref().map(|t| t.status.clone())));
+    Effect::new(move |prev: Option<Option<String>>| {
+        let s = status_now.get();
+        if prev.is_some_and(|p| p != s) {
+            spawn_local(async move {
+                if let Ok(d) = api::get::<TaskDetail>(&format!("/tasks/{id}")).await {
+                    screenshots.set(d.screenshots);
+                }
+            });
+        }
+        s
+    });
 
     let close_btn = close.clone();
     let close_backdrop = close.clone();
@@ -188,6 +204,13 @@ pub fn TaskDrawer(id: Uuid) -> impl IntoView {
                             });
                             view! { <super::attachments::TaskAttachments project=pid task=id items=attachments can_add=can_add/> }
                         })}
+                        {move || (!screenshots.with(Vec::is_empty)).then(|| view! {
+                            <section class="block" aria-labelledby="shots-title">
+                                <h3 id="shots-title" class="row"><Icon icon=Ic::Camera class="sm"/>"Screenshots nach dem Lauf"</h3>
+                                <super::bon::Screenshots shots=screenshots.get()/>
+                            </section>
+                        })}
+                        {move || task.get().map(|t| view! { <super::bon::PreviewBlock t=t/> })}
                         {move || intake.get().map(|l| view! { <super::integrations::IntakeBlock link=l/> })}
                         {move || pull.get().map(|p| view! { <super::pr::PrBlock pr=p/> })}
                         <super::steer::MessagesBlock id=id task=task events=events/>
@@ -475,6 +498,8 @@ fn Details(t: Task) -> impl IntoView {
         } else {
             view! { <GatePanel id=id gate=g/> }.into_any()
         })}
+        {t.is_group().then(|| view! { <super::bon::ComparisonBlock group=id/> })}
+        <super::bon::AttemptOf t=t.clone()/>
         <super::branch::BranchBlock t=t.clone()/>
         <super::memory::DedupeBlock t=t.clone()/>
         {(!questions.is_empty()).then(|| view! { <DrawerQuestions id=id questions=questions.clone() waiting=status == TaskStatus::WaitingInput/> })}
@@ -560,6 +585,7 @@ fn Details(t: Task) -> impl IntoView {
                 </div>
             </Block>
         })}
+        <super::bon::DecisionLine t=t.clone()/>
         {cost.map(|c| view! { <CostBlock c=c/> })}
     }
 }

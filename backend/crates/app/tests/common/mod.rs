@@ -36,18 +36,35 @@ pub async fn start(pool: PgPool) -> Harness {
 
 /// Like [`start`], with adjusted app config.
 pub async fn start_with(pool: PgPool, f: impl FnOnce(&mut Config)) -> Harness {
-    boot(pool, f, false).await
+    boot(pool, f, |_| {}, false).await
+}
+
+/// Like [`start_with`], with adjusted runner config as well (WP12: host
+/// Chromium for screenshots).
+pub async fn start_full(
+    pool: PgPool,
+    f: impl FnOnce(&mut Config),
+    r: impl FnOnce(&mut RunnerConfig),
+) -> Harness {
+    boot(pool, f, r, false).await
 }
 
 /// App talks to the runner through [`flaky_proxy`]: the first exec stream is
 /// cut after the first usage frame (runner restart / network drop).
 pub async fn start_flaky(pool: PgPool) -> Harness {
-    boot(pool, |_| {}, true).await
+    boot(pool, |_| {}, |_| {}, true).await
 }
 
-async fn boot(pool: PgPool, f: impl FnOnce(&mut Config), flaky: bool) -> Harness {
+async fn boot(
+    pool: PgPool,
+    f: impl FnOnce(&mut Config),
+    r: impl FnOnce(&mut RunnerConfig),
+    flaky: bool,
+) -> Harness {
     let runner_dir = tempfile::tempdir().unwrap();
-    let rs = RunnerState::new(RunnerConfig::for_tests(runner_dir.path().to_path_buf()));
+    let mut rcfg = RunnerConfig::for_tests(runner_dir.path().to_path_buf());
+    r(&mut rcfg);
+    let rs = RunnerState::new(rcfg);
     let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut runner_url = format!("http://{}", rl.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(rl, queued_runner::router(rs)).await.unwrap() });

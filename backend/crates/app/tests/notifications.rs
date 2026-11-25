@@ -357,6 +357,22 @@ async fn daily_summary_is_sent_once_across_instances_and_restarts(pool: PgPool) 
     assert_eq!(a.put("/api/notifications/settings", s).await.0, 200);
     // A fixed "now": 18 Nov 2026, 07:30 UTC = 08:30 in Berlin (due).
     let now = Utc.with_ymd_and_hms(2026, 11, 18, 7, 30, 0).unwrap();
+    // `notify::tick` also runs the digest with the wall clock: the real
+    // local days count as done, or a run inside the real due window would
+    // add a row (and a metric) of its own (time-of-day dependent result).
+    let berlin: chrono_tz::Tz = "Europe/Berlin".parse().unwrap();
+    let today = Utc::now().with_timezone(&berlin).date_naive();
+    for d in [today, today.succ_opt().unwrap()] {
+        sqlx::query(
+            "INSERT INTO notification_digests (user_id, local_date, period_start, period_end)
+             VALUES ($1,$2,'2026-10-31T00:00:00Z','2026-11-01T00:00:00Z')",
+        )
+        .bind(ua)
+        .bind(d)
+        .execute(&h.st.db)
+        .await
+        .unwrap();
+    }
     for (status, mins) in [
         ("done", 60),
         ("done", 120),
@@ -415,7 +431,7 @@ async fn daily_summary_is_sent_once_across_instances_and_restarts(pool: PgPool) 
         let _ = (x.unwrap(), y.unwrap());
     }
     let rows: Vec<(chrono::NaiveDate, Option<Uuid>)> = sqlx::query_as(
-        "SELECT local_date, notification_id FROM notification_digests WHERE user_id=$1",
+        "SELECT local_date, notification_id FROM notification_digests WHERE user_id=$1 AND local_date <= '2026-11-20'",
     )
     .bind(ua)
     .fetch_all(&h.st.db)
@@ -501,7 +517,7 @@ async fn daily_summary_is_sent_once_across_instances_and_restarts(pool: PgPool) 
     let day3 = now + Duration::days(2);
     assert_eq!(queued::digest::run_due(&restart, day3).await.unwrap(), 1);
     let rows: Vec<(chrono::NaiveDate, Option<Uuid>)> = sqlx::query_as(
-        "SELECT local_date, notification_id FROM notification_digests WHERE user_id=$1 ORDER BY local_date",
+        "SELECT local_date, notification_id FROM notification_digests WHERE user_id=$1 AND local_date <= '2026-11-20' ORDER BY local_date",
     )
     .bind(ua)
     .fetch_all(&h.st.db)

@@ -132,7 +132,11 @@ impl PreviewOrigin {
         let err = || {
             format!("PREVIEW_ORIGIN must look like https://*.preview.example.com[:port], got {v}")
         };
-        let (scheme, rest) = v.trim().trim_end_matches('/').split_once("://").ok_or_else(err)?;
+        let (scheme, rest) = v
+            .trim()
+            .trim_end_matches('/')
+            .split_once("://")
+            .ok_or_else(err)?;
         if scheme != "https" && scheme != "http" {
             return Err(err());
         }

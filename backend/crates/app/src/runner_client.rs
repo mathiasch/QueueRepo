@@ -513,7 +513,10 @@ impl RunnerClient {
     /// WP12: stops a live preview (`false` = it was not running).
     pub async fn preview_stop(&self, name: &str) -> Result<bool> {
         let v: serde_json::Value = self
-            .post(format!("{}/previews/{name}/stop", self.base), &serde_json::json!({}))
+            .post(
+                format!("{}/previews/{name}/stop", self.base),
+                &serde_json::json!({}),
+            )
             .await?;
         Ok(v["stopped"].as_bool().unwrap_or(false))
     }

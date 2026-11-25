@@ -30,8 +30,13 @@ fi
 psql "$ADMIN_URL" -qc "CREATE DATABASE $DB" >/dev/null
 DB_URL="${ADMIN_URL%/*}/$DB"
 
+# WP12: headless Chromium for preview screenshots (engine none: the host's).
+CHROMIUM="${RUNNER_CHROMIUM:-$(ls -d /opt/pw-browsers/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell 2>/dev/null | sort | tail -n 1)}"
+NO_SANDBOX=0; [[ "$(id -u)" == "0" ]] && NO_SANDBOX=1
+
 # 127.0.0.1 as an internal host the egress proxy may reach: system tests use
 # a local fake upstream instead of real external hosts (WP02).
+RUNNER_CHROMIUM="$CHROMIUM" RUNNER_CHROMIUM_NO_SANDBOX="$NO_SANDBOX" \
 RUNNER_ALLOW_ROOT=1 RUNNER_ENGINE=none RUNNER_TOKEN="$TOKEN" RUNNER_DATA_DIR="$WORK/runner" \
 RUNNER_METRICS_TOKEN="$RUNNER_METRICS_TOKEN" \
 RUNNER_EGRESS_PRIVATE_HOSTS=127.0.0.1 \
@@ -50,7 +55,7 @@ FAKE_INTAKE="http://127.0.0.1:$FAKE_INTAKE_PORT"
 
 DATABASE_URL="$DB_URL" RUNNER_URL="http://127.0.0.1:$RUNNER_PORT" RUNNER_TOKEN="$TOKEN" \
 DATA_DIR="$WORK/app" FRONTEND_DIR="$ROOT/frontend/dist" BIND="127.0.0.1:$APP_PORT" \
-PUBLIC_URL="http://localhost:$APP_PORT" ENABLE_MOCK_PROVIDER=true TICK_SECS=1 RUST_LOG=warn \
+PUBLIC_URL="http://localhost:$APP_PORT" PREVIEW_ORIGIN="http://*.localhost:$APP_PORT" ENABLE_MOCK_PROVIDER=true TICK_SECS=1 RUST_LOG=warn \
 METRICS_TOKEN="$METRICS_TOKEN" NOTIFY_TICK_SECS=1 ALLOW_PRIVATE_NOTIFY_TARGETS=true \
 ALLOW_LOCAL_GIT_REMOTES=true ALLOW_PRIVATE_GIT_HOSTS=true PR_POLL_SECS=1 TRIGGER_TICK_SECS=1 \
 INTAKE_TICK_SECS=1 INTAKE_GITHUB_API_URL="$FAKE_INTAKE" INTAKE_SLACK_API_URL="$FAKE_INTAKE" \

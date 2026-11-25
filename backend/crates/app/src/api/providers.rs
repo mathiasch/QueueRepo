@@ -456,7 +456,15 @@ pub async fn estimate(
     let mut notes = vec![];
     let mut steps = vec![];
     if let Some(rt) = route.as_ref().filter(|r| r.plan.mode != StepMode::Off) {
-        steps.push(single_step(&cat, &all, &exec, false, "plan", &rt.plan, estimate::PLAN));
+        steps.push(single_step(
+            &cat,
+            &all,
+            &exec,
+            false,
+            "plan",
+            &rt.plan,
+            estimate::PLAN,
+        ));
     }
     let location = location_of(&st, &exec).await?;
     if r.attempts.is_empty() && !r.auto_select {
@@ -493,7 +501,10 @@ pub async fn estimate(
                 s.first()
                     .and_then(|x| x.connector.clone())
                     .unwrap_or_else(|| e.provider.clone()),
-                e.model.as_deref().map(|m| format!(" · {m}")).unwrap_or_default()
+                e.model
+                    .as_deref()
+                    .map(|m| format!(" · {m}"))
+                    .unwrap_or_default()
             ),
             low: one.low,
             mid: one.mid,
@@ -521,7 +532,15 @@ pub async fn estimate(
                     mode: StepMode::Sync,
                     target: Some(t),
                 };
-                steps.push(single_step(&cat, &all, &exec, false, "select", &sr, estimate::REVIEW));
+                steps.push(single_step(
+                    &cat,
+                    &all,
+                    &exec,
+                    false,
+                    "select",
+                    &sr,
+                    estimate::REVIEW,
+                ));
             }
             Err(why) => return Err(AppError::bad_request(why)),
         }
@@ -633,22 +652,31 @@ async fn exec_steps(
         },
     )];
     if project.review_enabled {
-        let rr = route
-            .as_ref()
-            .map(|r| r.review.clone())
-            .unwrap_or_else(|| queued_api::StepRoute {
-                mode: StepMode::Harness,
-                target: project
-                    .review_provider
-                    .clone()
-                    .filter(|p| !p.is_empty())
-                    .map(|p| queued_api::Target {
-                        connector_id: None,
-                        provider: Some(p),
-                        model: project.review_model.clone(),
-                    }),
-            });
-        steps.push(single_step(cat, all, exec, flex, "review", &rr, estimate::REVIEW));
+        let rr =
+            route
+                .as_ref()
+                .map(|r| r.review.clone())
+                .unwrap_or_else(|| queued_api::StepRoute {
+                    mode: StepMode::Harness,
+                    target: project
+                        .review_provider
+                        .clone()
+                        .filter(|p| !p.is_empty())
+                        .map(|p| queued_api::Target {
+                            connector_id: None,
+                            provider: Some(p),
+                            model: project.review_model.clone(),
+                        }),
+                });
+        steps.push(single_step(
+            cat,
+            all,
+            exec,
+            flex,
+            "review",
+            &rr,
+            estimate::REVIEW,
+        ));
     }
     Ok(steps)
 }

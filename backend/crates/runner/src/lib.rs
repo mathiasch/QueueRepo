@@ -1142,8 +1142,8 @@ async fn preview_http(
     for (k, v) in &f.headers {
         r = r.header(k.as_str(), v.as_slice());
     }
-    Ok(r.body(Body::from(f.body))
-        .map_err(|e| ApiErr(StatusCode::BAD_GATEWAY, e.to_string()))?)
+    r.body(Body::from(f.body))
+        .map_err(|e| ApiErr(StatusCode::BAD_GATEWAY, e.to_string()))
 }
 
 /// Which agent CLIs exist in the sandbox, and in which version.

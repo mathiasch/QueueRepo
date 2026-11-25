@@ -8,7 +8,7 @@
 //! * single-shot steps need an access with a direct API (sync) or a batch API.
 use queued_api::{
     DataLocation, DecisionSource, ExecuteRoute, ModelTier, PresetInfo, PriceCatalog, Residency,
-    Routing, RoutingDecision, RoutingRule, RuleWhen, StepMode, StepRoute, TaskFacts, Target,
+    Routing, RoutingDecision, RoutingRule, RuleWhen, StepMode, StepRoute, Target, TaskFacts,
     MAX_RULES,
 };
 use uuid::Uuid;
@@ -221,7 +221,11 @@ pub fn validate(
 }
 
 /// WP12: rule list checks (German messages).
-pub fn validate_rules(rules: &[RoutingRule], residency: Residency, all: &[Access]) -> Result<(), String> {
+pub fn validate_rules(
+    rules: &[RoutingRule],
+    residency: Residency,
+    all: &[Access],
+) -> Result<(), String> {
     if rules.len() > MAX_RULES {
         return Err(format!("Höchstens {MAX_RULES} Regeln"));
     }
@@ -229,7 +233,10 @@ pub fn validate_rules(rules: &[RoutingRule], residency: Residency, all: &[Access
         let name = r.name.trim();
         let label = format!("Regel {} („{}“)", i + 1, name);
         if name.is_empty() || name.chars().count() > 80 {
-            return Err(format!("Regel {}: Name fehlt oder ist zu lang (max. 80 Zeichen)", i + 1));
+            return Err(format!(
+                "Regel {}: Name fehlt oder ist zu lang (max. 80 Zeichen)",
+                i + 1
+            ));
         }
         let w = &r.when;
         if w.kinds.len() > 2 || w.kinds.iter().any(|k| k != "task" && k != "fix") {
@@ -240,7 +247,8 @@ pub fn validate_rules(rules: &[RoutingRule], residency: Residency, all: &[Access
                 return Err(format!("{label}: „mindestens“ ist größer als „höchstens“"));
             }
         }
-        if w.max_chars.is_some_and(|m| m > 1_000_000) || w.min_chars.is_some_and(|m| m > 1_000_000) {
+        if w.max_chars.is_some_and(|m| m > 1_000_000) || w.min_chars.is_some_and(|m| m > 1_000_000)
+        {
             return Err(format!("{label}: Zeichenzahl zu groß"));
         }
         if w.keywords.len() > 10
@@ -248,7 +256,9 @@ pub fn validate_rules(rules: &[RoutingRule], residency: Residency, all: &[Access
                 .iter()
                 .any(|k| k.trim().is_empty() || k.chars().count() > 60)
         {
-            return Err(format!("{label}: höchstens 10 Stichworte mit je 1–60 Zeichen"));
+            return Err(format!(
+                "{label}: höchstens 10 Stichworte mit je 1–60 Zeichen"
+            ));
         }
         let acc = find(all, &r.target).ok_or(format!("{label}: Zugang nicht gefunden"))?;
         check_location(residency, acc, &format!("Der Zugang von {label}"))?;
@@ -257,7 +267,10 @@ pub fn validate_rules(rules: &[RoutingRule], residency: Residency, all: &[Access
             return Err(format!("{label}: Modellname zu lang"));
         }
         if model.is_none() && (acc.harness == "opencode" || acc.kind == "bedrock") {
-            return Err(format!("{label}: für „{}“ muss ein Modell angegeben werden", acc.label));
+            return Err(format!(
+                "{label}: für „{}“ muss ein Modell angegeben werden",
+                acc.label
+            ));
         }
     }
     Ok(())
@@ -295,7 +308,7 @@ pub fn rule_matches(w: &RuleWhen, f: &TaskFacts, text: &str) -> bool {
     let kind_ok = if w.kinds.is_empty() {
         f.kind == "task"
     } else {
-        w.kinds.iter().any(|k| *k == f.kind)
+        w.kinds.contains(&f.kind)
     };
     let lower = text.to_lowercase();
     kind_ok
@@ -315,7 +328,13 @@ pub fn describe_when(w: &RuleWhen) -> String {
         parts.push(
             w.kinds
                 .iter()
-                .map(|k| if k == "fix" { "Fix-Aufträge" } else { "neue Aufträge" })
+                .map(|k| {
+                    if k == "fix" {
+                        "Fix-Aufträge"
+                    } else {
+                        "neue Aufträge"
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" und "),
         );
@@ -451,11 +470,19 @@ pub fn decide(
             if model.is_some() {
                 t.model = model;
             }
-            let preset = routing.and_then(|r| r.preset.as_deref()).filter(|p| *p != "custom");
+            let preset = routing
+                .and_then(|r| r.preset.as_deref())
+                .filter(|p| *p != "custom");
             let reason = match (preset, routing.is_some_and(|r| !r.rules.is_empty())) {
-                (Some(p), true) => format!("Keine Regel passt – Umsetzung laut Vorlage „{p}“: {}", target_text(&t)),
+                (Some(p), true) => format!(
+                    "Keine Regel passt – Umsetzung laut Vorlage „{p}“: {}",
+                    target_text(&t)
+                ),
                 (Some(p), false) => format!("Umsetzung laut Vorlage „{p}“: {}", target_text(&t)),
-                (None, true) => format!("Keine Regel passt – Umsetzung laut Projekt-Routing: {}", target_text(&t)),
+                (None, true) => format!(
+                    "Keine Regel passt – Umsetzung laut Projekt-Routing: {}",
+                    target_text(&t)
+                ),
                 (None, false) => format!("Umsetzung laut Projekt-Routing: {}", target_text(&t)),
             };
             mk(DecisionSource::Route, t, None, reason)
@@ -466,7 +493,10 @@ pub fn decide(
                 provider: Some(default_provider.to_string()),
                 model,
             };
-            let reason = format!("Kein Projekt-Routing – Standard-Anbieter: {}", target_text(&t));
+            let reason = format!(
+                "Kein Projekt-Routing – Standard-Anbieter: {}",
+                target_text(&t)
+            );
             mk(DecisionSource::Default, t, None, reason)
         }
     }
@@ -513,11 +543,17 @@ pub fn decide_fix(
 ) -> RoutingDecision {
     let inherited = Target {
         connector_id: failed.connector_id,
-        provider: failed.connector_id.is_none().then(|| failed.provider.clone()),
+        provider: failed
+            .connector_id
+            .is_none()
+            .then(|| failed.provider.clone()),
         model: failed.model.clone(),
     };
     if let Some((m, level)) = escalate(routing, failed) {
-        let from = failed.model.clone().unwrap_or_else(|| "Standardmodell".into());
+        let from = failed
+            .model
+            .clone()
+            .unwrap_or_else(|| "Standardmodell".into());
         return RoutingDecision {
             step: "execute".into(),
             source: DecisionSource::Escalation,
@@ -533,12 +569,9 @@ pub fn decide_fix(
         };
     }
     if let Some(r) = routing {
-        if let Some((i, rule)) = r
-            .rules
-            .iter()
-            .enumerate()
-            .find(|(_, rule)| !rule.when.kinds.is_empty() && rule_matches(&rule.when, &ask.facts, &ask.text))
-        {
+        if let Some((i, rule)) = r.rules.iter().enumerate().find(|(_, rule)| {
+            !rule.when.kinds.is_empty() && rule_matches(&rule.when, &ask.facts, &ask.text)
+        }) {
             return RoutingDecision {
                 step: "execute".into(),
                 source: DecisionSource::Rule,
@@ -616,12 +649,21 @@ pub async fn resolve_execute(
     ask: Option<&Ask>,
     default_provider: &str,
 ) -> anyhow::Result<Result<Exec, String>> {
-    if explicit.model.as_ref().is_some_and(|m| m.trim().len() > 200) {
+    if explicit
+        .model
+        .as_ref()
+        .is_some_and(|m| m.trim().len() > 200)
+    {
         return Ok(Err("Modellname zu lang".into()));
     }
     let none = Ask::default();
     let routing = project.routing();
-    let decision = decide(routing.as_ref(), ask.unwrap_or(&none), &explicit, default_provider);
+    let decision = decide(
+        routing.as_ref(),
+        ask.unwrap_or(&none),
+        &explicit,
+        default_provider,
+    );
     check_decision(st, user, project, decision, default_provider).await
 }
 
@@ -1160,5 +1202,211 @@ mod tests {
             .contains("nicht gefunden"));
         r.execute.target = None;
         assert!(validate(&r, Residency::Any, &all, cat()).is_err());
+    }
+
+    fn rule(name: &str, when: RuleWhen, model: &str) -> RoutingRule {
+        RoutingRule {
+            name: name.into(),
+            when,
+            target: Target {
+                connector_id: None,
+                provider: Some("mock".into()),
+                model: Some(model.into()),
+            },
+        }
+    }
+
+    fn routed(rules: Vec<RoutingRule>) -> Routing {
+        Routing {
+            preset: Some("balanced".into()),
+            execute: ExecuteRoute {
+                target: Some(Target {
+                    connector_id: None,
+                    provider: Some("mock".into()),
+                    model: Some("claude-sonnet-5-5".into()),
+                }),
+                escalation: vec!["claude-opus-5-5".into()],
+                flex: false,
+            },
+            rules,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn decision_precedence_is_explicit_rule_route_default() {
+        let r = routed(vec![
+            rule(
+                "Klein",
+                RuleWhen {
+                    max_chars: Some(20),
+                    ..Default::default()
+                },
+                "claude-haiku-5-5",
+            ),
+            rule(
+                "Doku",
+                RuleWhen {
+                    keywords: vec!["readme".into()],
+                    ..Default::default()
+                },
+                "claude-sonnet-5",
+            ),
+        ]);
+        let small = Ask::new("task", "Fix", "typo", "", 0);
+        let d = decide(Some(&r), &small, &Explicit::default(), "claude");
+        assert_eq!(d.source, DecisionSource::Rule);
+        assert_eq!(d.rule.as_deref(), Some("Klein"));
+        assert_eq!(d.rule_index, Some(0));
+        assert_eq!(d.target.model.as_deref(), Some("claude-haiku-5-5"));
+        assert!(d.reason.contains("höchstens 20 Zeichen"), "{}", d.reason);
+        // First match wins (both match: short and README).
+        let both = Ask::new("task", "README", "README", "", 0);
+        assert_eq!(
+            decide(Some(&r), &both, &Explicit::default(), "claude").rule_index,
+            Some(0)
+        );
+        let doc = Ask::new(
+            "task",
+            "Doku",
+            "Bitte die ReadMe mit einer langen Erklärung erweitern",
+            "",
+            0,
+        );
+        let d = decide(Some(&r), &doc, &Explicit::default(), "claude");
+        assert_eq!(d.rule.as_deref(), Some("Doku"), "case-insensitive keyword");
+        let big = Ask::new("task", "Groß", &"x".repeat(200), "", 0);
+        let d = decide(Some(&r), &big, &Explicit::default(), "claude");
+        assert_eq!(d.source, DecisionSource::Route);
+        assert!(d.reason.contains("Keine Regel passt") && d.reason.contains("balanced"));
+        // An explicit choice beats every rule.
+        let e = Explicit {
+            provider: Some("mock".into()),
+            model: Some("claude-opus-5-5".into()),
+            ..Default::default()
+        };
+        let d = decide(Some(&r), &small, &e, "claude");
+        assert_eq!(d.source, DecisionSource::Explicit);
+        assert_eq!(d.target.model.as_deref(), Some("claude-opus-5-5"));
+        // A model given without an access keeps the rule's access.
+        let m = Explicit {
+            model: Some("claude-opus-5".into()),
+            ..Default::default()
+        };
+        let d = decide(Some(&r), &small, &m, "claude");
+        assert_eq!(
+            (d.source, d.target.model.as_deref()),
+            (DecisionSource::Rule, Some("claude-opus-5"))
+        );
+        // No routing: the default provider.
+        let d = decide(None, &small, &Explicit::default(), "codex");
+        assert_eq!(d.source, DecisionSource::Default);
+        assert_eq!(d.target.provider.as_deref(), Some("codex"));
+        // Deterministic.
+        assert_eq!(
+            decide(Some(&r), &doc, &Explicit::default(), "claude"),
+            decide(Some(&r), &doc, &Explicit::default(), "claude")
+        );
+        // Rules without kinds are for new tasks only; analyses and
+        // continuations never match.
+        let onempty = Ask::new("onempty", "x", "x", "", 0);
+        assert_eq!(
+            decide(Some(&r), &onempty, &Explicit::default(), "claude").source,
+            DecisionSource::Route
+        );
+    }
+
+    #[test]
+    fn conditions_attachments_and_min_chars() {
+        let w = RuleWhen {
+            min_chars: Some(10),
+            has_attachments: Some(true),
+            kinds: vec!["task".into(), "fix".into()],
+            ..Default::default()
+        };
+        assert!(rule_matches(&w, &facts("task", "0123456789", "", 1), ""));
+        assert!(
+            !rule_matches(&w, &facts("task", "0123456789", "", 0), ""),
+            "no attachment"
+        );
+        assert!(!rule_matches(&w, &facts("task", "short", "", 1), ""));
+        assert!(rule_matches(&w, &facts("fix", "0123456789", "", 2), ""));
+        assert!(!rule_matches(
+            &w,
+            &facts("onempty", "0123456789", "", 2),
+            ""
+        ));
+        assert_eq!(
+            facts("task", " äöü ", "ß", 0).chars,
+            4,
+            "characters, trimmed"
+        );
+        assert_eq!(describe_when(&RuleWhen::default()), "alle neuen Aufträge");
+    }
+
+    #[test]
+    fn fix_decision_escalates_then_rules_then_inherits() {
+        let r = routed(vec![rule(
+            "Fixes billig",
+            RuleWhen {
+                kinds: vec!["fix".into()],
+                ..Default::default()
+            },
+            "claude-haiku-5-5",
+        )]);
+        let mut failed = crate::limits::tests::task();
+        failed.provider = "mock".into();
+        failed.model = Some("claude-sonnet-5-5".into());
+        let ask = Ask::new("fix", "Fix", "p", "", 0);
+        let d = decide_fix(Some(&r), &failed, &ask);
+        assert_eq!(d.source, DecisionSource::Escalation);
+        assert_eq!(d.escalation_level, Some(1));
+        assert!(
+            d.reason.contains("claude-sonnet-5-5 → claude-opus-5-5"),
+            "{}",
+            d.reason
+        );
+        failed.escalation_level = 1;
+        let d = decide_fix(Some(&r), &failed, &ask);
+        assert_eq!(d.source, DecisionSource::Rule, "chain exhausted → fix rule");
+        assert_eq!(d.target.model.as_deref(), Some("claude-haiku-5-5"));
+        let d = decide_fix(Some(&routed(vec![])), &failed, &ask);
+        assert_eq!(d.source, DecisionSource::Inherited);
+        assert_eq!(d.target.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert!(d.reason.contains("ausgeschöpft"), "{}", d.reason);
+    }
+
+    #[test]
+    fn rule_validation() {
+        let us = acc("anthropic_api", DataLocation::Us, true, true);
+        let eu = acc("mistral", DataLocation::Eu, true, true);
+        let all = vec![us.clone(), eu.clone()];
+        let ok = RoutingRule {
+            name: "EU".into(),
+            when: RuleWhen::default(),
+            target: eu.target(Some("mistral-large-4")),
+        };
+        assert!(validate_rules(std::slice::from_ref(&ok), Residency::Eu, &all).is_ok());
+        let us_rule = RoutingRule {
+            target: us.target(Some("claude-haiku-5-5")),
+            ..ok.clone()
+        };
+        assert!(validate_rules(&[us_rule], Residency::Eu, &all)
+            .unwrap_err()
+            .contains("Regel 1"));
+        let mut bad = ok.clone();
+        bad.name = " ".into();
+        assert!(validate_rules(&[bad], Residency::Any, &all).is_err());
+        let mut bad = ok.clone();
+        bad.when.kinds = vec!["onempty".into()];
+        assert!(validate_rules(&[bad], Residency::Any, &all).is_err());
+        let mut bad = ok.clone();
+        bad.when.min_chars = Some(50);
+        bad.when.max_chars = Some(10);
+        assert!(validate_rules(&[bad], Residency::Any, &all).is_err());
+        let mut bad = ok.clone();
+        bad.when.keywords = vec!["".into()];
+        assert!(validate_rules(&[bad], Residency::Any, &all).is_err());
+        assert!(validate_rules(&vec![ok; MAX_RULES + 1], Residency::Any, &all).is_err());
     }
 }

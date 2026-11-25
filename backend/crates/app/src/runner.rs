@@ -174,7 +174,11 @@ pub async fn run_task(st: AppState, task: Task, cancel: CancellationToken, gen: 
                 } else {
                     format!(
                         "{} Versuch {}: {why} – alle Versuche wurden gestoppt",
-                        if class == "limit_tokens" { "Token-Limit erreicht in" } else { "Kostenlimit erreicht in" },
+                        if class == "limit_tokens" {
+                            "Token-Limit erreicht in"
+                        } else {
+                            "Kostenlimit erreicht in"
+                        },
                         task.attempt_no.unwrap_or(0)
                     )
                 };
@@ -3845,11 +3849,23 @@ async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Resu
     if decision.source == queued_api::DecisionSource::Rule {
         // A rule may name another access: checked like a new task; refused
         // (rights, residency) ⇒ the failed task's access, with the reason.
-        match crate::routing::check_decision(st, failed.user_id, &project, decision.clone(), &failed.provider).await? {
+        match crate::routing::check_decision(
+            st,
+            failed.user_id,
+            &project,
+            decision.clone(),
+            &failed.provider,
+        )
+        .await?
+        {
             Ok(_) => {}
             Err(why) => {
                 let mut d = crate::routing::decide_fix(None, failed, &ask);
-                d.reason = format!("{} (Regel „{}“ nicht nutzbar: {why})", d.reason, decision.rule.clone().unwrap_or_default());
+                d.reason = format!(
+                    "{} (Regel „{}“ nicht nutzbar: {why})",
+                    d.reason,
+                    decision.rule.clone().unwrap_or_default()
+                );
                 decision = d;
             }
         }
@@ -3869,7 +3885,11 @@ async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Resu
         }
         // The failed task's own access is no longer usable: the fix keeps it
         // and the run blocks with the access message (as before WP12).
-        Err(_) => (failed.provider.clone(), failed.connector_id, decision.target.model.clone()),
+        Err(_) => (
+            failed.provider.clone(),
+            failed.connector_id,
+            decision.target.model.clone(),
+        ),
     };
     if decision.source == queued_api::DecisionSource::Escalation {
         event(

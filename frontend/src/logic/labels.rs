@@ -35,6 +35,8 @@ pub fn status_label(s: TaskStatus) -> &'static str {
         TaskStatus::WaitingInput => "Wartet auf dich",
         TaskStatus::Held => "Freigabe nötig",
         TaskStatus::Merging => "Wird übernommen",
+        TaskStatus::Comparing => "Mehrere Versuche",
+        TaskStatus::Candidate => "Zur Auswahl",
         TaskStatus::Done => "Fertig",
         TaskStatus::Failed => "Fehlgeschlagen",
         TaskStatus::Blocked => "Blockiert",
@@ -60,6 +62,12 @@ pub fn status_help(s: TaskStatus) -> &'static str {
         TaskStatus::Merging => {
             "Fertig und geprüft. Queue übernimmt die Änderungen gerade der Reihe nach in den Hauptstand des Projekts."
         }
+        TaskStatus::Comparing => {
+            "Mehrere Agenten lösen den Auftrag gleichzeitig, jeder für sich. Danach vergleichst du die Ergebnisse und wählst das beste – oder ein Prüf-Agent wählt für dich."
+        }
+        TaskStatus::Candidate => {
+            "Dieser Versuch ist fertig und geprüft. Er wartet darauf, ob er ausgewählt wird."
+        }
         TaskStatus::Done => "Erledigt, geprüft und im Projekt gespeichert.",
         TaskStatus::Failed => {
             "Das Ergebnis war nicht in Ordnung. Ein Reparatur-Auftrag versucht es erneut."
@@ -73,7 +81,11 @@ pub fn status_help(s: TaskStatus) -> &'static str {
 
 pub fn status_tone(s: TaskStatus) -> Tone {
     match s {
-        TaskStatus::PendingApproval | TaskStatus::WaitingInput | TaskStatus::Held => Tone::Warning,
+        TaskStatus::PendingApproval
+        | TaskStatus::WaitingInput
+        | TaskStatus::Held
+        | TaskStatus::Candidate => Tone::Warning,
+        TaskStatus::Comparing => Tone::Run,
         TaskStatus::Queued | TaskStatus::WaitingBatch | TaskStatus::Merging => Tone::Info,
         TaskStatus::Running => Tone::Run,
         TaskStatus::Done => Tone::Success,
@@ -150,6 +162,7 @@ pub fn task_kind_label(kind: &str) -> &'static str {
         "onempty" => "Automatisch",
         "pr_fix" => "PR-Folge",
         "continue" => "Fortsetzung",
+        "attempt" => "Versuch",
         _ => "Auftrag",
     }
 }

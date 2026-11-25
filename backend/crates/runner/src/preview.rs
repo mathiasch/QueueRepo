@@ -174,7 +174,12 @@ pub fn preview_dir(cfg: &RunnerConfig, name: &str) -> PathBuf {
 
 /// `docker|podman run` arguments of a preview container: no network, no
 /// published port, the working tree and the preview directory mounted.
-pub fn container_args(cfg: &RunnerConfig, req: &PreviewStart, ws: &Path, dir: &Path) -> Vec<String> {
+pub fn container_args(
+    cfg: &RunnerConfig,
+    req: &PreviewStart,
+    ws: &Path,
+    dir: &Path,
+) -> Vec<String> {
     let vol = |src: &Path, dst: &str| {
         if cfg.volume_opts.is_empty() {
             format!("{}:{dst}", src.display())
@@ -314,7 +319,10 @@ async fn request(
     req: hyper::Request<Full<Bytes>>,
     timeout: Duration,
 ) -> Result<hyper::Response<hyper::body::Incoming>> {
-    async fn go<S>(s: S, req: hyper::Request<Full<Bytes>>) -> Result<hyper::Response<hyper::body::Incoming>>
+    async fn go<S>(
+        s: S,
+        req: hyper::Request<Full<Bytes>>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -432,7 +440,10 @@ pub async fn start(
     if req.keep {
         let m = reg.map.lock().await;
         if m.len() >= cfg.max_previews {
-            bail!("too many previews on this runner (at most {})", cfg.max_previews);
+            bail!(
+                "too many previews on this runner (at most {})",
+                cfg.max_previews
+            );
         }
         if m.contains_key(&req.name) {
             bail!("preview already running");
@@ -468,7 +479,11 @@ pub async fn start(
                 .kill_on_drop(true);
             #[cfg(unix)]
             c.process_group(0);
-            (c.spawn().context("start dev server")?, Target::Tcp(port), port)
+            (
+                c.spawn().context("start dev server")?,
+                Target::Tcp(port),
+                port,
+            )
         }
         Engine::Docker | Engine::Podman => {
             tokio::fs::write(dir.join("bridge.js"), BRIDGE_JS).await?;
@@ -566,7 +581,13 @@ async fn screenshot(cfg: &RunnerConfig, name: &str, h: &Handle, s: &ShotSpec, i:
     shot
 }
 
-async fn take(cfg: &RunnerConfig, name: &str, h: &Handle, s: &ShotSpec, i: usize) -> Result<Vec<u8>> {
+async fn take(
+    cfg: &RunnerConfig,
+    name: &str,
+    h: &Handle,
+    s: &ShotSpec,
+    i: usize,
+) -> Result<Vec<u8>> {
     let file = format!("shot-{i}.png");
     let profile = format!("chrome-{i}");
     let url = format!("http://127.0.0.1:{}{}", h.port, s.path);
@@ -629,7 +650,9 @@ async fn take(cfg: &RunnerConfig, name: &str, h: &Handle, s: &ShotSpec, i: usize
         Ok(Err(e)) => bail!("Browser: {e}"),
         Err(_) => {
             if cfg.engine == Engine::None {
-                if let Some((p, a)) = exec::stop_command(Engine::None, name, child.id(), Signal::Kill) {
+                if let Some((p, a)) =
+                    exec::stop_command(Engine::None, name, child.id(), Signal::Kill)
+                {
                     let _ = Command::new(p).args(a).output().await;
                 }
             }
@@ -776,7 +799,10 @@ mod tests {
         assert!(validate(&r).is_err());
         let mut r = req("x");
         r.env = vec![("PATH".into(), "/tmp".into())];
-        assert!(validate(&r).is_err(), "PATH/PORT/HOST/HOME are the runner's");
+        assert!(
+            validate(&r).is_err(),
+            "PATH/PORT/HOST/HOME are the runner's"
+        );
         let mut r = req("");
         r.command = " ".into();
         assert!(validate(&r).is_err());
@@ -789,29 +815,52 @@ mod tests {
         let mut cfg = RunnerConfig::for_tests(PathBuf::from("/data"));
         cfg.engine = Engine::Docker;
         cfg.docker_user = Some("1000:1000".into());
-        let a = container_args(&cfg, &req("npm run dev"), Path::new("/w/t1"), Path::new("/data/pv/x"));
+        let a = container_args(
+            &cfg,
+            &req("npm run dev"),
+            Path::new("/w/t1"),
+            Path::new("/data/pv/x"),
+        );
         let j = a.join(" ");
         assert!(j.contains("--network none"), "{j}");
-        assert!(!a.iter().any(|x| x == "-p" || x.starts_with("--publish") || x == "-P"), "{j}");
+        assert!(
+            !a.iter()
+                .any(|x| x == "-p" || x.starts_with("--publish") || x == "-P"),
+            "{j}"
+        );
         assert!(j.contains("--cap-drop ALL") && j.contains("no-new-privileges"));
         assert!(j.contains("--memory 1g") && j.contains("--pids-limit 4096"));
         assert!(j.contains("-v /w/t1:/workspace") && j.contains("-v /data/pv/x:/queue-preview"));
         assert!(j.contains("--user 1000:1000"));
         assert!(a.iter().any(|x| x == "APP_MODE"));
-        assert!(!a.iter().any(|x| x.contains("APP_MODE=")), "values only via the environment");
+        assert!(
+            !a.iter().any(|x| x.contains("APP_MODE=")),
+            "values only via the environment"
+        );
         assert_eq!(a.last().unwrap(), "npm run dev");
     }
 
     #[test]
     fn browser_has_no_network_besides_loopback() {
-        let a = browser_args("http://127.0.0.1:3000/", ShotViewport::Mobile, "/o.png", "/p", false);
+        let a = browser_args(
+            "http://127.0.0.1:3000/",
+            ShotViewport::Mobile,
+            "/o.png",
+            "/p",
+            false,
+        );
         assert!(a.iter().any(|x| x == "--proxy-server=http://127.0.0.1:9"));
         assert!(a.iter().any(|x| x == "--window-size=390,844"));
-        assert!(a.iter().any(|x| x.starts_with("--user-agent=") && x.contains("iPhone")));
+        assert!(a
+            .iter()
+            .any(|x| x.starts_with("--user-agent=") && x.contains("iPhone")));
         assert!(!a.iter().any(|x| x == "--no-sandbox"));
         assert_eq!(a.last().unwrap(), "http://127.0.0.1:3000/");
         let d = browser_args("u", ShotViewport::Desktop, "o", "p", true);
-        assert!(d.iter().any(|x| x == "--window-size=1280,800") && d.iter().any(|x| x == "--no-sandbox"));
+        assert!(
+            d.iter().any(|x| x == "--window-size=1280,800")
+                && d.iter().any(|x| x == "--no-sandbox")
+        );
     }
 
     /// The container bridge (run here with the host's node): Unix socket →
@@ -845,7 +894,10 @@ mod tests {
         assert!(ready_probe(&target, port, "/").await);
         let r = request(
             &target,
-            hyper::Request::get("/").header("host", "x").body(Full::new(Bytes::new())).unwrap(),
+            hyper::Request::get("/")
+                .header("host", "x")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
             Duration::from_secs(5),
         )
         .await
@@ -863,7 +915,10 @@ mod tests {
         let mut found: Vec<PathBuf> = std::fs::read_dir(base)
             .expect("Chromium under /opt/pw-browsers (or RUNNER_CHROMIUM)")
             .filter_map(|e| e.ok())
-            .map(|e| e.path().join("chrome-headless-shell-linux64/chrome-headless-shell"))
+            .map(|e| {
+                e.path()
+                    .join("chrome-headless-shell-linux64/chrome-headless-shell")
+            })
             .filter(|p| p.exists())
             .collect();
         found.sort();
@@ -891,7 +946,10 @@ mod tests {
         match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Err(_) => true,
             // A zombie (no reaping init in some containers) is dead too.
-            Ok(s) => s.rsplit(')').next().is_some_and(|r| r.trim_start().starts_with('Z')),
+            Ok(s) => s
+                .rsplit(')')
+                .next()
+                .is_some_and(|r| r.trim_start().starts_with('Z')),
         }
     }
 
@@ -900,7 +958,8 @@ mod tests {
     #[tokio::test]
     async fn timeout_stops_the_whole_process_group() {
         let (_t, cfg, reg, ws) = setup();
-        let mut r = req("sleep 300 & echo $! > child.pid; sleep 300");
+        // The grandchild ignores SIGTERM/SIGINT: only SIGKILL to the group ends it.
+        let mut r = req("(trap '' TERM INT; exec sleep 300) & echo $! > child.pid; sleep 300");
         r.ready_timeout_secs = 2;
         r.keep = true;
         let out = start(cfg.clone(), reg.clone(), &ws, r).await.unwrap();
@@ -921,7 +980,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(ok, "grandchild {pid} survived the timeout");
-        assert!(!preview_dir(&cfg, "q-0123456789ab-preview").exists(), "directory removed");
+        assert!(
+            !preview_dir(&cfg, "q-0123456789ab-preview").exists(),
+            "directory removed"
+        );
     }
 
     /// Ready check, desktop and mobile screenshots (real PNGs from the
@@ -934,17 +996,26 @@ mod tests {
             "<!doctype html><title>x</title><h1 style='color:#c00'>Vorschau</h1>",
         )
         .unwrap();
-        let mut r = req("echo $$ > server.pid; exec python3 -m http.server \"$PORT\" --bind 127.0.0.1");
+        let mut r =
+            req("echo $$ > server.pid; exec python3 -m http.server \"$PORT\" --bind 127.0.0.1");
         r.shots = vec![
-            ShotSpec { path: "/".into(), viewport: ShotViewport::Desktop },
-            ShotSpec { path: "/index.html".into(), viewport: ShotViewport::Mobile },
+            ShotSpec {
+                path: "/".into(),
+                viewport: ShotViewport::Desktop,
+            },
+            ShotSpec {
+                path: "/index.html".into(),
+                viewport: ShotViewport::Mobile,
+            },
         ];
         let out = start(cfg.clone(), reg.clone(), &ws, r).await.unwrap();
         assert!(out.ready, "{:?} {}", out.error, out.log_tail);
         assert_eq!(out.shots.len(), 2);
         for s in &out.shots {
             assert!(s.error.is_none(), "{:?}", s.error);
-            let png = base64::engine::general_purpose::STANDARD.decode(&s.png_b64).unwrap();
+            let png = base64::engine::general_purpose::STANDARD
+                .decode(&s.png_b64)
+                .unwrap();
             assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
             // IHDR width: desktop 1280, mobile 390 × device scale 2.
             let w = u32::from_be_bytes(png[16..20].try_into().unwrap());
@@ -996,19 +1067,50 @@ mod tests {
         assert_eq!(v["url"], "/a/b?x=1");
         assert_eq!(v["method"], "POST");
         let h = v["h"].as_object().unwrap();
-        assert!(!h.contains_key("cookie") && !h.contains_key("authorization"), "{h:?}");
+        assert!(
+            !h.contains_key("cookie") && !h.contains_key("authorization"),
+            "{h:?}"
+        );
         assert!(!h.contains_key("x-forwarded-for"));
         assert_eq!(h["accept"], "text/html");
         let names: Vec<&str> = f.headers.iter().map(|(k, _)| k.as_str()).collect();
-        assert!(!names.contains(&"set-cookie") && !names.contains(&"x-frame-options"), "{names:?}");
+        assert!(
+            !names.contains(&"set-cookie") && !names.contains(&"x-frame-options"),
+            "{names:?}"
+        );
         assert!(!names.contains(&"content-security-policy"));
         assert!(names.contains(&"x-own"));
-        let nf = forward(&reg, "q-0123456789ab-preview", "GET", "/missing", &[], Bytes::new())
-            .await
-            .unwrap();
+        let nf = forward(
+            &reg,
+            "q-0123456789ab-preview",
+            "GET",
+            "/missing",
+            &[],
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(nf.status, 404, "the server's status passes through");
-        assert!(forward(&reg, "q-0123456789ab-preview", "GET", "//evil\r\nx", &[], Bytes::new()).await.is_err());
-        assert!(forward(&reg, "q-0123456789ab-preview", "CONNECT", "/", &[], Bytes::new()).await.is_err());
+        assert!(forward(
+            &reg,
+            "q-0123456789ab-preview",
+            "GET",
+            "//evil\r\nx",
+            &[],
+            Bytes::new()
+        )
+        .await
+        .is_err());
+        assert!(forward(
+            &reg,
+            "q-0123456789ab-preview",
+            "CONNECT",
+            "/",
+            &[],
+            Bytes::new()
+        )
+        .await
+        .is_err());
         // Lifetime 3 s: the reaper stops it.
         let mut gone = false;
         for _ in 0..40 {
@@ -1019,6 +1121,15 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         assert!(gone, "lifetime not enforced");
-        assert!(forward(&reg, "q-0123456789ab-preview", "GET", "/", &[], Bytes::new()).await.is_err());
+        assert!(forward(
+            &reg,
+            "q-0123456789ab-preview",
+            "GET",
+            "/",
+            &[],
+            Bytes::new()
+        )
+        .await
+        .is_err());
     }
 }

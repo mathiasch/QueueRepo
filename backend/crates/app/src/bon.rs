@@ -19,11 +19,12 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use queued_api::{
+    add_money,
     bon::{
         AttemptView, Bon, BonChoice, Comparison, SelectedBy, SelectorAnswer, VerifyState,
         MAX_ATTEMPTS,
     },
-    add_money, ModelTier, PriceCatalog, Residency, StepMode, StepRoute, Target, Usage,
+    ModelTier, PriceCatalog, Residency, StepMode, StepRoute, Target, Usage,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -34,8 +35,7 @@ use crate::{
     llm,
     models::{FailureClass, Project, Task},
     notify::{notify, Note},
-    pricing,
-    queue,
+    pricing, queue,
     routing::{self, Access, Exec, Explicit},
     state::AppState,
 };
@@ -208,6 +208,13 @@ pub fn pick_selector(
 // Creation
 // ---------------------------------------------------------------------------
 
+/// What the user asked for (`POST /api/tasks`).
+pub struct GroupRequest<'a> {
+    pub n: i32,
+    pub targets: &'a [Target],
+    pub auto_select: bool,
+}
+
 /// A validated group request.
 pub struct GroupPlan {
     pub bon: Bon,
@@ -222,11 +229,14 @@ pub async fn plan_group(
     user: Uuid,
     project: &Project,
     base: &Exec,
-    n: i32,
-    targets: &[Target],
-    auto_select: bool,
+    req: GroupRequest<'_>,
     default_provider: &str,
 ) -> anyhow::Result<Result<GroupPlan, String>> {
+    let GroupRequest {
+        n,
+        targets,
+        auto_select,
+    } = req;
     if !(2..=MAX_ATTEMPTS).contains(&n) {
         return Ok(Err(format!(
             "Mehrere Versuche: 2 bis {MAX_ATTEMPTS} (oder 1 für einen normalen Auftrag)"
@@ -250,10 +260,28 @@ pub async fn plan_group(
         provider: base.connector_id.is_none().then(|| base.provider.clone()),
         model: base.model.clone(),
     };
+    // An entry without access means "like the task" (its resolved access),
+    // optionally with an own model.
     let wanted: Vec<Target> = if targets.is_empty() {
         vec![base_target; n as usize]
     } else {
-        targets.to_vec()
+        targets
+            .iter()
+            .map(|t| {
+                if t.connector_id.is_none() && t.provider.as_deref().is_none_or(str::is_empty) {
+                    Target {
+                        model: t
+                            .model
+                            .clone()
+                            .filter(|m| !m.trim().is_empty())
+                            .or(base_target.model.clone()),
+                        ..base_target.clone()
+                    }
+                } else {
+                    t.clone()
+                }
+            })
+            .collect()
     };
     let blocked = crate::worker::Blocked::load(st, user).await?;
     let mut resolved = vec![];
@@ -339,7 +367,11 @@ pub async fn fan_out(st: &AppState, task: &Task) -> anyhow::Result<()> {
         return Ok(());
     };
     let mut bon: Bon = serde_json::from_value(bon_v)?;
-    let now = Utc::now();
+    // The transaction's time: equal to the attempts' `created_at` (`now()`),
+    // which marks the round.
+    let now: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&mut *tx)
+        .await?;
     bon.fanned_out_at = Some(now);
     bon.choice = None;
     bon.aborted = None;
@@ -352,10 +384,7 @@ pub async fn fan_out(st: &AppState, task: &Task) -> anyhow::Result<()> {
             .get((i - 1) as usize)
             .cloned()
             .unwrap_or_default();
-        let provider = t
-            .provider
-            .clone()
-            .unwrap_or_else(|| task.provider.clone());
+        let provider = t.provider.clone().unwrap_or_else(|| task.provider.clone());
         let provider = match t.connector_id {
             Some(c) => match connectors::load_row(st, c).await? {
                 Some(r) => connectors::harness(&r.3, &r.5),
@@ -548,6 +577,14 @@ pub async fn ledger_booked(st: &AppState, group: Uuid, task: Uuid) {
     }
 }
 
+/// The group ended (selection, cancel, failure): its ledger goes.
+fn ledger_forget(st: &AppState, group: Uuid) {
+    st.bon_ledger
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&group);
+}
+
 /// After a run of an attempt: the booked group total (database – covers
 /// several app instances) against the group budget.
 pub async fn check_budget(st: &AppState, task: &Task) -> anyhow::Result<()> {
@@ -707,7 +744,7 @@ pub async fn settle(st: &AppState, group: Uuid) -> anyhow::Result<()> {
         return Ok(());
     }
     let atts = round(st, group).await?;
-    if atts.iter().any(|a| OPEN.contains(&a.status.as_str())) {
+    if atts.is_empty() || atts.iter().any(|a| OPEN.contains(&a.status.as_str())) {
         return Ok(());
     }
     let candidates = atts.iter().filter(|a| a.status == "candidate").count();
@@ -732,6 +769,7 @@ pub async fn settle(st: &AppState, group: Uuid) -> anyhow::Result<()> {
         .await?
         .rows_affected();
         queue::emit_task(st, group).await;
+        ledger_forget(st, group);
         if n > 0 {
             notify(
                 st,
@@ -951,6 +989,11 @@ pub async fn select(
         crate::preview::stop_for_task(st, *id).await;
         crate::runner::merge::cleanup_task(st, *project, *id, true).await;
     }
+    ledger_forget(st, group);
+    if !has_changes {
+        // Nothing to merge: the winner is done, its tree and branch go.
+        crate::runner::merge::cleanup_task(st, w.project_id, w.id, true).await;
+    }
     queue::emit_task(st, w.id).await;
     queue::emit_task(st, group).await;
     st.metrics.bon_selection(by);
@@ -1003,6 +1046,7 @@ pub async fn cancel_group(st: &AppState, group: Uuid) -> anyhow::Result<bool> {
         crate::preview::stop_for_task(st, *id).await;
         crate::runner::merge::cleanup_task(st, *project, *id, true).await;
     }
+    ledger_forget(st, group);
     queue::emit_task(st, group).await;
     st.wake.notify_one();
     Ok(true)
@@ -1119,7 +1163,10 @@ fn cut_chars(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         return s.to_string();
     }
-    format!("{}\n[… diff truncated]", s.chars().take(n).collect::<String>())
+    format!(
+        "{}\n[… diff truncated]",
+        s.chars().take(n).collect::<String>()
+    )
 }
 
 /// Parses the reviewer's answer; only a number from the list counts.
@@ -1246,7 +1293,10 @@ pub async fn auto_select(st: &AppState, group: Uuid) -> anyhow::Result<()> {
             label: format!(
                 "{}{}",
                 a.provider,
-                a.model.as_deref().map(|m| format!(" / {m}")).unwrap_or_default()
+                a.model
+                    .as_deref()
+                    .map(|m| format!(" / {m}"))
+                    .unwrap_or_default()
             ),
             summary: a.summary.clone().unwrap_or_default(),
             verify: verify_state(a, has_verify),
@@ -1290,7 +1340,12 @@ pub async fn auto_select(st: &AppState, group: Uuid) -> anyhow::Result<()> {
         tracing::warn!("selection cost not recorded: {e}");
     }
     let Some(ans) = parse_answer(&resp.text, &numbers) else {
-        return select_failed(st, &g, "die Antwort des Prüfers nannte keinen gültigen Versuch").await;
+        return select_failed(
+            st,
+            &g,
+            "die Antwort des Prüfers nannte keinen gültigen Versuch",
+        )
+        .await;
     };
     let Some(w) = cands.iter().find(|a| a.attempt_no == Some(ans.winner)) else {
         return select_failed(st, &g, "unbekannter Versuch").await;
@@ -1352,8 +1407,9 @@ pub async fn comparison(st: &AppState, g: &Task, viewer: Uuid) -> anyhow::Result
             add_money(&mut total, &m.currency, m.amount);
         }
     }
-    let labels = labels(st, &round(st, g.id).await?).await;
-    for a in round(st, g.id).await? {
+    let atts = round(st, g.id).await?;
+    let labels = labels(st, &atts).await;
+    for a in atts {
         let (files, add, del) = match (a.diff_base(), a.snapshot_after.as_deref()) {
             (Some(x), Some(y)) if x != y && a.branch.is_some() => st
                 .runner(project.id)
@@ -1477,7 +1533,10 @@ mod tests {
             &all,
             cat(),
             Residency::Any,
-            &[Some("claude-sonnet-5-5".into()), Some("claude-sonnet-5-5".into())],
+            &[
+                Some("claude-sonnet-5-5".into()),
+                Some("claude-sonnet-5-5".into()),
+            ],
             None,
         )
         .unwrap();
@@ -1501,7 +1560,7 @@ mod tests {
         );
         // Only the same provider: allowed, said so.
         let (t, why) = pick_selector(
-            &[anth.clone()],
+            std::slice::from_ref(&anth),
             cat(),
             Residency::Any,
             &[Some("claude-haiku-5-5".into())],
@@ -1511,7 +1570,14 @@ mod tests {
         assert_eq!(t.connector_id, anth.connector_id);
         assert!(why.contains("gleicher Anbieter"), "{why}");
         // Unknown executor model ⇒ top tier required.
-        let (t, _) = pick_selector(&[anth.clone()], cat(), Residency::Any, &[None], None).unwrap();
+        let (t, _) = pick_selector(
+            std::slice::from_ref(&anth),
+            cat(),
+            Residency::Any,
+            &[None],
+            None,
+        )
+        .unwrap();
         assert_eq!(
             routing::tier_of(cat(), t.model.as_deref().unwrap()),
             Some(ModelTier::Top)
@@ -1527,7 +1593,7 @@ mod tests {
         .is_err());
         // Residency: a US access is no candidate in an EU project.
         assert!(pick_selector(
-            &[oai.clone()],
+            std::slice::from_ref(&oai),
             cat(),
             Residency::Eu,
             &[Some("claude-sonnet-5-5".into())],
@@ -1535,10 +1601,26 @@ mod tests {
         )
         .is_err());
         // Deterministic.
-        let a = pick_selector(&all, cat(), Residency::Any, &[Some("gpt-6.1-sol".into())], None);
-        let b = pick_selector(&all, cat(), Residency::Any, &[Some("gpt-6.1-sol".into())], None);
+        let a = pick_selector(
+            &all,
+            cat(),
+            Residency::Any,
+            &[Some("gpt-6.1-sol".into())],
+            None,
+        );
+        let b = pick_selector(
+            &all,
+            cat(),
+            Residency::Any,
+            &[Some("gpt-6.1-sol".into())],
+            None,
+        );
         assert_eq!(a, b);
-        assert_eq!(a.unwrap().0.connector_id, anth.connector_id, "GPT executor → Claude reviewer");
+        assert_eq!(
+            a.unwrap().0.connector_id,
+            anth.connector_id,
+            "GPT executor → Claude reviewer"
+        );
     }
 
     #[test]
@@ -1578,9 +1660,12 @@ mod tests {
     #[test]
     fn answer_must_name_a_listed_candidate() {
         assert_eq!(
-            parse_answer("```json\n{\"winner\": 2, \"reason\": \"r\"}\n```", &[1, 2, 3])
-                .unwrap()
-                .winner,
+            parse_answer(
+                "```json\n{\"winner\": 2, \"reason\": \"r\"}\n```",
+                &[1, 2, 3]
+            )
+            .unwrap()
+            .winner,
             2
         );
         assert!(parse_answer("{\"winner\": 7}", &[1, 2]).is_none());

@@ -6,9 +6,13 @@
 # (e.g. add Rust, Go, Java) – the verify command runs in this image too.
 FROM node:22-bookworm-slim
 
+# chromium: WP12 preview screenshots (`exec` into the preview container; the
+# runner passes --headless --no-sandbox – the container is the sandbox).
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git ca-certificates curl wget ripgrep jq unzip zip \
       python3 python3-pip python3-venv build-essential \
+      chromium fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Pinned CLI versions: the stream parsers and their contract tests

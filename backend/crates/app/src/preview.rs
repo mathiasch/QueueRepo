@@ -21,9 +21,7 @@ use axum::{
 };
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
-use queued_api::preview::{
-    PreviewSettings, PreviewStatus, PreviewView, ScreenshotView, Viewport,
-};
+use queued_api::preview::{PreviewSettings, PreviewStatus, PreviewView, ScreenshotView, Viewport};
 use queued_common::{
     preview_request_header_ok, preview_response_header_ok, PreviewStart, ShotSpec, ShotViewport,
     MAX_PREVIEW_REQUEST, MAX_SHOTS,
@@ -63,7 +61,17 @@ pub async fn screenshots_of(st: &AppState, task: Uuid) -> sqlx::Result<Vec<Scree
         .collect())
 }
 
-type SettingsRow = (bool, String, i32, String, i32, i32, bool, Vec<String>, Vec<String>);
+type SettingsRow = (
+    bool,
+    String,
+    i32,
+    String,
+    i32,
+    i32,
+    bool,
+    Vec<String>,
+    Vec<String>,
+);
 
 /// Preview settings of a project (defaults when none are stored).
 pub async fn settings(st: &AppState, project: Uuid) -> sqlx::Result<PreviewSettings> {
@@ -206,7 +214,11 @@ pub async fn current(st: &AppState, task: Uuid) -> sqlx::Result<Option<PreviewVi
 }
 
 /// Starts a live preview of a task. `Err` = German message.
-pub async fn start(st: &AppState, task: &Task, user: Uuid) -> anyhow::Result<Result<PreviewView, String>> {
+pub async fn start(
+    st: &AppState,
+    task: &Task,
+    user: Uuid,
+) -> anyhow::Result<Result<PreviewView, String>> {
     if st.cfg.preview_origin.is_none() {
         return Ok(Err(
             "Live-Vorschau ist auf diesem Server nicht eingerichtet (PREVIEW_ORIGIN fehlt). Screenshots funktionieren trotzdem.".into(),
@@ -214,7 +226,9 @@ pub async fn start(st: &AppState, task: &Task, user: Uuid) -> anyhow::Result<Res
     }
     let s = settings(st, task.project_id).await?;
     if !s.enabled {
-        return Ok(Err("Die Vorschau ist im Projekt nicht eingeschaltet.".into()));
+        return Ok(Err(
+            "Die Vorschau ist im Projekt nicht eingeschaltet.".into()
+        ));
     }
     let cleaned: bool = sqlx::query_scalar("SELECT workspace_cleaned FROM tasks WHERE id=$1")
         .bind(task.id)
@@ -306,7 +320,10 @@ pub async fn start(st: &AppState, task: &Task, user: Uuid) -> anyhow::Result<Res
         "status",
         &match &error {
             None => "Vorschau gestartet".to_string(),
-            Some(e) => format!("Vorschau nicht gestartet: {}", e.lines().next().unwrap_or_default()),
+            Some(e) => format!(
+                "Vorschau nicht gestartet: {}",
+                e.lines().next().unwrap_or_default()
+            ),
         },
     )
     .await;
@@ -348,7 +365,9 @@ pub async fn stop_for_task(st: &AppState, task: Uuid) {
     };
     for (_, project, name) in rows {
         if let Err(e) = st.runner(project).await.preview_stop(&name).await {
-            tracing::info!("preview {name}: stop at the runner failed (its lifetime ends it): {e:#}");
+            tracing::info!(
+                "preview {name}: stop at the runner failed (its lifetime ends it): {e:#}"
+            );
         }
     }
 }
@@ -404,11 +423,22 @@ pub fn png_size(png: &[u8]) -> Option<(u32, u32)> {
 /// task; problems become an event.
 pub async fn screenshots_after_run(st: &AppState, task: &Task, before: &str, after: &str) {
     if let Err(e) = screenshots_inner(st, task, before, after).await {
-        queue::event(st, task, "status", &format!("Screenshots nicht möglich: {e:#}")).await;
+        queue::event(
+            st,
+            task,
+            "status",
+            &format!("Screenshots nicht möglich: {e:#}"),
+        )
+        .await;
     }
 }
 
-async fn screenshots_inner(st: &AppState, task: &Task, before: &str, after: &str) -> anyhow::Result<()> {
+async fn screenshots_inner(
+    st: &AppState,
+    task: &Task,
+    before: &str,
+    after: &str,
+) -> anyhow::Result<()> {
     let s = settings(st, task.project_id).await?;
     if !s.enabled || !s.screenshots || s.screenshot_paths.is_empty() || before == after {
         return Ok(());
@@ -467,7 +497,8 @@ async fn screenshots_inner(st: &AppState, task: &Task, before: &str, after: &str
     if !out.ready {
         anyhow::bail!(
             "{}{}",
-            out.error.unwrap_or_else(|| "Dev-Server nicht bereit".into()),
+            out.error
+                .unwrap_or_else(|| "Dev-Server nicht bereit".into()),
             queued_common::secrets::redact(&tail_lines(&out.log_tail))
         );
     }
@@ -557,8 +588,14 @@ fn secure(o: &PreviewOrigin, mut r: Response) -> Response {
     if let Ok(v) = HeaderValue::from_str(&csp(o)) {
         h.insert(header::CONTENT_SECURITY_POLICY, v);
     }
-    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     h.insert("x-robots-tag", HeaderValue::from_static("noindex"));
     h.remove(header::SET_COOKIE);
@@ -595,7 +632,11 @@ pub async fn layer(State(st): State<AppState>, req: Request, next: Next) -> Resp
     let Some(cap) = o.cap_of(&host) else {
         // Any other host of the preview domain (wrong length, a typo) is
         // never the app either.
-        let bare = host.split(':').next().unwrap_or_default().to_ascii_lowercase();
+        let bare = host
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         if bare.ends_with(&format!(".{}", o.suffix)) {
             return page(&o, StatusCode::NOT_FOUND, "Unbekannte Vorschau.");
         }
@@ -617,7 +658,11 @@ async fn serve(st: &AppState, o: &PreviewOrigin, cap: &str, req: Request) -> Res
         Err(_) => return page(o, StatusCode::SERVICE_UNAVAILABLE, "Vorschau gerade nicht erreichbar."),
     };
     let Some((project, name)) = row else {
-        return page(o, StatusCode::NOT_FOUND, "Diese Vorschau ist beendet oder unbekannt.");
+        return page(
+            o,
+            StatusCode::NOT_FOUND,
+            "Diese Vorschau ist beendet oder unbekannt.",
+        );
     };
     let (parts, body) = req.into_parts();
     let path = parts
@@ -642,12 +687,20 @@ async fn serve(st: &AppState, o: &PreviewOrigin, cap: &str, req: Request) -> Res
         .await;
     let (status, hs, body) = match res {
         Ok(x) => x,
-        Err(_) => return page(o, StatusCode::BAD_GATEWAY, "Der Dev-Server antwortet nicht."),
+        Err(_) => {
+            return page(
+                o,
+                StatusCode::BAD_GATEWAY,
+                "Der Dev-Server antwortet nicht.",
+            )
+        }
     };
-    let mut b = Response::builder()
-        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
+    let mut b =
+        Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
     for (k, v) in hs {
-        if !preview_response_header_ok(&k) || k.eq_ignore_ascii_case(queued_common::PREVIEW_STATUS_HEADER) {
+        if !preview_response_header_ok(&k)
+            || k.eq_ignore_ascii_case(queued_common::PREVIEW_STATUS_HEADER)
+        {
             continue;
         }
         if k.eq_ignore_ascii_case("location") {
@@ -661,7 +714,11 @@ async fn serve(st: &AppState, o: &PreviewOrigin, cap: &str, req: Request) -> Res
     }
     match b.body(Body::from(body)) {
         Ok(r) => secure(o, r),
-        Err(_) => page(o, StatusCode::BAD_GATEWAY, "Ungültige Antwort des Dev-Servers."),
+        Err(_) => page(
+            o,
+            StatusCode::BAD_GATEWAY,
+            "Ungültige Antwort des Dev-Servers.",
+        ),
     }
 }
 
@@ -696,24 +753,50 @@ mod tests {
 
     #[test]
     fn origin_parsing_and_host_matching() {
-        let o = PreviewOrigin::parse("https://*.preview.example.com", "https://queue.example.com").unwrap();
+        let o = PreviewOrigin::parse("https://*.preview.example.com", "https://queue.example.com")
+            .unwrap();
         let cap = "abcdefghijklmnopqrstuvwxyz";
-        assert_eq!(o.cap_of(&format!("{cap}.preview.example.com")), Some(cap.into()));
-        assert_eq!(o.cap_of(&format!("{}.PREVIEW.example.com", cap.to_uppercase())), Some(cap.into()));
+        assert_eq!(
+            o.cap_of(&format!("{cap}.preview.example.com")),
+            Some(cap.into())
+        );
+        assert_eq!(
+            o.cap_of(&format!("{}.PREVIEW.example.com", cap.to_uppercase())),
+            Some(cap.into())
+        );
         assert_eq!(o.cap_of("queue.example.com"), None);
-        assert_eq!(o.cap_of(&format!("{cap}.preview.example.com:8443")), None, "port must match");
+        assert_eq!(
+            o.cap_of(&format!("{cap}.preview.example.com:8443")),
+            None,
+            "port must match"
+        );
         assert_eq!(o.cap_of(&format!("x{cap}.preview.example.com")), None);
-        assert_eq!(o.cap_of("abcdefghijklmnopqrstuvwxy1.preview.example.com"), None, "base32 only");
+        assert_eq!(
+            o.cap_of("abcdefghijklmnopqrstuvwxy1.preview.example.com"),
+            None,
+            "base32 only"
+        );
         assert_eq!(o.url(cap), format!("https://{cap}.preview.example.com/"));
         assert_eq!(o.app_origin, "https://queue.example.com");
         let l = PreviewOrigin::parse("http://*.localhost:18080", "http://localhost:18080").unwrap();
-        assert_eq!(l.cap_of(&format!("{cap}.localhost:18080")), Some(cap.into()));
-        assert_eq!(l.cap_of("localhost:18080"), None, "the app's host is no preview");
+        assert_eq!(
+            l.cap_of(&format!("{cap}.localhost:18080")),
+            Some(cap.into())
+        );
+        assert_eq!(
+            l.cap_of("localhost:18080"),
+            None,
+            "the app's host is no preview"
+        );
         assert!(PreviewOrigin::parse("https://preview.example.com", "https://a.b").is_err());
         assert!(PreviewOrigin::parse("ftp://*.x.y", "https://a.b").is_err());
         assert!(PreviewOrigin::parse("https://*.x.y/path", "https://a.b").is_err());
         assert!(
-            PreviewOrigin::parse("https://*.example.com", &format!("https://{cap}.example.com")).is_err(),
+            PreviewOrigin::parse(
+                "https://*.example.com",
+                &format!("https://{cap}.example.com")
+            )
+            .is_err(),
             "the app must not live on a preview host"
         );
     }
@@ -736,9 +819,15 @@ mod tests {
         png.extend(800u32.to_be_bytes());
         assert_eq!(png_size(&png), Some((1280, 800)));
         assert_eq!(png_size(b"GIF89a"), None);
-        assert_eq!(rewrite_location("http://127.0.0.1:5173/login?x=1"), "/login?x=1");
+        assert_eq!(
+            rewrite_location("http://127.0.0.1:5173/login?x=1"),
+            "/login?x=1"
+        );
         assert_eq!(rewrite_location("http://localhost:3000"), "/");
         assert_eq!(rewrite_location("/rel"), "/rel");
-        assert_eq!(rewrite_location("https://example.com/x"), "https://example.com/x");
+        assert_eq!(
+            rewrite_location("https://example.com/x"),
+            "https://example.com/x"
+        );
     }
 }

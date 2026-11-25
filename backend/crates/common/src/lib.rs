@@ -1014,4 +1014,49 @@ mod tests {
         assert!(!valid_name(""));
         assert!(!valid_name("A"));
     }
+
+    #[test]
+    fn preview_header_filters() {
+        for h in [
+            "Cookie",
+            "authorization",
+            "Proxy-Authorization",
+            "host",
+            "X-Forwarded-For",
+            "x-queue-preview-path",
+            "upgrade",
+            "Sec-WebSocket-Key",
+            "origin",
+            "referer",
+        ] {
+            assert!(
+                !preview_request_header_ok(h),
+                "{h} must not reach the dev server"
+            );
+        }
+        for h in ["accept", "content-type", "user-agent", "if-none-match"] {
+            assert!(preview_request_header_ok(h), "{h}");
+        }
+        for h in [
+            "Set-Cookie",
+            "content-security-policy",
+            "x-frame-options",
+            "strict-transport-security",
+            "clear-site-data",
+            "service-worker-allowed",
+            "access-control-allow-origin",
+            "cross-origin-opener-policy",
+            "x-queue-preview-status",
+            "refresh",
+            "link",
+        ] {
+            assert!(
+                !preview_response_header_ok(h),
+                "{h} must not reach the browser"
+            );
+        }
+        for h in ["content-type", "etag", "location", "cache-control"] {
+            assert!(preview_response_header_ok(h), "{h}");
+        }
+    }
 }

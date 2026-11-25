@@ -97,8 +97,9 @@ fn path_ok(p: &str) -> bool {
     p.starts_with('/')
         && p.len() <= 300
         && !p.contains("//")
-        && p.chars()
-            .all(|c| c.is_ascii_graphic() && c != '\\' && c != '"' && c != '\'' && c != '<' && c != '>')
+        && p.chars().all(|c| {
+            c.is_ascii_graphic() && c != '\\' && c != '"' && c != '\'' && c != '<' && c != '>'
+        })
 }
 
 impl PreviewSettings {
@@ -128,7 +129,9 @@ impl PreviewSettings {
             ));
         }
         if let Some(p) = self.screenshot_paths.iter().find(|p| !path_ok(p)) {
-            return Err(format!("Ungültiger Seitenpfad „{p}“ (muss mit / beginnen)."));
+            return Err(format!(
+                "Ungültiger Seitenpfad „{p}“ (muss mit / beginnen)."
+            ));
         }
         if self.screenshots && self.enabled && self.screenshot_paths.is_empty() {
             return Err("Für Screenshots mindestens eine Seite angeben (z. B. /).".into());

@@ -183,7 +183,10 @@ mod tests {
 
     #[test]
     fn status_labels_are_german_and_selection_aware() {
-        assert_eq!(attempt_status_label("candidate", false), "Erfolgreich – wählbar");
+        assert_eq!(
+            attempt_status_label("candidate", false),
+            "Erfolgreich – wählbar"
+        );
         assert_eq!(attempt_status_label("merging", true), "Gewählt");
         assert_eq!(attempt_status_label("merging", false), "Wird übernommen");
         assert_eq!(attempt_status_label("cancelled", false), "Verworfen");

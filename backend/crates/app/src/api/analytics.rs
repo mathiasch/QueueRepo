@@ -16,8 +16,8 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use queued_api::{
     add_money,
     analytics::{
-        insight_notes, Analytics, DayRow, Durations, Outcomes, PauseRow, ProjectRow, ProviderRow,
-        RunRow, Scope, TaskCostRow, TaskInsights, Tokens, WINDOWS,
+        insight_notes, Analytics, BestOfN, DayRow, Durations, Outcomes, PauseRow, ProjectRow,
+        ProviderRow, RunRow, Scope, TaskCostRow, TaskInsights, Tokens, WINDOWS,
     },
     Money,
 };
@@ -106,10 +106,13 @@ pub async fn compute(
     tz: chrono_tz::Tz,
     days: i32,
 ) -> sqlx::Result<Analytics> {
-    let (tf, uf) = match project {
+    let (tf_any, uf) = match project {
         None => (TASKS_MINE, USAGE_MINE),
         Some(_) => (TASKS_PROJECT, USAGE_PROJECT),
     };
+    // WP12: Best-of-N attempts are not tasks of their own in outcomes,
+    // durations and counts – the group task counts once; costs stay complete.
+    let tf = format!("{tf_any} AND t.kind <> 'attempt'");
     let db = &st.db;
 
     // Outcomes incl. first pass and repairs (recursive over fix chains).
@@ -298,14 +301,15 @@ pub async fn compute(
     // The ten most expensive tasks of the window.
     let sql = format!(
         "WITH top AS (
-             SELECT u.task_id, SUM(u.cost_amount) AS amount,
+             SELECT COALESCE(a.attempt_of, u.task_id) AS task_id, SUM(u.cost_amount) AS amount,
                     SUM(u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_write_tokens)::BIGINT AS tok
-               FROM usage_log u
+               FROM usage_log u JOIN tasks a ON a.id = u.task_id
               WHERE {uf} AND u.ts >= $3 AND u.ts < $4 AND u.task_id IS NOT NULL
               GROUP BY 1 ORDER BY 2 DESC, 3 DESC LIMIT 10)
          SELECT t.id, t.title, p.name, t.status, top.tok, u.currency, SUM(u.cost_amount)::DOUBLE PRECISION
            FROM top JOIN tasks t ON t.id = top.task_id JOIN projects p ON p.id = t.project_id
-           JOIN usage_log u ON u.task_id = top.task_id AND u.ts >= $3 AND u.ts < $4
+           JOIN tasks m ON m.id = top.task_id OR m.attempt_of = top.task_id
+           JOIN usage_log u ON u.task_id = m.id AND u.ts >= $3 AND u.ts < $4
           GROUP BY 1, 2, 3, 4, 5, 6, top.amount
           ORDER BY top.amount DESC, top.tok DESC"
     );
@@ -407,7 +411,35 @@ pub async fn compute(
         None
     };
 
+    // WP12: Best-of-N in the window (groups created in it).
+    let sql = format!(
+        "SELECT COUNT(*) FILTER (WHERE t.attempts > 1 AND t.attempt_of IS NULL),
+                COUNT(*) FILTER (WHERE t.kind = 'attempt'),
+                COUNT(*) FILTER (WHERE t.kind = 'attempt' AND (t.status IN ('candidate','merging','done')
+                                       OR (t.status = 'cancelled' AND t.error ILIKE 'verworfen%'))),
+                COUNT(*) FILTER (WHERE t.attempts > 1 AND t.bon->'choice'->>'by' = 'user'),
+                COUNT(*) FILTER (WHERE t.attempts > 1 AND t.bon->'choice'->>'by' = 'auto'),
+                COUNT(*) FILTER (WHERE t.attempts > 1 AND t.bon->>'aborted' IS NOT NULL)
+           FROM tasks t
+          WHERE {tf_any} AND t.created_at >= $3 AND t.created_at < $4"
+    );
+    let b: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(&sql)
+        .bind(user)
+        .bind(project)
+        .bind(from)
+        .bind(to)
+        .fetch_one(db)
+        .await?;
+    let best_of_n = BestOfN {
+        groups: b.0,
+        attempts: b.1,
+        successful_attempts: b.2,
+        selected_by_user: b.3,
+        selected_auto: b.4,
+        budget_stops: b.5,
+    };
     Ok(Analytics {
+        best_of_n,
         days,
         scope: if project.is_some() {
             Scope::Project

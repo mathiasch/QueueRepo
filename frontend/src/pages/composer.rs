@@ -8,6 +8,7 @@ use uuid::Uuid;
 use wasm_bindgen::JsCast;
 
 use crate::api;
+use crate::logic::bon::{clamp_attempts, estimate_text, targets as bon_targets};
 use crate::logic::costs::{
     connector_label, estimate_summary, fmt_money, mode_label, model_suggestions, parse_access,
     step_label,
@@ -113,6 +114,11 @@ pub fn Composer() -> impl IntoView {
     // WP06: plan first (`None` = the project's default).
     let plan_first = RwSignal::new(None::<bool>);
     let advanced = RwSignal::new(false);
+    // WP12 Best-of-N: number of attempts, access/model per attempt
+    // ("" = like the task), automatic selection.
+    let attempts = RwSignal::new(1i32);
+    let attempt_rows = RwSignal::new(Vec::<(String, String)>::new());
+    let auto_select = RwSignal::new(false);
     let busy = RwSignal::new(false);
     let limits = RwSignal::new(LimitForm::default());
     let limit_errors = RwSignal::new(vec![]);
@@ -224,11 +230,37 @@ pub fn Composer() -> impl IntoView {
         let model = Some(model_committed.get().trim().to_string()).filter(|m| !m.is_empty());
         let seq = est_seq.get_value() + 1;
         est_seq.set_value(seq);
+        // Every attempt explicitly (empty rows: the task's access/model).
+        let n = attempts.get();
+        let rows = attempt_rows.get();
+        let est_attempts = if n > 1 {
+            (0..n as usize)
+                .map(|i| {
+                    let (a, m) = rows.get(i).cloned().unwrap_or_default();
+                    let (c, p) = if a.is_empty() {
+                        (connector_id, provider.clone())
+                    } else {
+                        parse_access(&a)
+                    };
+                    queued_api::Target {
+                        connector_id: c,
+                        provider: p,
+                        model: Some(m.trim().to_string())
+                            .filter(|m| !m.is_empty())
+                            .or(model.clone()),
+                    }
+                })
+                .collect()
+        } else {
+            vec![]
+        };
         let body = EstimateRequest {
             project_id: pid,
             connector_id,
             provider,
             model,
+            attempts: est_attempts,
+            auto_select: n > 1 && auto_select.get(),
         };
         spawn_local(async move {
             let r = api::post::<_, Estimate>("/estimate", &body)
@@ -272,6 +304,13 @@ pub fn Composer() -> impl IntoView {
             allow_test_changes: test_task.get_untracked(),
             plan_mode: plan_first.get_untracked(),
             attachment_ids: attachments.with_untracked(|a| a.iter().map(|x| x.id).collect()),
+            attempts: (attempts.get_untracked() > 1).then(|| attempts.get_untracked()),
+            attempt_targets: if attempts.get_untracked() > 1 {
+                bon_targets(&attempt_rows.get_untracked())
+            } else {
+                vec![]
+            },
+            auto_select: attempts.get_untracked() > 1 && auto_select.get_untracked(),
             limits: lim.create_fields(),
         };
         spawn_local(async move {
@@ -287,6 +326,9 @@ pub fn Composer() -> impl IntoView {
                     tpl_title.set(None);
                     limits.set(LimitForm::default());
                     attachments.set(vec![]);
+                    attempts.set(1);
+                    attempt_rows.set(vec![]);
+                    auto_select.set(false);
                     store.announce(format!("„{}“ eingereiht", first_line(&t.title, 60)));
                     if let Some(el) = textarea.get_untracked() {
                         let _ = el.focus();
@@ -449,6 +491,7 @@ pub fn Composer() -> impl IntoView {
                             </label>
                             <HelpTip topic="Test-Auftrag" text=help::TEST_TASK/>
                         </div>
+                        <BestOfN attempts=attempts rows=attempt_rows auto_select=auto_select legacy=legacy/>
                         <h4 class="row">"Limits dieses Auftrags" <HelpTip topic="Limits" text=help::LIMITS/></h4>
                         <TaskLimitInputs form=limits errors=limit_errors/>
                     </div>
@@ -502,6 +545,86 @@ pub fn Composer() -> impl IntoView {
     }
 }
 
+const HELP_BON: &str = "Mehrere Agenten bearbeiten denselben Auftrag gleichzeitig, jeder für sich. Danach vergleichst du die Ergebnisse und übernimmst das beste. Kostet entsprechend mehr – lohnt sich für wichtige oder unklare Aufträge.";
+
+/// WP12: "Mehrere Versuche" – stepper, access/model per attempt, automatic
+/// selection.
+#[component]
+fn BestOfN(
+    attempts: RwSignal<i32>,
+    rows: RwSignal<Vec<(String, String)>>,
+    auto_select: RwSignal<bool>,
+    legacy: Memo<Vec<String>>,
+) -> impl IntoView {
+    let store = use_store();
+    let set_n = move |n: i32| {
+        let n = clamp_attempts(n);
+        attempts.set(n);
+        rows.update(|r| r.resize(n as usize, (String::new(), String::new())));
+    };
+    let serial = Memo::new(move |_| {
+        store
+            .settings
+            .with(|s| s.as_ref().is_some_and(|s| s.parallelism < 2))
+    });
+    let count_id = uid("bon-count");
+    view! {
+        <fieldset class="form-section bon" data-testid="best-of-n">
+            <legend class="row">"Mehrere Versuche" <HelpTip topic="Mehrere Versuche" text=HELP_BON align="align-start"/></legend>
+            <div class="row stepper">
+                <button type="button" class="btn icon-only" aria-label="Weniger Versuche" disabled=move || { attempts.get() <= 1 } on:click=move |_| set_n(attempts.get_untracked() - 1)>
+                    <span aria-hidden="true">"−"</span>
+                </button>
+                <output id=count_id class="stepper-value" aria-live="polite" data-testid="bon-count">
+                    {move || match attempts.get() { 1 => "1 Versuch".to_string(), n => format!("{n} Versuche") }}
+                </output>
+                <button type="button" class="btn icon-only" aria-label="Mehr Versuche" disabled=move || { attempts.get() >= queued_api::bon::MAX_ATTEMPTS } on:click=move |_| set_n(attempts.get_untracked() + 1)>
+                    <span aria-hidden="true">"+"</span>
+                </button>
+            </div>
+            {move || (attempts.get() > 1).then(|| view! {
+                <p class="small muted">"Jeder Versuch läuft in einem eigenen, abgeschotteten Arbeitsbereich. Leer = wie der Auftrag."</p>
+                {move || serial.get().then(|| view! { <p class="small tone-warning-text" role="note">"Deine Parallelität ist 1 – die Versuche laufen nacheinander (Einstellungen → Parallelität)."</p> })}
+                <div class="stack bon-rows">
+                    {move || (0..attempts.get() as usize).map(|i| {
+                        let sel_id = uid("bon-access");
+                        let model_id = uid("bon-model");
+                        let get = move || rows.with(|r| r.get(i).cloned().unwrap_or_default());
+                        view! {
+                            <div class="grid-2 bon-row" data-testid=format!("bon-row-{}", i + 1)>
+                                <div class="field">
+                                    <label class="label" for=sel_id.clone()>{format!("Versuch {} – Zugang", i + 1)}</label>
+                                    <select id=sel_id class="select" prop:value=move || get().0 on:change=move |ev| {
+                                        let v = event_target_value(&ev);
+                                        rows.update(|r| if let Some(x) = r.get_mut(i) { x.0 = v });
+                                    }>
+                                        <option value="">"Wie der Auftrag"</option>
+                                        {move || legacy.get().into_iter().map(|p| view! { <option value=format!("p:{p}")>{provider_label(&p)}</option> }).collect_view()}
+                                        {move || store.connectors.get().into_iter().map(|c| view! { <option value=format!("c:{}", c.id)>{connector_label(&c)}</option> }).collect_view()}
+                                    </select>
+                                </div>
+                                <div class="field">
+                                    <label class="label" for=model_id.clone()>{format!("Versuch {} – Modell", i + 1)}</label>
+                                    <input id=model_id class="input" placeholder="wie der Auftrag" autocomplete="off"
+                                        prop:value=move || get().1
+                                        on:change=move |ev| {
+                                            let v = event_target_value(&ev);
+                                            rows.update(|r| if let Some(x) = r.get_mut(i) { x.1 = v });
+                                        }/>
+                                </div>
+                            </div>
+                        }
+                    }).collect_view()}
+                </div>
+                <label class="check">
+                    <input type="checkbox" data-testid="bon-auto" prop:checked=move || auto_select.get() on:change=move |ev| auto_select.set(event_target_checked(&ev))/>
+                    <span class="check-text">"Besten Versuch automatisch wählen"<small>"Ein Prüf-Agent – nie schwächer als die Versuche, möglichst von einem anderen Anbieter – vergleicht die Ergebnisse und übernimmt den besten."</small></span>
+                </label>
+            })}
+        </fieldset>
+    }
+}
+
 /// Cost estimate before submitting, with the steps on request.
 #[component]
 fn EstimateLine(
@@ -515,7 +638,7 @@ fn EstimateLine(
                 None => view! { <span class="small muted">"Kosten werden geschätzt …"</span> }.into_any(),
                 Some(Err(e)) => view! { <span class="small tone-warning-text" role="note">{format!("Keine Schätzung: {e}")}</span> }.into_any(),
                 Some(Ok(e)) => {
-                    let summary = estimate_summary(&e);
+                    let summary = estimate_text(&e).unwrap_or_else(|| estimate_summary(&e));
                     let loc = e.location.clone();
                     let steps = e.steps.clone();
                     let notes = e.notes.clone();

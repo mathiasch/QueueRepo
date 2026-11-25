@@ -230,6 +230,8 @@ pub fn ProjectPage() -> impl IntoView {
                             Tab::Tasks => view! { <ProjectTasks id=pid/> }.into_any(),
                             Tab::Settings => view! {
                                 <ProjectRouting p=p.clone() on_saved=Callback::new(move |_| reload())/>
+                                <super::bon::RoutingRulesCard p=p.clone() on_saved=Callback::new(move |_| reload())/>
+                                <super::bon::ProjectPreviewCard p=p.clone()/>
                                 <ProjectSettings p=p on_saved=Callback::new(move |_| reload())/>
                             }.into_any(),
                             Tab::Delivery => view! { <super::delivery::ProjectDelivery p=p/> }.into_any(),
@@ -568,7 +570,11 @@ fn ProjectRouting(p: ProjectView, on_saved: Callback<()>) -> impl IntoView {
                             <div class="preset-grid">
                                 {list.into_iter().map(|pr| {
                                     let active = Memo::new({ let pid = pr.id.clone(); move |_| current.with(|c| c.as_ref().and_then(|r| r.preset.clone()) == Some(pid.clone())) });
-                                    let routing = pr.routing.clone();
+                                    // WP12: rules stay when another preset is applied.
+                                    let routing = pr.routing.clone().map(|mut r| {
+                                        r.rules = current.with_untracked(|c| c.as_ref().map(|c| c.rules.clone()).unwrap_or_default());
+                                        r
+                                    });
                                     let res = if pr.residency == Residency::Any { None } else { Some(pr.residency) };
                                     let available = pr.available;
                                     view! {

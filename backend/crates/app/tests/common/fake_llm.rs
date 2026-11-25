@@ -34,6 +34,8 @@ pub struct FakeState {
     /// While set, batches never end.
     pub hold: AtomicBool,
     pub review_approved: AtomicBool,
+    /// WP12: selection requests answered.
+    pub selections: AtomicUsize,
     /// Statuses returned (in order) for the next model calls/submissions.
     pub fail_next: Mutex<Vec<u16>>,
     polls: Mutex<HashMap<String, usize>>,
@@ -66,6 +68,7 @@ pub async fn start_fake() -> Fake {
         polls_until_done: AtomicUsize::new(1),
         hold: AtomicBool::new(false),
         review_approved: AtomicBool::new(true),
+        selections: AtomicUsize::new(0),
         fail_next: Mutex::new(vec![]),
         polls: Mutex::new(HashMap::new()),
         batches: Mutex::new(HashMap::new()),
@@ -96,6 +99,21 @@ pub fn answer(s: &FakeState, text: &str) -> String {
             {"index": first + 1, "verdict": "keep", "reason": "fine"}
         ]})
         .to_string()
+    } else if text.contains("senior reviewer of an autonomous coding queue") {
+        // WP12 selection: the highest-numbered candidate of the list.
+        let n = text
+            .split("candidate ")
+            .skip(1)
+            .filter_map(|r| {
+                r.split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .and_then(|d| d.parse::<i64>().ok())
+            })
+            .max()
+            .unwrap_or(1);
+        s.selections.fetch_add(1, Ordering::SeqCst);
+        json!({"winner": n, "reason": format!("Fake reviewer: candidate {n} is the cleanest")})
+            .to_string()
     } else if text.contains("strict code reviewer") {
         if s.review_approved.load(Ordering::SeqCst) {
             r#"Sure: {"approved": true, "issues": []}"#.into()
