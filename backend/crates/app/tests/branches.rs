@@ -623,8 +623,18 @@ async fn concurrent_claims_respect_project_parallelism(pool: PgPool) {
             );
         }
         if round == 0 {
-            // 1 + 2 + (3 - 1 merging) = 5 claimed in the first round.
-            assert_eq!(ids.len(), 5, "{counts:?}");
+            // 1 + 2 + (3 - 1 merging) = 5 slots. A claimer that finds every
+            // free project locked by another claimer returns `None`
+            // (`SKIP LOCKED`, by design: the next tick claims it) – so the
+            // first concurrent round may leave a slot; one claimer at a
+            // time fills exactly the rest, never more.
+            assert!(ids.len() <= 5, "{counts:?}");
+            let mut filled = ids.len();
+            while let Some(t) = claim_next(&pool, user, &Blocked::default()).await.unwrap() {
+                assert!(!ids.contains(&t.id));
+                filled += 1;
+            }
+            assert_eq!(filled, 5, "{:?}", running_per_project(&pool).await);
         } else {
             assert!(ids.is_empty(), "everything is full: {ids:?}");
         }

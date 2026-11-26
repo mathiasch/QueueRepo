@@ -651,7 +651,7 @@ pub fn ProjectPreviewCard(p: queued_api::ProjectView) -> impl IntoView {
                     </div>
                     {move || error.get().map(|e| view! { <p class="alert tone-danger" role="alert">{e}</p> })}
                     {can_edit.then(|| view! {
-                        <button class="btn primary" type="button" data-testid="pv-save" disabled=move || busy.get() on:click=save>"Speichern"</button>
+                        <button class="btn primary" type="button" data-testid="pv-save" disabled=move || busy.get() on:click=save>"Vorschau-Einstellungen sichern"</button>
                     })}
                 </fieldset>
             })}

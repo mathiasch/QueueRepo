@@ -37,6 +37,7 @@ Gegenstand: kompletter WP12-Diff (Migration 0015, `queued-api`, `queued-common`,
 | B3 | **Stepper nicht bedienbar:** `disabled=move || n >= MAX` im `view!`-Makro – `>` beendete das Attribut, der Knopf war dauerhaft deaktiviert, Code-Text landete im DOM. | E2E (rot) | Ausdrücke in `{ … }` | E2E Desktop/iPhone grün |
 | B4 | **Gruppe bearbeitbar:** Zugang/Modell einer wartenden Gruppe ließ sich per PATCH ändern, die Versuche hätten aber weiter die bei der Anlage geprüften Zugänge genutzt. | Selbst-Review | PATCH von Zugang/Modell einer Gruppe abgelehnt (400 mit Erklärung) | Code; kein eigener Test (Gruppe ist nur Sekundenbruchteile `queued`) – siehe N8 |
 | B5 | **Gewinner ohne Änderungen** wurde `done`, sein Arbeitsbaum und Branch blieben liegen. | Selbst-Review | `cleanup_task` für diesen Fall | Code |
+| B7 | **Zweiter „Speichern“-Knopf in den Projekt-Einstellungen:** Die neue Vorschau-Karte stand vor dem Projektformular und hieß ebenfalls „Speichern“ – für Menschen missverständlich, für 5 bestehende E2E-Tests mehrdeutig (`.first()` traf die falsche Karte). | erster voller Playwright-Lauf (5 rot) | Karte ans Ende der Einstellungen, Knopf „Vorschau-Einstellungen sichern“; bestehende Tests unverändert | betroffene Specs grün, volle Läufe |
 | B6 | **WP10-Test tageszeitabhängig rot** (`daily_summary_is_sent_once_…`, auch auf `5241d25`): `notify::tick` startet die Tageszusammenfassung mit der echten Uhr. | erster voller Lauf | Test belegt die echten Tage vorab; Produktcode unverändert | Test grün zu jeder Tageszeit |
 
 ## Nicht blockierende Funde (offen, bewusst)
@@ -58,7 +59,9 @@ Gegenstand: kompletter WP12-Diff (Migration 0015, `queued-api`, `queued-common`,
 
 ## Mutative Gegenprobe
 
-Je eine gezielte Verschlechterung, Test muss rot werden, danach zurückgesetzt (`git status` sauber geprüft):
+Je eine gezielte Verschlechterung, Test muss rot werden, danach zurückgesetzt (`git status` sauber geprüft).
+
+Fund in der eigenen Werkzeugkette: Das Zurücksetzen per Kopie gab der Datei eine **ältere** Änderungszeit als dem mutierten Build – Cargo hielt den Mutanten für aktuell. So lief `queued-common` nach M5 kurz mit durchgelassenen Cookies weiter; der erste volle Lauf fiel genau daran rot aus (`live_preview_…`). Behoben durch `touch` nach jedem Zurücksetzen und einen Neubau aller Quellen vor den Abnahmeläufen. Die Rot-Ergebnisse der Mutationen selbst sind davon unberührt (der Mutant war jeweils neuer als der Build).
 
 | # | Mutation | Test | Ergebnis |
 |---|---|---|---|
