@@ -91,6 +91,7 @@ pub fn SettingsPage() -> impl IntoView {
             <super::providers::CostsCard/>
             <super::providers::PricesCard/>
             <super::providers::EvalCard/>
+            <super::chooser::ChooserPrefsCard/>
             <super::providers::CliStatusCard/>
             <Appearance/>
             <Account/>

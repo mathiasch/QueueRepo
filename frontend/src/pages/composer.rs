@@ -111,6 +111,7 @@ pub fn Composer() -> impl IntoView {
     let parent = RwSignal::new(String::new());
     let front = RwSignal::new(false);
     let test_task = RwSignal::new(false);
+    let urgent = RwSignal::new(false);
     // WP06: plan first (`None` = the project's default).
     let plan_first = RwSignal::new(None::<bool>);
     let advanced = RwSignal::new(false);
@@ -311,6 +312,7 @@ pub fn Composer() -> impl IntoView {
                 vec![]
             },
             auto_select: attempts.get_untracked() > 1 && auto_select.get_untracked(),
+            urgent: urgent.get_untracked(),
             limits: lim.create_fields(),
         };
         spawn_local(async move {
@@ -322,6 +324,7 @@ pub fn Composer() -> impl IntoView {
                     parent.set(String::new());
                     front.set(false);
                     test_task.set(false);
+                    urgent.set(false);
                     plan_first.set(None);
                     tpl_title.set(None);
                     limits.set(LimitForm::default());
@@ -491,7 +494,13 @@ pub fn Composer() -> impl IntoView {
                             </label>
                             <HelpTip topic="Test-Auftrag" text=help::TEST_TASK/>
                         </div>
-                        <BestOfN attempts=attempts rows=attempt_rows auto_select=auto_select legacy=legacy/>
+                        <div class="row">
+                            <label class="check">
+                                <input type="checkbox" data-testid="urgent" prop:checked=move || urgent.get() on:change=move |ev| urgent.set(event_target_checked(&ev))/>
+                                <span class="check-text">"Eilig"<small>"Die automatische Modellwahl verzichtet auf günstigere, aber langsamere Tarife (Batch, Flex)."</small></span>
+                            </label>
+                        </div>
+                        <BestOfN attempts=attempts rows=attempt_rows auto_select=auto_select legacy=legacy project=project_id prompt=prompt/>
                         <h4 class="row">"Limits dieses Auftrags" <HelpTip topic="Limits" text=help::LIMITS/></h4>
                         <TaskLimitInputs form=limits errors=limit_errors/>
                     </div>
@@ -555,8 +564,50 @@ fn BestOfN(
     rows: RwSignal<Vec<(String, String)>>,
     auto_select: RwSignal<bool>,
     legacy: Memo<Vec<String>>,
+    project: Memo<Option<Uuid>>,
+    prompt: RwSignal<String>,
 ) -> impl IntoView {
     let store = use_store();
+    let suggesting = RwSignal::new(false);
+    // WP15: the model chooser proposes the models of the attempts.
+    let suggest = move |_| {
+        let Some(pid) = project.get_untracked() else {
+            return;
+        };
+        let n = attempts.get_untracked().max(2);
+        let text: String = prompt.get_untracked().chars().take(2000).collect();
+        suggesting.set(true);
+        spawn_local(async move {
+            let q = format!(
+                "/projects/{pid}/chooser/suggest?attempts={n}&prompt={}",
+                api::enc(&text)
+            );
+            match api::get::<queued_api::chooser::AttemptSuggestion>(&q).await {
+                Ok(s) if !s.targets.is_empty() => {
+                    let mut r: Vec<(String, String)> = s
+                        .targets
+                        .iter()
+                        .map(|t| {
+                            let access = match (t.connector_id, &t.provider) {
+                                (Some(c), _) => format!("c:{c}"),
+                                (None, Some(p)) => format!("p:{p}"),
+                                _ => String::new(),
+                            };
+                            (access, t.model.clone().unwrap_or_default())
+                        })
+                        .collect();
+                    r.resize(n as usize, (String::new(), String::new()));
+                    attempts.set(n);
+                    rows.set(r);
+                    store.announce(&s.reason);
+                }
+                Ok(_) => store
+                    .toast_error_text("Kein Vorschlag", "Unter deinen Zugängen passt kein Modell"),
+                Err(e) => store.toast_error("Kein Vorschlag", &e),
+            }
+            suggesting.set(false);
+        });
+    };
     let set_n = move |n: i32| {
         let n = clamp_attempts(n);
         attempts.set(n);
@@ -584,6 +635,9 @@ fn BestOfN(
             </div>
             {move || (attempts.get() > 1).then(|| view! {
                 <p class="small muted">"Jeder Versuch läuft in einem eigenen, abgeschotteten Arbeitsbereich. Leer = wie der Auftrag."</p>
+                <button type="button" class="btn sm" data-testid="bon-suggest" disabled=move || suggesting.get() on:click=suggest>
+                    <Icon icon=Ic::Sparkles class="sm"/>"Modelle vorschlagen lassen"
+                </button>
                 {move || serial.get().then(|| view! { <p class="small tone-warning-text" role="note">"Deine Parallelität ist 1 – die Versuche laufen nacheinander (Einstellungen → Parallelität)."</p> })}
                 <div class="stack bon-rows">
                     {move || (0..attempts.get() as usize).map(|i| {

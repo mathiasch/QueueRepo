@@ -5,6 +5,7 @@ pub mod b64;
 pub mod bon;
 pub mod branch;
 pub mod budget;
+pub mod chooser;
 pub mod comments;
 pub mod costs;
 pub mod diff;

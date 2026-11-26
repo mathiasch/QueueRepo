@@ -100,12 +100,7 @@ fn new_seed(st: &AppState) -> u64 {
 
 /// The chooser's decision for a new task (`None` = chooser off in the
 /// project). Never fails: errors and timeouts become a fallback report.
-pub async fn choose(
-    st: &AppState,
-    user: Uuid,
-    project: &Project,
-    ask: &Ask,
-) -> Option<Choice> {
+pub async fn choose(st: &AppState, user: Uuid, project: &Project, ask: &Ask) -> Option<Choice> {
     let settings = match store::settings(st, project.id).await {
         Ok(s) => s,
         Err(e) => {
@@ -179,7 +174,6 @@ async fn choose_inner(
 ) -> anyhow::Result<Choice> {
     let cands = candidates(st, user, project.id).await?;
     let prefs = store::prefs(st, user).await?;
-    let residency = project.residency();
     let mut classify_cost: Option<(StepCost, Uuid)> = None;
     if settings.classify && ask.facts.kind != "onempty" {
         match classify_call(st, user, project, ask, &cands, settings, &prefs).await {
@@ -201,38 +195,22 @@ async fn choose_inner(
                 "Einordnung per Modell nicht möglich (kein günstiger Zugang) – nur Heuristik"
                     .into(),
             ),
-            Err(why) => feats
-                .signals
-                .push(format!("Einordnung per Modell fehlgeschlagen ({why}) – nur Heuristik")),
+            Err(why) => feats.signals.push(format!(
+                "Einordnung per Modell fehlgeschlagen ({why}) – nur Heuristik"
+            )),
         }
     }
-    let stats = store::stats(
-        st,
-        user,
-        &[feats.category.as_str(), "analysis"],
-        &queued_api::chooser::CHOOSER_STEPS,
-    )
-    .await?;
-    let history = store::history(st, user).await?;
-    let spent = store::explore_spent(st, project.id).await?;
-    let user_settings = crate::queue::load_settings(st, user).await?;
-    let cat = pricing::current(st).await;
-    let input = decide::Input {
-        features: &feats,
-        kind: &ask.facts.kind,
+    let data = Data::load(st, user, project.id, &feats.category).await?;
+    let input = data.input(
+        &feats,
+        &ask.facts.kind,
         cands,
-        residency,
-        project_blocked: settings.blocked_models.clone(),
-        user_blocked: prefs.blocked_models.clone(),
-        cost_limit: ask.cost_limit.or(project.max_cost_usd),
-        quality: settings.quality,
-        explore_left: (settings.explore_budget_usd - spent).max(0.0),
-        max_fix: u32::try_from(user_settings.max_fix_attempts.max(0)).unwrap_or(0),
-        history,
-        stats: &stats,
-        catalog: &cat,
-        seed: new_seed(st),
-    };
+        project,
+        settings,
+        &prefs,
+        ask.cost_limit,
+        new_seed(st),
+    );
     let out = decide::decide(&input);
     let mut report = out.report;
     if let Some((c, connector)) = classify_cost {
@@ -251,6 +229,97 @@ async fn choose_inner(
     })
 }
 
+/// Learning data and settings a decision needs (loaded once).
+pub struct Data {
+    pub stats: decide::Stats,
+    pub history: std::collections::HashMap<String, crate::estimate::Profile>,
+    pub spent: f64,
+    pub max_fix: u32,
+    pub cat: std::sync::Arc<queued_api::PriceCatalog>,
+}
+
+impl Data {
+    pub async fn load(
+        st: &AppState,
+        user: Uuid,
+        project: Uuid,
+        category: &str,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            stats: store::stats(
+                st,
+                user,
+                &[category, "analysis"],
+                &queued_api::chooser::CHOOSER_STEPS,
+            )
+            .await?,
+            history: store::history(st, user).await?,
+            spent: store::explore_spent(st, project).await?,
+            max_fix: u32::try_from(
+                crate::queue::load_settings(st, user)
+                    .await?
+                    .max_fix_attempts
+                    .max(0),
+            )
+            .unwrap_or(0),
+            cat: pricing::current(st).await,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn input<'a>(
+        &'a self,
+        feats: &'a TaskFeatures,
+        kind: &'a str,
+        cands: Vec<decide::Cand>,
+        project: &Project,
+        settings: &queued_api::chooser::ChooserSettings,
+        prefs: &queued_api::chooser::ChooserPrefs,
+        cost_limit: Option<f64>,
+        seed: u64,
+    ) -> decide::Input<'a> {
+        decide::Input {
+            features: feats,
+            kind,
+            cands,
+            residency: project.residency(),
+            project_blocked: settings.blocked_models.clone(),
+            user_blocked: prefs.blocked_models.clone(),
+            cost_limit: cost_limit.or(project.max_cost_usd),
+            quality: settings.quality,
+            explore_left: (settings.explore_budget_usd - self.spent).max(0.0),
+            max_fix: self.max_fix,
+            history: self.history.clone(),
+            stats: &self.stats,
+            catalog: &self.cat,
+            seed,
+        }
+    }
+}
+
+/// Best-of-N: the `n` best allowed agent loops for a task (distinct models,
+/// alternating providers). Works with the chooser off as well (it is a
+/// suggestion a human applies).
+pub async fn suggest(
+    st: &AppState,
+    user: Uuid,
+    project: &Project,
+    ask: &Ask,
+    n: usize,
+) -> anyhow::Result<Vec<queued_api::chooser::CandidateView>> {
+    let settings = store::settings(st, project.id).await?;
+    let prefs = store::prefs(st, user).await?;
+    let feats = features_of(st, project, ask).await;
+    let cands = candidates(st, user, project.id).await?;
+    let data = Data::load(st, user, project.id, &feats.category).await?;
+    // No exploration in suggestions: only trusted, greedy choices.
+    let input = decide::Input {
+        explore_left: 0.0,
+        ..data.input(&feats, "task", cands, project, &settings, &prefs, None, 0)
+    };
+    Ok(decide::suggest(&input, n))
+}
+
 /// The cheapest single-shot model allowed for the classification (tier
 /// `cheap`, residency, not paused, not blocked).
 pub fn classify_target<'a>(
@@ -266,9 +335,9 @@ pub fn classify_target<'a>(
                 && c.price.tier == ModelTier::Cheap
                 && residency.allows(c.access.location)
                 && !c.paused
-                && !blocked.iter().any(|b| {
-                    pricing::normalize_model(b) == pricing::normalize_model(&c.model)
-                })
+                && !blocked
+                    .iter()
+                    .any(|b| pricing::normalize_model(b) == pricing::normalize_model(&c.model))
         })
         .min_by(|a, b| a.price.input.total_cmp(&b.price.input))
 }
@@ -433,7 +502,10 @@ pub fn fix_decision(failed: &Task, root: &Task, ask: &Ask) -> Option<RoutingDeci
     rep.chosen.as_ref()?;
     let level = usize::try_from(failed.escalation_level.max(0)).ok()?;
     let next = rep.chain.get(level)?;
-    let from = failed.model.clone().unwrap_or_else(|| "Standardmodell".into());
+    let from = failed
+        .model
+        .clone()
+        .unwrap_or_else(|| "Standardmodell".into());
     Some(RoutingDecision {
         step: "execute".into(),
         source: queued_api::DecisionSource::Escalation,
@@ -545,7 +617,10 @@ pub async fn review_pick(
 }
 
 /// Tier and family of a model name (catalog), if known.
-pub fn tier_family(cat: &queued_api::PriceCatalog, model: Option<&str>) -> Option<(ModelTier, String)> {
+pub fn tier_family(
+    cat: &queued_api::PriceCatalog,
+    model: Option<&str>,
+) -> Option<(ModelTier, String)> {
     let e = pricing::find(cat, model?, chrono::Utc::now())?;
     Some((e.tier, e.family.clone()))
 }

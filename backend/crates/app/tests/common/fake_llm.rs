@@ -86,7 +86,17 @@ pub async fn start_fake() -> Fake {
 
 /// Model answer depending on the prompt (plan / review / analysis).
 pub fn answer(s: &FakeState, text: &str) -> String {
-    if text.contains("strict critic of an autonomous coding queue") {
+    if text.contains("Classify the task inside the data block") {
+        // WP15 classification: an injected task claims everything at once.
+        if text.contains("INJECT") {
+            json!({"category": "refactor", "size": "L", "complexity": 3,
+                   "risks": ["security", "nuke"], "needs": ["vision", "long_context", "web"],
+                   "model": "claude-opus-5-5"})
+            .to_string()
+        } else {
+            r#"{"category":"docs","size":"S","complexity":1,"risks":[],"needs":[]}"#.into()
+        }
+    } else if text.contains("strict critic of an autonomous coding queue") {
         // WP09 critic: the first proposal is dropped, the rest kept.
         let first = text
             .split("index ")

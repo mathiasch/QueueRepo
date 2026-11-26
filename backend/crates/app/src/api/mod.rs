@@ -2,6 +2,7 @@ pub(crate) mod account;
 pub(crate) mod admin;
 mod analytics;
 mod attachments;
+mod chooser;
 mod credentials;
 mod environment;
 mod evals;
@@ -159,6 +160,24 @@ pub fn router(st: AppState) -> Router {
         .route("/cli-status", get(providers::cli_status))
         .route("/projects/{id}/presets", get(providers::presets))
         .route("/projects/{id}/routing", put(providers::put_routing))
+        .route(
+            "/projects/{id}/chooser",
+            get(chooser::get_project).put(chooser::put_project),
+        )
+        .route("/projects/{id}/chooser/suggest", get(chooser::suggest))
+        .route(
+            "/chooser/prefs",
+            get(chooser::get_prefs).put(chooser::put_prefs),
+        )
+        .route(
+            "/tasks/{id}/feedback",
+            get(chooser::get_feedback).post(chooser::post_feedback),
+        )
+        .route(
+            "/admin/chooser",
+            get(chooser::admin_view).put(chooser::admin_put),
+        )
+        .route("/admin/chooser/replay", post(chooser::admin_replay))
         .route("/evals/cases", get(evals::cases))
         .route("/evals", get(evals::list).post(evals::start))
         .route("/evals/{id}", get(evals::get).delete(evals::remove))

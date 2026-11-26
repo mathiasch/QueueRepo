@@ -4,6 +4,7 @@ pub mod attachments;
 pub mod automation;
 pub mod bon;
 pub mod branch;
+pub mod chooser;
 pub mod composer;
 pub mod delivery;
 pub mod drawer;

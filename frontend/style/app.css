@@ -937,3 +937,20 @@ ol.rules { margin: 0 0 var(--sp-3); padding-left: var(--sp-5); display: flex; fl
   .attempt-grid { grid-template-columns: 1fr; }
   .preview-frame { height: 60vh; }
 }
+
+/* WP15: model chooser */
+.chooser-report { display: flex; flex-direction: column; gap: var(--sp-3); margin-top: var(--sp-3); }
+.chooser-head { font-size: var(--fs-sm); line-height: 1.45; overflow-wrap: anywhere; }
+.chips-row { display: flex; flex-wrap: wrap; gap: 6px; list-style: none; margin: 0; padding: 0; }
+.chooser-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: var(--sp-2); margin: 0; }
+.chooser-facts > div { padding: var(--sp-2) var(--sp-3); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-2); min-width: 0; }
+.chooser-facts dt { font-size: var(--fs-xs); color: var(--text-muted); font-weight: 650; }
+.chooser-facts dd { margin: 2px 0 0; font-weight: 700; overflow-wrap: anywhere; }
+.chooser-reasons { margin: 4px 0 0; padding-left: 1.2em; display: flex; flex-direction: column; gap: 4px; overflow-wrap: anywhere; }
+.chooser .feedback { margin-top: var(--sp-3); gap: var(--sp-2); }
+.chooser .feedback .btn { min-height: var(--touch); }
+.chooser .feedback .btn[aria-pressed="true"] { background: var(--primary-soft); color: var(--primary-text); border-color: var(--primary); }
+.chooser tr.muted td, .chooser tr.muted th { color: var(--text-muted); }
+.chooser td .btn { min-height: var(--touch); }
+.range { width: 100%; min-height: var(--touch); accent-color: var(--primary); font-size: 16px; }
+.chooser-report .chip { white-space: normal; }

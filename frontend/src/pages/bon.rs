@@ -10,8 +10,7 @@ use uuid::Uuid;
 
 use crate::api;
 use crate::logic::bon::{
-    changes_label, comparison_status, cost_label, decision_text, review_label, secs_label,
-    verify_label,
+    changes_label, comparison_status, cost_label, review_label, secs_label, verify_label,
 };
 use crate::logic::format::fmt_time;
 use crate::nav::use_open_task;
@@ -190,19 +189,6 @@ pub fn AttemptOf(t: Task) -> impl IntoView {
                         <Icon icon=Ic::Layers class="sm"/>"Zum Vergleich"
                     </button>
                 </p>
-            </section>
-        }
-    })
-}
-
-/// "Warum dieses Modell?"
-#[component]
-pub fn DecisionLine(t: Task) -> impl IntoView {
-    t.routing_decision_parsed().map(|d| {
-        view! {
-            <section class="block" data-testid="routing-decision">
-                <h3 class="row"><Icon icon=Ic::Route class="sm"/>"Warum dieses Modell?"</h3>
-                <p class="box small">{decision_text(&d)}</p>
             </section>
         }
     })

@@ -710,7 +710,9 @@ pub async fn resolve_execute(
                     // in between): the router's decision, with the reason.
                     let mut report = choice.report.clone();
                     report.fallback = Some(format!("Gewählter Zugang nicht nutzbar: {why}"));
-                    report.reasons.push(format!("Gewählter Zugang nicht nutzbar: {why}"));
+                    report
+                        .reasons
+                        .push(format!("Gewählter Zugang nicht nutzbar: {why}"));
                     let fb = crate::chooser::decision_of(
                         decision,
                         &crate::chooser::Choice {

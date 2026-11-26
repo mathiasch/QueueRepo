@@ -14,7 +14,11 @@ use crate::routing::Access;
 /// Model families the agent harness of an access can run.
 pub fn harness_families(a: &Access) -> Vec<&'static str> {
     match a.kind.as_str() {
-        "anthropic_api" | "claude_subscription" | "legacy:claude" | "bedrock" | "vertex"
+        "anthropic_api"
+        | "claude_subscription"
+        | "legacy:claude"
+        | "bedrock"
+        | "vertex"
         | "anthropic_gateway" => vec!["anthropic"],
         "openai_api" | "codex_subscription" | "legacy:codex" | "azure_openai" => vec!["openai"],
         "gemini_subscription" | "legacy:gemini" | "gemini_api" => vec!["google"],
@@ -60,13 +64,13 @@ pub fn caps(price_id: &str, family: &str) -> Caps {
             _ => 128_000,
         },
     };
-    let vision = match price_id {
+    let vision = !matches!(
+        price_id,
         "mistral/devstral-2"
-        | "mistral/devstral-small-2"
-        | "infomaniak/apertus-v1-5-70b"
-        | "deepseek/deepseek-v4-flash" => false,
-        _ => true,
-    };
+            | "mistral/devstral-small-2"
+            | "infomaniak/apertus-v1-5-70b"
+            | "deepseek/deepseek-v4-flash"
+    );
     Caps {
         context_tokens: ctx,
         vision,
@@ -119,9 +123,7 @@ pub fn prior(price_id: &str, tier: ModelTier) -> Prior {
             (0.60, Evidence::Assumption)
         }
         "mistral/mistral-medium-3-5" => (0.62, Evidence::Benchmark),
-        "google/gemini-3-8-flash" | "google/gemini-3-8-flash-2026" => {
-            (0.62, Evidence::Benchmark)
-        }
+        "google/gemini-3-8-flash" | "google/gemini-3-8-flash-2026" => (0.62, Evidence::Benchmark),
         _ => (
             match tier {
                 ModelTier::Cheap => 0.40,
@@ -236,6 +238,9 @@ mod tests {
         assert!(context_offset("S", 1, false) > context_offset("L", 3, true));
         assert!((sigmoid(logit(0.3)) - 0.3).abs() < 1e-9);
         assert!(!caps("mistral/devstral-2", "mistral").vision);
-        assert_eq!(caps("mistral/mistral-large-4", "mistral").context_tokens, 1_000_000);
+        assert_eq!(
+            caps("mistral/mistral-large-4", "mistral").context_tokens,
+            1_000_000
+        );
     }
 }

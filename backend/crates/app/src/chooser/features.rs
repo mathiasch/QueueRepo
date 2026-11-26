@@ -30,56 +30,156 @@ const CATEGORY_WORDS: &[(&str, &[&str])] = &[
     (
         "bugfix",
         &[
-            "bug", "fix", "fehler", "behebe", "beheb", "kaputt", "crash", "absturz", "broken",
-            "regression", "falsch", "wrong", "stacktrace", "panic", "exception", "error",
-            "funktioniert nicht", "doesn't work", "does not work", "off-by-one", "missing",
+            "bug",
+            "fix",
+            "fehler",
+            "behebe",
+            "beheb",
+            "kaputt",
+            "crash",
+            "absturz",
+            "broken",
+            "regression",
+            "falsch",
+            "wrong",
+            "stacktrace",
+            "panic",
+            "exception",
+            "error",
+            "funktioniert nicht",
+            "doesn't work",
+            "does not work",
+            "off-by-one",
+            "missing",
             "fehlt",
         ],
     ),
     (
         "feature",
         &[
-            "add", "implement", "neue", "neuen", "neues", "feature", "funktion", "option",
-            "support", "unterstütz", "ergänze", "erweitere", "create", "erstelle", "baue",
-            "endpoint", "endpunkt", "flag",
+            "add",
+            "implement",
+            "neue",
+            "neuen",
+            "neues",
+            "feature",
+            "funktion",
+            "option",
+            "support",
+            "unterstütz",
+            "ergänze",
+            "erweitere",
+            "create",
+            "erstelle",
+            "baue",
+            "endpoint",
+            "endpunkt",
+            "flag",
         ],
     ),
     (
         "refactor",
         &[
-            "refactor", "umbau", "aufräum", "clean up", "cleanup", "rename", "umbenenn",
-            "extract", "extrahier", "vereinfach", "simplify", "deduplic", "restructure",
-            "modularis", "modulariz", "move", "verschieb",
+            "refactor",
+            "umbau",
+            "aufräum",
+            "clean up",
+            "cleanup",
+            "rename",
+            "umbenenn",
+            "extract",
+            "extrahier",
+            "vereinfach",
+            "simplify",
+            "deduplic",
+            "restructure",
+            "modularis",
+            "modulariz",
+            "move",
+            "verschieb",
         ],
     ),
     (
         "docs",
         &[
-            "readme", "doku", "documentation", "document", "docs", "kommentar", "comment",
-            "changelog", "anleitung", "guide", "beschreib", "erkläre", "explain",
+            "readme",
+            "doku",
+            "documentation",
+            "document",
+            "docs",
+            "kommentar",
+            "comment",
+            "changelog",
+            "anleitung",
+            "guide",
+            "beschreib",
+            "erkläre",
+            "explain",
         ],
     ),
     (
         "tests",
         &[
-            "test", "tests", "unit test", "coverage", "testfall", "testfälle", "e2e",
-            "playwright", "pytest", "assert", "spec",
+            "test",
+            "tests",
+            "unit test",
+            "coverage",
+            "testfall",
+            "testfälle",
+            "e2e",
+            "playwright",
+            "pytest",
+            "assert",
+            "spec",
         ],
     ),
     (
         "research",
         &[
-            "recherch", "research", "untersuch", "investigate", "evaluate", "evaluier",
-            "vergleich", "compare", "analysier", "analyse", "analyze", "find out", "finde heraus",
-            "welche bibliothek", "which library", "best practice",
+            "recherch",
+            "research",
+            "untersuch",
+            "investigate",
+            "evaluate",
+            "evaluier",
+            "vergleich",
+            "compare",
+            "analysier",
+            "analyse",
+            "analyze",
+            "find out",
+            "finde heraus",
+            "welche bibliothek",
+            "which library",
+            "best practice",
         ],
     ),
     (
         "ui",
         &[
-            "ui", "ux", "button", "knopf", "layout", "css", "design", "seite", "page", "dialog",
-            "formular", "form", "responsive", "mobile", "iphone", "dark mode", "farbe", "color",
-            "icon", "screen", "oberfläche", "frontend", "styling",
+            "ui",
+            "ux",
+            "button",
+            "knopf",
+            "layout",
+            "css",
+            "design",
+            "seite",
+            "page",
+            "dialog",
+            "formular",
+            "form",
+            "responsive",
+            "mobile",
+            "iphone",
+            "dark mode",
+            "farbe",
+            "color",
+            "icon",
+            "screen",
+            "oberfläche",
+            "frontend",
+            "styling",
         ],
     ),
 ];
@@ -88,73 +188,201 @@ const RISK_WORDS: &[(&str, &[&str])] = &[
     (
         "security",
         &[
-            "security", "sicherheit", "auth", "login", "password", "passwort", "token", "secret",
-            "credential", "xss", "csrf", "sql injection", "injection", "path traversal", "ssrf",
-            "crypto", "verschlüssel", "encrypt", "permission", "berechtigung", "cve",
-            "vulnerab", "schwachstelle", "sanitiz", "escape",
+            "security",
+            "sicherheit",
+            "auth",
+            "login",
+            "password",
+            "passwort",
+            "token",
+            "secret",
+            "credential",
+            "xss",
+            "csrf",
+            "sql injection",
+            "injection",
+            "path traversal",
+            "ssrf",
+            "crypto",
+            "verschlüssel",
+            "encrypt",
+            "permission",
+            "berechtigung",
+            "cve",
+            "vulnerab",
+            "schwachstelle",
+            "sanitiz",
+            "escape",
         ],
     ),
     (
         "migration",
         &[
-            "migration", "migrate", "schema", "alter table", "database", "datenbank",
-            "postgres", "sql", "index", "spalte", "column",
+            "migration",
+            "migrate",
+            "schema",
+            "alter table",
+            "database",
+            "datenbank",
+            "postgres",
+            "sql",
+            "index",
+            "spalte",
+            "column",
         ],
     ),
     (
         "infra",
         &[
-            "deploy", "docker", "kubernetes", "k8s", "terraform", "helm", "systemd", "nginx",
-            "ci", "pipeline", "github actions", "infrastructure", "infrastruktur", "server",
-            "cron", "dns", "tls", "zertifikat", "certificate",
+            "deploy",
+            "docker",
+            "kubernetes",
+            "k8s",
+            "terraform",
+            "helm",
+            "systemd",
+            "nginx",
+            "ci",
+            "pipeline",
+            "github actions",
+            "infrastructure",
+            "infrastruktur",
+            "server",
+            "cron",
+            "dns",
+            "tls",
+            "zertifikat",
+            "certificate",
         ],
     ),
     (
         "data_loss",
         &[
-            "delete", "lösche", "löschen", "drop table", "drop", "truncate", "rm -rf", "purge",
-            "wipe", "overwrite", "überschreib", "force push", "--force",
+            "delete",
+            "lösche",
+            "löschen",
+            "drop table",
+            "drop",
+            "truncate",
+            "rm -rf",
+            "purge",
+            "wipe",
+            "overwrite",
+            "überschreib",
+            "force push",
+            "--force",
         ],
     ),
 ];
 
 const COMPLEX_WORDS: &[&str] = &[
-    "architektur", "architecture", "concurren", "nebenläuf", "race", "deadlock", "thread",
-    "async", "performance", "optimi", "algorithm", "algorithmus", "distributed", "verteilt",
-    "protocol", "protokoll", "parser", "compiler", "state machine", "zustandsautomat",
-    "transaction", "transaktion", "cache", "skalier", "scal",
+    "architektur",
+    "architecture",
+    "concurren",
+    "nebenläuf",
+    "race",
+    "deadlock",
+    "thread",
+    "async",
+    "performance",
+    "optimi",
+    "algorithm",
+    "algorithmus",
+    "distributed",
+    "verteilt",
+    "protocol",
+    "protokoll",
+    "parser",
+    "compiler",
+    "state machine",
+    "zustandsautomat",
+    "transaction",
+    "transaktion",
+    "cache",
+    "skalier",
+    "scal",
 ];
 
 const BROAD_WORDS: &[&str] = &[
-    "überall", "everywhere", "all files", "alle dateien", "whole codebase", "ganze codebasis",
-    "gesamte codebasis", "entire codebase", "across the", "projektweit", "repo-wide",
-    "repository-wide", "throughout",
+    "überall",
+    "everywhere",
+    "all files",
+    "alle dateien",
+    "whole codebase",
+    "ganze codebasis",
+    "gesamte codebasis",
+    "entire codebase",
+    "across the",
+    "projektweit",
+    "repo-wide",
+    "repository-wide",
+    "throughout",
 ];
 
 const URGENT_WORDS: &[&str] = &[
-    "dringend", "urgent", "asap", "sofort", "hotfix", "notfall", "emergency", "immediately",
+    "dringend",
+    "urgent",
+    "asap",
+    "sofort",
+    "hotfix",
+    "notfall",
+    "emergency",
+    "immediately",
     "so schnell wie möglich",
 ];
 
 const WEB_WORDS: &[&str] = &[
-    "recherchier", "research the web", "search the web", "im internet", "online nach",
-    "neueste version", "latest version", "aktuelle version", "release notes", "web search",
-    "websuche", "http://", "https://",
+    "recherchier",
+    "research the web",
+    "search the web",
+    "im internet",
+    "online nach",
+    "neueste version",
+    "latest version",
+    "aktuelle version",
+    "release notes",
+    "web search",
+    "websuche",
+    "http://",
+    "https://",
 ];
 
-const VISION_WORDS: &[&str] = &["screenshot", "bildschirmfoto", "mockup", "bild", "image", "foto"];
+const VISION_WORDS: &[&str] = &[
+    "screenshot",
+    "bildschirmfoto",
+    "mockup",
+    "bild",
+    "image",
+    "foto",
+];
 
 /// (name, file extensions, keywords)
 const LANGUAGES: &[(&str, &[&str], &[&str])] = &[
-    ("Rust", &["rs"], &["rust", "cargo", "crate", "tokio", "axum", "sqlx"]),
-    ("Python", &["py"], &["python", "pip", "pytest", "django", "flask", "fastapi"]),
+    (
+        "Rust",
+        &["rs"],
+        &["rust", "cargo", "crate", "tokio", "axum", "sqlx"],
+    ),
+    (
+        "Python",
+        &["py"],
+        &["python", "pip", "pytest", "django", "flask", "fastapi"],
+    ),
     ("TypeScript", &["ts", "tsx"], &["typescript", "tsc"]),
-    ("JavaScript", &["js", "jsx", "mjs"], &["javascript", "node", "npm"]),
+    (
+        "JavaScript",
+        &["js", "jsx", "mjs"],
+        &["javascript", "node", "npm"],
+    ),
     ("Go", &["go"], &["golang", "go mod"]),
     ("Java", &["java"], &["java", "maven", "gradle", "spring"]),
     ("SQL", &["sql"], &["sql", "postgres", "sqlite", "mysql"]),
     ("Shell", &["sh", "bash"], &["shell", "bash", "posix sh"]),
-    ("CSS/HTML", &["css", "scss", "html"], &["css", "html", "tailwind"]),
+    (
+        "CSS/HTML",
+        &["css", "scss", "html"],
+        &["css", "html", "tailwind"],
+    ),
     ("Leptos", &[], &["leptos"]),
     ("React", &[], &["react", "next.js", "nextjs"]),
     ("Vue", &[], &["vue", "nuxt"]),
@@ -322,9 +550,17 @@ pub fn analyze(i: &Input<'_>) -> TaskFeatures {
             }
             "data_loss" => {
                 hits >= 1
-                    && ["drop table", "truncate", "rm -rf", "force push", "--force", "wipe", "purge"]
-                        .iter()
-                        .any(|w| has_word(&text, w))
+                    && [
+                        "drop table",
+                        "truncate",
+                        "rm -rf",
+                        "force push",
+                        "--force",
+                        "wipe",
+                        "purge",
+                    ]
+                    .iter()
+                    .any(|w| has_word(&text, w))
                     || hits >= 2
             }
             _ => hits >= 1,
@@ -414,15 +650,51 @@ mod tests {
 
     #[test]
     fn categories() {
-        assert_eq!(feat("FizzBuzz: letzte Zeile fehlt", "Find and fix the bug in fizzbuzz.sh").category, "bugfix");
-        assert_eq!(feat("README", "Document the --count option in README.md").category, "docs");
-        assert_eq!(feat("Tests", "Write unit tests for max.sh with three test cases").category, "tests");
-        assert_eq!(feat("Umbau", "Refactor: extract the shared log function").category, "refactor");
-        assert_eq!(feat("Neue Option", "Add a --shout option to greet.sh").category, "feature");
-        assert_eq!(feat("Knopf", "Der Button auf der Seite ist auf dem iPhone zu klein (CSS)").category, "ui");
-        assert_eq!(feat("Bibliotheken", "Recherchiere, welche Bibliothek für PDF am besten ist").category, "research");
+        assert_eq!(
+            feat(
+                "FizzBuzz: letzte Zeile fehlt",
+                "Find and fix the bug in fizzbuzz.sh"
+            )
+            .category,
+            "bugfix"
+        );
+        assert_eq!(
+            feat("README", "Document the --count option in README.md").category,
+            "docs"
+        );
+        assert_eq!(
+            feat("Tests", "Write unit tests for max.sh with three test cases").category,
+            "tests"
+        );
+        assert_eq!(
+            feat("Umbau", "Refactor: extract the shared log function").category,
+            "refactor"
+        );
+        assert_eq!(
+            feat("Neue Option", "Add a --shout option to greet.sh").category,
+            "feature"
+        );
+        assert_eq!(
+            feat(
+                "Knopf",
+                "Der Button auf der Seite ist auf dem iPhone zu klein (CSS)"
+            )
+            .category,
+            "ui"
+        );
+        assert_eq!(
+            feat(
+                "Bibliotheken",
+                "Recherchiere, welche Bibliothek für PDF am besten ist"
+            )
+            .category,
+            "research"
+        );
         assert_eq!(feat("x", "hmm").category, "other");
-        let o = analyze(&Input { kind: "onempty", ..Default::default() });
+        let o = analyze(&Input {
+            kind: "onempty",
+            ..Default::default()
+        });
         assert_eq!(o.category, "analysis");
     }
 
@@ -448,14 +720,19 @@ mod tests {
         assert!(l.complexity >= 2);
         assert!(l.languages.contains(&"Rust".to_string()));
 
-        let sec = feat("Login", "Fix the path traversal in the download handler (security)");
+        let sec = feat(
+            "Login",
+            "Fix the path traversal in the download handler (security)",
+        );
         assert!(sec.risks.contains(&"security".to_string()));
         assert!(sec.high_risk());
 
         let mig = feat("Spalte", "Add a migration: ALTER TABLE users ADD COLUMN x");
         assert!(mig.risks.contains(&"migration".to_string()));
         // "sql" alone is not a migration.
-        assert!(!feat("Query", "speed up the sql query").risks.contains(&"migration".to_string()));
+        assert!(!feat("Query", "speed up the sql query")
+            .risks
+            .contains(&"migration".to_string()));
 
         let web = feat("Version", "Find the latest version of serde and update");
         assert!(web.needs("web"));

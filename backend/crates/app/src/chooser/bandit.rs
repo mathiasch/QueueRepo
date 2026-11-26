@@ -205,7 +205,13 @@ mod tests {
         for _ in 0..5 {
             c.add(1.0, decay(1.0, 7.0, 60.0));
         }
-        let p = Posterior::new("anthropic/claude-haiku-5-5", ModelTier::Cheap, "bugfix", c, None);
+        let p = Posterior::new(
+            "anthropic/claude-haiku-5-5",
+            ModelTier::Cheap,
+            "bugfix",
+            c,
+            None,
+        );
         let mut fresh = Counts::default();
         for _ in 0..10 {
             fresh.add(0.0, 1.0);
@@ -213,8 +219,19 @@ mod tests {
         for _ in 0..5 {
             fresh.add(1.0, 1.0);
         }
-        let q = Posterior::new("anthropic/claude-haiku-5-5", ModelTier::Cheap, "bugfix", fresh, None);
-        assert!(p.mean() > 0.6 && q.mean() < 0.45, "{} {}", p.mean(), q.mean());
+        let q = Posterior::new(
+            "anthropic/claude-haiku-5-5",
+            ModelTier::Cheap,
+            "bugfix",
+            fresh,
+            None,
+        );
+        assert!(
+            p.mean() > 0.6 && q.mean() < 0.45,
+            "{} {}",
+            p.mean(),
+            q.mean()
+        );
     }
 
     #[test]
@@ -226,19 +243,34 @@ mod tests {
         for _ in 0..4 {
             four.add(1.0, 1.0);
         }
-        assert!(!Posterior::new("openai/gpt-6-1-terra", ModelTier::Mid, "bugfix", four, None).trusted());
+        assert!(
+            !Posterior::new("openai/gpt-6-1-terra", ModelTier::Mid, "bugfix", four, None).trusted()
+        );
         four.add(1.0, 1.0);
         let t = Posterior::new("openai/gpt-6-1-terra", ModelTier::Mid, "bugfix", four, None);
         assert!(t.trusted());
         assert_eq!(t.basis(), "learned");
-        assert!(Posterior::new("anthropic/claude-sonnet-5-5", ModelTier::Mid, "x", none, None).trusted());
+        assert!(Posterior::new(
+            "anthropic/claude-sonnet-5-5",
+            ModelTier::Mid,
+            "x",
+            none,
+            None
+        )
+        .trusted());
     }
 
     #[test]
     fn pooled_data_is_capped() {
         let mut huge = Counts::default();
         huge.add(0.0, 1000.0);
-        let p = Posterior::new("anthropic/claude-opus-5-5", ModelTier::Top, "bugfix", Counts::default(), Some(huge));
+        let p = Posterior::new(
+            "anthropic/claude-opus-5-5",
+            ModelTier::Top,
+            "bugfix",
+            Counts::default(),
+            Some(huge),
+        );
         assert!((p.pooled - POOL_CAP).abs() < 1e-9);
         // Pooled failures pull the mean down, but own data still decides.
         assert!(p.mean() > 0.2);
@@ -256,7 +288,8 @@ mod tests {
         for round in 0..1000 {
             let s: Vec<f64> = (0..2)
                 .map(|i| {
-                    Posterior::new("x/unknown", ModelTier::Mid, "other", counts[i], None).sample(&mut rng)
+                    Posterior::new("x/unknown", ModelTier::Mid, "other", counts[i], None)
+                        .sample(&mut rng)
                 })
                 .collect();
             let arm = usize::from(s[1] > s[0]);

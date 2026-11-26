@@ -30,14 +30,16 @@ enum Tab {
     Rules,
     Audit,
     Runners,
+    Chooser,
 }
 
-const TABS: [(Tab, &str, Ic); 5] = [
+const TABS: [(Tab, &str, Ic); 6] = [
     (Tab::People, "Personen", Ic::Users),
     (Tab::Invites, "Einladungen", Ic::Send),
     (Tab::Rules, "Regeln", Ic::Shield),
     (Tab::Audit, "Protokoll", Ic::ListChecks),
     (Tab::Runners, "Runner", Ic::Terminal),
+    (Tab::Chooser, "Modellwahl", Ic::Sparkles),
 ];
 
 #[component]
@@ -79,6 +81,7 @@ pub fn AdminPage() -> impl IntoView {
                 Tab::Rules => view! { <Rules/> }.into_any(),
                 Tab::Audit => view! { <Audit/> }.into_any(),
                 Tab::Runners => view! { <Runners/> }.into_any(),
+                Tab::Chooser => view! { <super::chooser::AdminChooser/> }.into_any(),
             }}
         </div>
     }

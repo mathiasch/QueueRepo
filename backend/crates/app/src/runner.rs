@@ -2890,11 +2890,19 @@ async fn review_not_weaker(
     let pick = crate::chooser::review_pick(st, task, project, exec_tier, &exec_family).await?;
     let (target, why) = match pick {
         Some(c) => (
-            (c.target.connector_id, c.target.provider.clone(), c.target.model.clone()),
+            (
+                c.target.connector_id,
+                c.target.provider.clone(),
+                c.target.model.clone(),
+            ),
             format!("{} über „{}“", c.model, c.access),
         ),
         None => (
-            (task.connector_id, Some(task.provider.clone()), task.model.clone()),
+            (
+                task.connector_id,
+                Some(task.provider.clone()),
+                task.model.clone(),
+            ),
             "dasselbe Modell wie die Umsetzung".to_string(),
         ),
     };
@@ -3301,7 +3309,13 @@ async fn defer_review(
         .target
         .as_ref()
         .and_then(|t| t.model.clone())
-        .or_else(|| routing.execute.target.as_ref().and_then(|t| t.model.clone()));
+        .or_else(|| {
+            routing
+                .execute
+                .target
+                .as_ref()
+                .and_then(|t| t.model.clone())
+        });
     {
         let cat = pricing::current(st).await;
         if let (Some((e, _)), Some((r, _))) = (
@@ -3939,8 +3953,14 @@ async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Resu
     // WP15: the model chooser's escalation chain wins over the routing's
     // (checked like any decision; an unusable stage falls back below).
     if let Some(d) = crate::chooser::fix_decision(failed, &root, &ask) {
-        match crate::routing::check_decision(st, failed.user_id, &project, d.clone(), &failed.provider)
-            .await?
+        match crate::routing::check_decision(
+            st,
+            failed.user_id,
+            &project,
+            d.clone(),
+            &failed.provider,
+        )
+        .await?
         {
             Ok(_) => decision = d,
             Err(why) => {
@@ -3953,7 +3973,9 @@ async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Resu
                 decision.chooser = d.chooser;
             }
         }
-    } else if let Some(rep) = crate::chooser::report_of(failed).or_else(|| crate::chooser::report_of(&root)) {
+    } else if let Some(rep) =
+        crate::chooser::report_of(failed).or_else(|| crate::chooser::report_of(&root))
+    {
         // Chain exhausted (or none): the fix keeps the report's steps.
         decision.chooser = Some(Box::new(rep));
     }

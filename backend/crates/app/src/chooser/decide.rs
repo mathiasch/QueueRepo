@@ -169,7 +169,14 @@ pub fn loop_cost(i: &Input<'_>, c: &Cand) -> f64 {
 
 /// Agentic review on `c`.
 pub fn review_cost(i: &Input<'_>, c: &Cand) -> f64 {
-    step_cost(i.catalog, c, &estimate::REVIEW, StepMode::Harness, false, None)
+    step_cost(
+        i.catalog,
+        c,
+        &estimate::REVIEW,
+        StepMode::Harness,
+        false,
+        None,
+    )
 }
 
 fn plan_mode(i: &Input<'_>, c: &Cand) -> Option<StepMode> {
@@ -321,7 +328,9 @@ fn best_chain(
         let (cpa, sc) = score(e, acc, rescue, ps[0], i.quality);
         let better = match &best {
             None => true,
-            Some(b) => sc < b.score - 1e-12 || ((sc - b.score).abs() <= 1e-12 && ch.len() < b.stages.len()),
+            Some(b) => {
+                sc < b.score - 1e-12 || ((sc - b.score).abs() <= 1e-12 && ch.len() < b.stages.len())
+            }
         };
         if better {
             best = Some(ChainPick {
@@ -397,7 +406,9 @@ pub fn decide(i: &Input<'_>) -> Outcome {
         e.excluded = exclusion(i, c, e.attempt + plan_cost, true);
     }
 
-    let allowed: Vec<usize> = (0..ev.len()).filter(|&k| ev[k].excluded.is_none()).collect();
+    let allowed: Vec<usize> = (0..ev.len())
+        .filter(|&k| ev[k].excluded.is_none())
+        .collect();
     if allowed.is_empty() {
         let why = if i.cands.is_empty() {
             "Kein Zugang mit passenden Modellen (Anthropic, OpenAI, Mistral …) – Vorlage/Projekt-Routing gilt".to_string()
@@ -485,7 +496,9 @@ pub fn decide(i: &Input<'_>) -> Outcome {
     let plan = plan_choice.filter(|_| chosen_cand.price.tier != ModelTier::Top);
     let plan_cost_final = plan.as_ref().map_or(0.0, |p| p.cost);
     let review = choose_review(i, &ev, chosen_cand);
-    let analyze = (i.kind == "onempty").then(|| choose_analyze(i, &ev)).flatten();
+    let analyze = (i.kind == "onempty")
+        .then(|| choose_analyze(i, &ev))
+        .flatten();
     let flex = flex_for(i, chosen_cand);
 
     let view = |k: usize, cpa: f64, sc: f64, acc: f64| -> CandidateView {
@@ -578,22 +591,12 @@ pub fn decide(i: &Input<'_>) -> Outcome {
         ));
     }
     if flex {
-        reasons.push("Kein Zeitdruck: Umsetzung im günstigeren Flex-Tarif (−50 %, langsamer)".into());
+        reasons
+            .push("Kein Zeitdruck: Umsetzung im günstigeren Flex-Tarif (−50 %, langsamer)".into());
     }
-    if let Some(p) = &plan {
-        reasons.push(format!("Planung: {} ({})", p.model, mode_text(p.mode)));
-    }
-    if let Some(r) = &review {
-        reasons.push(format!("Review: {} – {}", r.model, r.reason));
-    }
-    if let Some(a) = &analyze {
-        reasons.push(format!("Analyse: {} ({})", a.model, mode_text(a.mode)));
-    }
+    // Plan, review and analysis are listed as steps (not repeated here).
     if i.quality != queued_api::chooser::DEFAULT_QUALITY {
-        reasons.push(format!(
-            "Regler Kosten ↔ Qualität: {} von 100",
-            i.quality
-        ));
+        reasons.push(format!("Regler Kosten ↔ Qualität: {} von 100", i.quality));
     }
     if chosen_cand.price.currency != "USD" {
         reasons.push(format!(
@@ -618,6 +621,8 @@ pub fn decide(i: &Input<'_>) -> Outcome {
             quality: i.quality,
             fallback: None,
             classify_cost: 0.0,
+            classify_step: None,
+            classify_connector: None,
             seed: i.seed,
             reasons,
             overridden: None,
@@ -716,7 +721,8 @@ fn choose_plan(i: &Input<'_>, ev: &[Eval]) -> Option<StepChoice> {
             None => true,
             Some((t, bp, bc, _, _)) => {
                 c.price.tier > *t
-                    || (c.price.tier == *t && (p > bp + 1e-9 || ((p - bp).abs() <= 1e-9 && cost < *bc)))
+                    || (c.price.tier == *t
+                        && (p > bp + 1e-9 || ((p - bp).abs() <= 1e-9 && cost < *bc)))
             }
         };
         if better {
@@ -930,8 +936,13 @@ pub(crate) mod tests {
         for a in accs {
             for fam in model::harness_families(a) {
                 for e in &cat.entries {
-                    let Some(alias) = e.models.first() else { continue };
-                    if e.family != fam || pricing::find(cat, alias, now).map(|x| x.id.as_str()) != Some(e.id.as_str()) {
+                    let Some(alias) = e.models.first() else {
+                        continue;
+                    };
+                    if e.family != fam
+                        || pricing::find(cat, alias, now).map(|x| x.id.as_str())
+                            != Some(e.id.as_str())
+                    {
                         continue;
                     }
                     out.push(Cand {
@@ -1018,12 +1029,21 @@ pub(crate) mod tests {
         assert!(c.model.contains("haiku"));
         assert!(out.report.chain.iter().all(|c| c.tier > ModelTier::Cheap));
 
-        let f = feat("Login", "Fix the path traversal vulnerability in the auth download handler");
+        let f = feat(
+            "Login",
+            "Fix the path traversal vulnerability in the auth download handler",
+        );
         let out = decide(&input(&f, anthropic(), &stats));
         let c = out.report.chosen.unwrap();
         assert_ne!(c.tier, ModelTier::Cheap);
-        assert!(out.report.alternatives.iter().any(|a| a.tier == ModelTier::Cheap
-            && a.excluded.as_deref().is_some_and(|e| e.contains("riskante"))));
+        assert!(out
+            .report
+            .alternatives
+            .iter()
+            .any(|a| a.tier == ModelTier::Cheap
+                && a.excluded
+                    .as_deref()
+                    .is_some_and(|e| e.contains("riskante"))));
     }
 
     #[test]
@@ -1033,9 +1053,16 @@ pub(crate) mod tests {
             "Rename everywhere",
             "Refactor the async scheduler architecture everywhere in the whole codebase: src/a.rs src/b.rs src/c.rs src/d.rs",
         );
-        let out = decide(&Input { quality: 0, ..input(&f, anthropic(), &stats) });
+        let out = decide(&Input {
+            quality: 0,
+            ..input(&f, anthropic(), &stats)
+        });
         let c = out.report.chosen.unwrap();
-        assert_eq!(c.tier, ModelTier::Cheap, "cascade is cheapest per accepted task");
+        assert_eq!(
+            c.tier,
+            ModelTier::Cheap,
+            "cascade is cheapest per accepted task"
+        );
         assert!(!out.report.chain.is_empty(), "{:?}", out.report.reasons);
         let mut prev = c.tier;
         for s in &out.report.chain {
@@ -1053,9 +1080,18 @@ pub(crate) mod tests {
             "Refactor the async scheduler architecture everywhere in the whole codebase: src/a.rs src/b.rs src/c.rs src/d.rs",
         );
         assert_eq!(f.size, "L");
-        let lo = decide(&Input { quality: 0, ..input(&f, anthropic(), &stats) });
-        let hi = decide(&Input { quality: 100, ..input(&f, anthropic(), &stats) });
-        let (tl, th) = (lo.report.chosen.unwrap().tier, hi.report.chosen.unwrap().tier);
+        let lo = decide(&Input {
+            quality: 0,
+            ..input(&f, anthropic(), &stats)
+        });
+        let hi = decide(&Input {
+            quality: 100,
+            ..input(&f, anthropic(), &stats)
+        });
+        let (tl, th) = (
+            lo.report.chosen.unwrap().tier,
+            hi.report.chosen.unwrap().tier,
+        );
         assert!(th >= tl, "{tl:?} {th:?}");
         assert_ne!(th, ModelTier::Cheap);
     }
@@ -1068,39 +1104,78 @@ pub(crate) mod tests {
         let eu = access("bedrock", DataLocation::Eu, false, false, false);
         let mut cands = cands_for(&[us, eu]);
         // Residency.
-        let out = decide(&Input { residency: Residency::Eu, ..input(&f, cands.clone(), &stats) });
+        let out = decide(&Input {
+            residency: Residency::Eu,
+            ..input(&f, cands.clone(), &stats)
+        });
         assert_eq!(out.report.chosen.as_ref().unwrap().access, "bedrock");
-        assert!(out.report.alternatives.iter().any(|a| a.access == "anthropic_api" && a.excluded.as_deref().is_some_and(|e| e.contains("Datenstandort"))));
+        assert!(out
+            .report
+            .alternatives
+            .iter()
+            .any(|a| a.access == "anthropic_api"
+                && a.excluded
+                    .as_deref()
+                    .is_some_and(|e| e.contains("Datenstandort"))));
         // Pauses.
         for c in cands.iter_mut().filter(|c| c.access.kind == "bedrock") {
             c.paused = true;
         }
-        let out = decide(&Input { residency: Residency::Eu, ..input(&f, cands.clone(), &stats) });
+        let out = decide(&Input {
+            residency: Residency::Eu,
+            ..input(&f, cands.clone(), &stats)
+        });
         assert!(out.execute.is_none(), "all excluded ⇒ fallback");
         assert!(out.report.fallback.is_some());
         // Blocked models (project and user).
         let cands = anthropic();
-        let out = decide(&Input { project_blocked: vec!["claude-haiku-5-5".into()], ..input(&f, cands.clone(), &stats) });
+        let out = decide(&Input {
+            project_blocked: vec!["claude-haiku-5-5".into()],
+            ..input(&f, cands.clone(), &stats)
+        });
         assert!(!out.report.chosen.as_ref().unwrap().model.contains("haiku"));
-        assert!(out.report.alternatives.iter().any(|a| a.model.contains("haiku") && a.excluded.as_deref() == Some("im Projekt gesperrt")));
-        let out = decide(&Input { user_blocked: vec!["haiku".into()], ..input(&f, cands.clone(), &stats) });
+        assert!(out
+            .report
+            .alternatives
+            .iter()
+            .any(|a| a.model.contains("haiku")
+                && a.excluded.as_deref() == Some("im Projekt gesperrt")));
+        let out = decide(&Input {
+            user_blocked: vec!["haiku".into()],
+            ..input(&f, cands.clone(), &stats)
+        });
         assert!(!out.report.chosen.as_ref().unwrap().model.contains("haiku"));
         // Cost limit: a tiny limit leaves only the cheap tier.
         let big = feat("Big", &"refactor ".repeat(400));
-        let out = decide(&Input { cost_limit: Some(0.5), ..input(&big, cands.clone(), &stats) });
-        assert!(out.report.alternatives.iter().any(|a| a.excluded.as_deref().is_some_and(|e| e.contains("Kostenlimit"))));
+        let out = decide(&Input {
+            cost_limit: Some(0.5),
+            ..input(&big, cands.clone(), &stats)
+        });
+        assert!(out.report.alternatives.iter().any(|a| a
+            .excluded
+            .as_deref()
+            .is_some_and(|e| e.contains("Kostenlimit"))));
         // Context length: 300k tokens exceed the assumed 200k window.
         let mut lc = f.clone();
         lc.est_tokens = 300_000;
         let out = decide(&input(&lc, cands.clone(), &stats));
         assert!(out.execute.is_none());
-        assert!(out.report.alternatives.iter().all(|a| a.excluded.as_deref().is_some_and(|e| e.contains("Kontext"))));
+        assert!(out
+            .report
+            .alternatives
+            .iter()
+            .all(|a| a.excluded.as_deref().is_some_and(|e| e.contains("Kontext"))));
         // Vision: Devstral cannot see, Large 4 can.
         let mut v = f.clone();
         v.needs.push("vision".into());
         let m = cands_for(&[access("mistral", DataLocation::Eu, true, true, false)]);
         let out = decide(&input(&v, m, &stats));
-        assert!(out.report.alternatives.iter().chain(out.report.chosen.iter()).all(|a| !a.model.starts_with("devstral") || a.excluded.is_some()));
+        assert!(out
+            .report
+            .alternatives
+            .iter()
+            .chain(out.report.chosen.iter())
+            .all(|a| !a.model.starts_with("devstral") || a.excluded.is_some()));
         // Web research needs a harness with web search (opencode has none).
         let mut w = f.clone();
         w.needs.push("web".into());
@@ -1125,17 +1200,27 @@ pub(crate) mod tests {
     #[test]
     fn review_never_weaker_and_prefers_another_provider() {
         let stats = Stats::default();
-        let f = feat("Refactor", "Refactor the async cache architecture in src/a.rs src/b.rs src/c.rs src/d.rs");
+        let f = feat(
+            "Refactor",
+            "Refactor the async cache architecture in src/a.rs src/b.rs src/c.rs src/d.rs",
+        );
         let both = cands_for(&[
             access("anthropic_api", DataLocation::Us, true, true, false),
             access("openai_api", DataLocation::Us, true, true, true),
         ]);
-        let out = decide(&Input { quality: 100, ..input(&f, both.clone(), &stats) });
+        let out = decide(&Input {
+            quality: 100,
+            ..input(&f, both.clone(), &stats)
+        });
         let exec = out.report.chosen.clone().unwrap();
         let r = out.report.review.clone().unwrap();
         assert!(r.tier >= exec.tier && r.tier != ModelTier::Cheap);
         assert_ne!(
-            both.iter().find(|c| c.model == r.model).unwrap().price.family,
+            both.iter()
+                .find(|c| c.model == r.model)
+                .unwrap()
+                .price
+                .family,
             exec.family,
             "other provider family preferred"
         );
@@ -1146,11 +1231,23 @@ pub(crate) mod tests {
         assert!(r.tier >= exec.tier.max(ModelTier::Mid));
         // Top executor, no other top model: the executor reviews itself.
         let i = input(&f, anthropic(), &stats);
-        let opus = i.cands.iter().find(|c| c.model == "claude-opus-5-5").unwrap();
+        let opus = i
+            .cands
+            .iter()
+            .find(|c| c.model == "claude-opus-5-5")
+            .unwrap();
         let t = opus.target();
-        let only_haiku: Vec<Cand> = i.cands.iter().filter(|c| c.price.tier == ModelTier::Cheap).cloned().collect();
+        let only_haiku: Vec<Cand> = i
+            .cands
+            .iter()
+            .filter(|c| c.price.tier == ModelTier::Cheap)
+            .cloned()
+            .collect();
         let r = choose_review_for(
-            &Input { cands: only_haiku, ..input(&f, vec![], &stats) },
+            &Input {
+                cands: only_haiku,
+                ..input(&f, vec![], &stats)
+            },
             ModelTier::Top,
             "anthropic",
             Some((&t, "a", "claude-opus-5-5")),
@@ -1168,25 +1265,41 @@ pub(crate) mod tests {
         ];
         let f = feat("Feature", "Add a --shout option to greet.sh and src/main.rs, src/cli.rs with tests\n- a\n- b\n- c\n- d");
         assert_ne!(f.size, "S");
-        let calm = decide(&Input { quality: 0, ..input(&f, cands_for(&accs), &stats) });
+        let calm = decide(&Input {
+            quality: 0,
+            ..input(&f, cands_for(&accs), &stats)
+        });
         if let Some(p) = &calm.report.plan {
             assert_eq!(p.mode, StepMode::Batch);
         }
         let mut urgent = f.clone();
         urgent.urgent = true;
-        let hurry = decide(&Input { quality: 0, ..input(&urgent, cands_for(&accs), &stats) });
+        let hurry = decide(&Input {
+            quality: 0,
+            ..input(&urgent, cands_for(&accs), &stats)
+        });
         assert!(!hurry.report.flex);
         if let Some(p) = &hurry.report.plan {
             assert_eq!(p.mode, StepMode::Sync);
         }
         // Flex: only on an OpenAI access with a flex price.
-        let terra_only: Vec<Cand> = cands_for(&accs[1..]).into_iter().filter(|c| c.model == "gpt-6.1-terra").collect();
+        let terra_only: Vec<Cand> = cands_for(&accs[1..])
+            .into_iter()
+            .filter(|c| c.model == "gpt-6.1-terra")
+            .collect();
         let mut stats2 = Stats::default();
         let mut cnt = Counts::default();
         for _ in 0..10 {
             cnt.add(1.0, 1.0);
         }
-        stats2.cells.insert(("execute".into(), f.category.clone(), "openai/gpt-6-1-terra".into()), (cnt, None));
+        stats2.cells.insert(
+            (
+                "execute".into(),
+                f.category.clone(),
+                "openai/gpt-6-1-terra".into(),
+            ),
+            (cnt, None),
+        );
         let calm = decide(&input(&f, terra_only.clone(), &stats2));
         assert!(calm.report.flex);
         let hurry = decide(&input(&urgent, terra_only, &stats2));
@@ -1198,20 +1311,32 @@ pub(crate) mod tests {
         // Only Terra (no benchmark): no trusted candidate.
         let stats = Stats::default();
         let f = feat("Docs", "Update README.md");
-        let terra: Vec<Cand> = cands_for(&[access("openai_api", DataLocation::Us, true, true, true)])
-            .into_iter()
-            .filter(|c| c.model == "gpt-6.1-terra")
-            .collect();
+        let terra: Vec<Cand> =
+            cands_for(&[access("openai_api", DataLocation::Us, true, true, true)])
+                .into_iter()
+                .filter(|c| c.model == "gpt-6.1-terra")
+                .collect();
         let out = decide(&input(&f, terra.clone(), &stats));
         assert!(out.execute.is_none(), "no budget ⇒ fallback");
-        assert!(out.report.fallback.as_deref().unwrap().contains("belastbare"));
-        let out = decide(&Input { explore_left: 5.0, ..input(&f, terra.clone(), &stats) });
+        assert!(out
+            .report
+            .fallback
+            .as_deref()
+            .unwrap()
+            .contains("belastbare"));
+        let out = decide(&Input {
+            explore_left: 5.0,
+            ..input(&f, terra.clone(), &stats)
+        });
         assert!(out.execute.is_some() && out.report.explored);
         assert!(out.report.explore_cost > 0.0 && out.report.explore_cost <= 5.0);
         // Never explore risky tasks.
         let mut risky = f.clone();
         risky.risks.push("security".into());
-        let out = decide(&Input { explore_left: 5.0, ..input(&risky, terra, &stats) });
+        let out = decide(&Input {
+            explore_left: 5.0,
+            ..input(&risky, terra, &stats)
+        });
         assert!(out.execute.is_none());
     }
 
@@ -1231,7 +1356,11 @@ pub(crate) mod tests {
         let mut spent = 0.0;
         let mut left = 0.3;
         for seed in 0..200 {
-            let out = decide(&Input { seed, explore_left: left, ..input(&f, cands.clone(), &stats) });
+            let out = decide(&Input {
+                seed,
+                explore_left: left,
+                ..input(&f, cands.clone(), &stats)
+            });
             assert!(out.execute.is_some());
             if out.report.explored {
                 explored_with += 1;
@@ -1242,7 +1371,11 @@ pub(crate) mod tests {
         assert!(explored_with > 0, "Thompson explores sometimes");
         assert!(spent <= 0.3 + 1e-9, "budget respected: {spent}");
         for seed in 0..200 {
-            let out = decide(&Input { seed, explore_left: 0.0, ..input(&f, cands.clone(), &stats) });
+            let out = decide(&Input {
+                seed,
+                explore_left: 0.0,
+                ..input(&f, cands.clone(), &stats)
+            });
             assert!(!out.report.explored);
         }
     }
@@ -1252,14 +1385,27 @@ pub(crate) mod tests {
         // Haiku keeps failing docs tasks ⇒ the chooser moves to Sonnet.
         let f = feat("Docs", "Update README.md");
         let mut stats = Stats::default();
-        let before = decide(&input(&f, anthropic(), &stats)).report.chosen.unwrap();
+        let before = decide(&input(&f, anthropic(), &stats))
+            .report
+            .chosen
+            .unwrap();
         assert!(before.model.contains("haiku"));
         let mut c = Counts::default();
         for _ in 0..30 {
             c.add(0.0, 1.0);
         }
-        stats.cells.insert(("execute".into(), "docs".into(), "anthropic/claude-haiku-5-5".into()), (c, None));
-        let after = decide(&input(&f, anthropic(), &stats)).report.chosen.unwrap();
+        stats.cells.insert(
+            (
+                "execute".into(),
+                "docs".into(),
+                "anthropic/claude-haiku-5-5".into(),
+            ),
+            (c, None),
+        );
+        let after = decide(&input(&f, anthropic(), &stats))
+            .report
+            .chosen
+            .unwrap();
         assert!(!after.model.contains("haiku"), "{after:?}");
     }
 
@@ -1271,8 +1417,16 @@ pub(crate) mod tests {
             access("anthropic_api", DataLocation::Us, true, true, false),
             access("openai_api", DataLocation::Us, true, true, true),
         ];
-        let a = decide(&Input { seed: 99, explore_left: 1.0, ..input(&f, cands_for(&accs), &stats) });
-        let b = decide(&Input { seed: 99, explore_left: 1.0, ..input(&f, cands_for(&accs), &stats) });
+        let a = decide(&Input {
+            seed: 99,
+            explore_left: 1.0,
+            ..input(&f, cands_for(&accs), &stats)
+        });
+        let b = decide(&Input {
+            seed: 99,
+            explore_left: 1.0,
+            ..input(&f, cands_for(&accs), &stats)
+        });
         assert_eq!(a.report, b.report);
         let s = suggest(&input(&f, cands_for(&accs), &stats), 3);
         assert_eq!(s.len(), 3);
@@ -1284,8 +1438,14 @@ pub(crate) mod tests {
     #[test]
     fn onempty_picks_a_batch_analysis() {
         let stats = Stats::default();
-        let f = features::analyze(&features::Input { kind: "onempty", ..Default::default() });
-        let out = decide(&Input { kind: "onempty", ..input(&f, anthropic(), &stats) });
+        let f = features::analyze(&features::Input {
+            kind: "onempty",
+            ..Default::default()
+        });
+        let out = decide(&Input {
+            kind: "onempty",
+            ..input(&f, anthropic(), &stats)
+        });
         let a = out.report.analyze.unwrap();
         assert_eq!(a.mode, StepMode::Batch);
         assert!(a.tier >= ModelTier::Mid);

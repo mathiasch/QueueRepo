@@ -429,6 +429,7 @@ async fn new_task(
 /// trigger stops working.
 pub async fn after_commit(st: &AppState, t: &TriggerRow, fired: &Fired, task: Option<&Task>) {
     if let Some(task) = task {
+        crate::chooser::after_insert(st, task).await;
         queue::announce(st, task);
     }
     if let Fired::Done {

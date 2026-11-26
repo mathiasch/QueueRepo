@@ -60,13 +60,17 @@ pub async fn create(
         .bind(c.project_id)
         .fetch_one(&st.db)
         .await?;
+    let (mimes, bytes) =
+        super::attachments::draft_meta(&st, &c.attachment_ids, c.project_id, u.id).await?;
     let ask = crate::routing::Ask::new(
         "task",
         c.title.as_deref().unwrap_or_default(),
         &c.prompt,
         &c.context,
         c.attachment_ids.len(),
-    );
+    )
+    .with_attachments(mimes, bytes)
+    .with_urgency(c.urgent, lim.max_cost_usd.flatten());
     let exec = crate::routing::resolve_execute(
         &st,
         u.id,
@@ -96,7 +100,28 @@ pub async fn create(
     // WP12 Best-of-N: N attempts (checked like N tasks, plus quota, budget
     // and the review agent of the automatic selection).
     let n = c.attempts.unwrap_or(1);
-    let group = if n > 1 || !c.attempt_targets.is_empty() || c.auto_select {
+    // WP15: with the model chooser on, attempts without own targets get its
+    // suggestions (distinct models, alternating providers; the rest like
+    // the task).
+    let mut attempt_targets = c.attempt_targets.clone();
+    if n > 1
+        && attempt_targets.is_empty()
+        && crate::chooser::store::settings(&st, project.id)
+            .await?
+            .enabled
+    {
+        let picked = crate::chooser::suggest(&st, u.id, &project, &ask, n as usize)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("chooser suggestions failed: {e:#}");
+                vec![]
+            });
+        if !picked.is_empty() {
+            attempt_targets = picked.into_iter().map(|p| p.target).collect();
+            attempt_targets.resize(n as usize, Default::default());
+        }
+    }
+    let group = if n > 1 || !attempt_targets.is_empty() || c.auto_select {
         Some(
             crate::bon::plan_group(
                 &st,
@@ -105,7 +130,7 @@ pub async fn create(
                 &exec,
                 crate::bon::GroupRequest {
                     n,
-                    targets: &c.attempt_targets,
+                    targets: &attempt_targets,
                     auto_select: c.auto_select,
                 },
                 &settings.default_provider,
@@ -179,6 +204,7 @@ pub async fn create(
     super::attachments::attach_drafts(&mut tx, &c.attachment_ids, task.id, c.project_id, u.id)
         .await?;
     tx.commit().await?;
+    crate::chooser::after_insert(&st, &task).await;
     queue::announce(&st, &task);
     Ok(Json(task))
 }
@@ -275,6 +301,38 @@ pub async fn update(
     } else {
         None
     };
+    // WP15: the explanation follows the new access; replacing the model
+    // chooser's choice is an override (the original choice stays visible).
+    let decision = exec.as_ref().map(|e| {
+        let mut d = e.decision.clone();
+        if let Some(old) = t.routing_decision_parsed() {
+            if let Some(mut rep) = old.chooser.map(|b| *b).filter(|r| r.chosen.is_some()) {
+                let was = rep
+                    .overridden
+                    .as_ref()
+                    .map(|o| (o.from.clone(), o.from_label.clone()));
+                let (from, from_label) = was.unwrap_or_else(|| {
+                    let c = rep.chosen.as_ref().expect("filtered");
+                    (c.target.clone(), format!("{} · {}", c.model, c.access))
+                });
+                rep.overridden = Some(queued_api::chooser::OverrideInfo {
+                    from,
+                    from_label,
+                    at: chrono::Utc::now(),
+                });
+                // Booked at creation; never twice.
+                rep.classify_step = None;
+                rep.classify_connector = None;
+                d.source = queued_api::DecisionSource::Override;
+                d.reason = format!(
+                    "Von Hand gewählt statt der automatischen Modellwahl: {}",
+                    d.reason
+                );
+                d.chooser = Some(Box::new(rep));
+            }
+        }
+        d
+    });
     sqlx::query(
         "UPDATE tasks SET title=COALESCE($2,title), prompt=COALESCE($3,prompt), context=COALESCE($4,context),
                 provider=COALESCE($5,provider), model=CASE WHEN $6::text IS NULL THEN model ELSE NULLIF($6,'') END,
@@ -283,6 +341,7 @@ pub async fn update(
                 max_tokens = CASE WHEN $11 THEN $12 ELSE max_tokens END,
                 max_turns = CASE WHEN $13 THEN $14 ELSE max_turns END,
                 connector_id = CASE WHEN $15 THEN $16 ELSE connector_id END,
+                routing_decision = CASE WHEN $15 THEN $17 ELSE routing_decision END,
                 updated_at=now()
          WHERE id=$1",
     )
@@ -305,8 +364,17 @@ pub async fn update(
     .bind(lim.max_turns.flatten())
     .bind(exec.is_some())
     .bind(exec.as_ref().and_then(|e| e.connector_id))
+    .bind(decision.as_ref().and_then(|d| serde_json::to_value(d).ok()))
     .execute(&st.db)
     .await?;
+    if decision
+        .as_ref()
+        .is_some_and(|d| d.source == queued_api::DecisionSource::Override)
+    {
+        if let Some(fresh) = queue::load_task(&st, id).await? {
+            crate::chooser::after_insert(&st, &fresh).await;
+        }
+    }
     queue::emit_task(&st, id).await;
     Ok(Json(json!({"ok": true})))
 }
@@ -713,6 +781,8 @@ pub async fn revert(
         .bind(t.id)
         .execute(&st.db)
         .await?;
+    // WP15: a reverted result teaches the model chooser (owner's data).
+    crate::chooser::learn::revert(&st, &t).await;
     queue::event(
         &st,
         &t,

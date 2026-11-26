@@ -389,6 +389,30 @@ pub async fn of_task(
 }
 
 /// Drafts of the caller → the new task (in the task's transaction).
+/// WP15: MIME types and total size of the composer's draft attachments
+/// (task analysis of the model chooser; only the caller's own drafts).
+pub async fn draft_meta(
+    st: &AppState,
+    ids: &[Uuid],
+    project: Uuid,
+    user: Uuid,
+) -> ApiResult<(Vec<String>, u64)> {
+    if ids.is_empty() {
+        return Ok((vec![], 0));
+    }
+    let rows: Vec<(String, i32)> = sqlx::query_as(
+        "SELECT mime, size FROM attachments
+          WHERE id = ANY($1) AND user_id=$2 AND project_id=$3 AND task_id IS NULL",
+    )
+    .bind(ids)
+    .bind(user)
+    .bind(project)
+    .fetch_all(&st.db)
+    .await?;
+    let bytes = rows.iter().map(|r| u64::try_from(r.1).unwrap_or(0)).sum();
+    Ok((rows.into_iter().map(|r| r.0).collect(), bytes))
+}
+
 pub async fn attach_drafts(
     conn: &mut sqlx::PgConnection,
     ids: &[Uuid],

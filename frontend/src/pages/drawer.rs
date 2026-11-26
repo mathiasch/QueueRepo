@@ -585,7 +585,7 @@ fn Details(t: Task) -> impl IntoView {
                 </div>
             </Block>
         })}
-        <super::bon::DecisionLine t=t.clone()/>
+        <super::chooser::DecisionPanel t=t.clone()/>
         {cost.map(|c| view! { <CostBlock c=c/> })}
     }
 }

@@ -231,6 +231,7 @@ pub fn ProjectPage() -> impl IntoView {
                             Tab::Settings => view! {
                                 <ProjectRouting p=p.clone() on_saved=Callback::new(move |_| reload())/>
                                 <super::bon::RoutingRulesCard p=p.clone() on_saved=Callback::new(move |_| reload())/>
+                                <super::chooser::ChooserCard p=p.clone()/>
                                 <ProjectSettings p=p.clone() on_saved=Callback::new(move |_| reload())/>
                                 <super::bon::ProjectPreviewCard p=p/>
                             }.into_any(),

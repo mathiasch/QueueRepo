@@ -165,6 +165,8 @@ pub fn source_label(s: DecisionSource) -> &'static str {
         DecisionSource::Route => "Projekt-Routing",
         DecisionSource::Inherited => "übernommen",
         DecisionSource::Default => "Standard",
+        DecisionSource::Chooser => "Automatische Modellwahl",
+        DecisionSource::Override => "von Hand übersteuert",
     }
 }
 
@@ -260,6 +262,7 @@ mod tests {
             escalation_level: None,
             reason: "Regel 1 „Klein“ → haiku".into(),
             facts: TaskFacts::default(),
+            chooser: None,
         };
         assert_eq!(decision_text(&d), "Regel: Regel 1 „Klein“ → haiku");
     }

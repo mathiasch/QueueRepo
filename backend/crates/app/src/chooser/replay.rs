@@ -102,7 +102,9 @@ impl Truth for Empirical {
             .copied()
             .unwrap_or((0.0, 0.0));
         let p = (a0 + s + 1.0) / (a0 + b0 + n + 2.0);
-        model::sigmoid(model::logit(p) + model::context_offset(&f.size, f.complexity, f.high_risk()))
+        model::sigmoid(
+            model::logit(p) + model::context_offset(&f.size, f.complexity, f.high_risk()),
+        )
     }
 }
 
@@ -148,7 +150,11 @@ pub fn synthetic_tasks(n: u32, seed: u64) -> Vec<TaskFeatures> {
                 category: category.into(),
                 size: size.into(),
                 complexity: if risky { complexity.max(2) } else { complexity },
-                risks: if risky { vec!["security".into()] } else { vec![] },
+                risks: if risky {
+                    vec!["security".into()]
+                } else {
+                    vec![]
+                },
                 est_tokens: 30_000,
                 ..Default::default()
             }
@@ -328,7 +334,8 @@ fn chooser_policy(
     with_openai: bool,
     quality: u8,
 ) -> Tally {
-    let cands = super::candidates_from(&replay_accesses(with_openai), pricing::builtin(), |_| false);
+    let cands =
+        super::candidates_from(&replay_accesses(with_openai), pricing::builtin(), |_| false);
     let mut stats = Stats::default();
     let mut t = Tally::default();
     let mut rng = Rng::new(seed ^ 0x0C40_05E5);
@@ -338,13 +345,28 @@ fn chooser_policy(
     for (n, f) in tasks.iter().enumerate() {
         let left = (budget_per_task * (n as f64 + 1.0) - spent).max(0.0);
         let snapshot = stats.clone();
-        let i = input(f, cands.clone(), &snapshot, left, seed.wrapping_add(n as u64), quality);
+        let i = input(
+            f,
+            cands.clone(),
+            &snapshot,
+            left,
+            seed.wrapping_add(n as u64),
+            quality,
+        );
         let out = decide::decide(&i);
         let Some(chosen) = &out.report.chosen else {
             // Fallback: the balanced preset's chain.
             let k = index_of(&cands, "claude-sonnet-5-5").unwrap_or(0);
             let r = decide::review_cost(&i, &cands[k]);
-            play(&i, &[(k, r)], 0.0, truth, &mut rng, &mut t, Some(&mut stats));
+            play(
+                &i,
+                &[(k, r)],
+                0.0,
+                truth,
+                &mut rng,
+                &mut t,
+                Some(&mut stats),
+            );
             continue;
         };
         if out.report.explored {
@@ -381,7 +403,14 @@ fn preset_policy(p: &Preset, tasks: &[TaskFeatures], truth: &dyn Truth, seed: u6
     let mut t = Tally::default();
     let mut rng = Rng::new(seed ^ 0x0C40_05E5);
     for f in tasks {
-        let i = input(f, cands.clone(), &stats, 0.0, 0, queued_api::chooser::DEFAULT_QUALITY);
+        let i = input(
+            f,
+            cands.clone(),
+            &stats,
+            0.0,
+            0,
+            queued_api::chooser::DEFAULT_QUALITY,
+        );
         let rk = index_of(&cands, p.review).unwrap_or(0);
         let review = decide::review_cost(&i, &cands[rk]);
         let stages: Vec<(usize, f64)> = p
@@ -414,20 +443,30 @@ fn preset_policy(p: &Preset, tasks: &[TaskFeatures], truth: &dyn Truth, seed: u6
 
 /// Runs the replay: the three presets, the chooser on the same accesses
 /// (fair comparison) and the chooser with an additional OpenAI access.
-pub fn run(source: &str, basis: &str, tasks: &[TaskFeatures], truth: &dyn Truth, seed: u64) -> ReplayReport {
+pub fn run(
+    source: &str,
+    basis: &str,
+    tasks: &[TaskFeatures],
+    truth: &dyn Truth,
+    seed: u64,
+) -> ReplayReport {
     let mut policies: Vec<ReplayPolicy> = PRESETS
         .iter()
         .map(|p| preset_policy(p, tasks, truth, seed).policy(p.id, p.label))
         .collect();
     let q = queued_api::chooser::DEFAULT_QUALITY;
-    let fair = chooser_policy(tasks, truth, seed, false, q)
-        .policy("chooser", "Automatische Modellwahl (gleiche Zugänge wie die Vorlagen)");
+    let fair = chooser_policy(tasks, truth, seed, false, q).policy(
+        "chooser",
+        "Automatische Modellwahl (gleiche Zugänge wie die Vorlagen)",
+    );
     let quality = chooser_policy(tasks, truth, seed, false, 90).policy(
         "chooser_quality",
         "Automatische Modellwahl, Regler auf Qualität (90)",
     );
-    let wide = chooser_policy(tasks, truth, seed, true, q)
-        .policy("chooser_openai", "Automatische Modellwahl (zusätzlich OpenAI-Zugang)");
+    let wide = chooser_policy(tasks, truth, seed, true, q).policy(
+        "chooser_openai",
+        "Automatische Modellwahl (zusätzlich OpenAI-Zugang)",
+    );
     let best_cpa = policies
         .iter()
         .min_by(|a, b| a.cost_per_accepted.total_cmp(&b.cost_per_accepted))
@@ -486,7 +525,11 @@ pub fn synthetic(n: u32, seed: u64) -> ReplayReport {
 
 /// Replay against the recorded history of this instance (admin): the
 /// features of finished tasks and the outcomes per category × model.
-pub async fn history(st: &crate::state::AppState, n: u32, seed: u64) -> anyhow::Result<ReplayReport> {
+pub async fn history(
+    st: &crate::state::AppState,
+    n: u32,
+    seed: u64,
+) -> anyhow::Result<ReplayReport> {
     let rows: Vec<(String, String, String, String, Option<serde_json::Value>)> = sqlx::query_as(
         "SELECT kind, title, prompt, context, routing_decision FROM tasks
          WHERE kind='task' AND status IN ('done','failed','blocked') AND finished_at IS NOT NULL
@@ -574,8 +617,14 @@ mod tests {
         }
         assert!(r.basis.contains("Synthetische"));
         // The quality slider trades money for acceptance and first pass.
-        let q = r.policies.iter().find(|p| p.policy == "chooser_quality").unwrap();
-        assert!(q.acceptance_rate > fair.acceptance_rate && q.first_pass_rate > fair.first_pass_rate);
+        let q = r
+            .policies
+            .iter()
+            .find(|p| p.policy == "chooser_quality")
+            .unwrap();
+        assert!(
+            q.acceptance_rate > fair.acceptance_rate && q.first_pass_rate > fair.first_pass_rate
+        );
         assert!(q.cost_per_accepted > fair.cost_per_accepted);
     }
 
@@ -588,7 +637,10 @@ mod tests {
     #[test]
     fn empirical_truth_smooths_toward_the_prior() {
         let mut cells = HashMap::new();
-        cells.insert(("docs".to_string(), "anthropic/claude-haiku-5-5".to_string()), (0.0, 50.0));
+        cells.insert(
+            ("docs".to_string(), "anthropic/claude-haiku-5-5".to_string()),
+            (0.0, 50.0),
+        );
         let t = Empirical { cells };
         let f = TaskFeatures {
             category: "docs".into(),

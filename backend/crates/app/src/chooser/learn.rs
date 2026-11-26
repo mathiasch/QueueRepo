@@ -162,7 +162,18 @@ pub async fn run_outcome(st: &AppState, task: &Task, accepted: bool) {
             if let Some(r) = super::routing_for(&fresh, &project) {
                 if super::single_shot(r.plan.mode) {
                     let m = r.plan.target.as_ref().and_then(|t| t.model.clone());
-                    put(st, &fresh, "plan", &category, &size, m.as_deref(), s, source, 0.0).await;
+                    put(
+                        st,
+                        &fresh,
+                        "plan",
+                        &category,
+                        &size,
+                        m.as_deref(),
+                        s,
+                        source,
+                        0.0,
+                    )
+                    .await;
                 }
             }
         }
@@ -221,7 +232,18 @@ async fn analyze(st: &AppState, task: &Task, ok: bool) {
 pub async fn feedback(st: &AppState, task: &Task, good: bool) -> sqlx::Result<()> {
     let (category, size) = category_of(st, task).await;
     let s = if good { 1.0 } else { 0.0 };
-    put(st, task, "execute", &category, &size, task.model.as_deref(), s, "feedback", 0.0).await;
+    put(
+        st,
+        task,
+        "execute",
+        &category,
+        &size,
+        task.model.as_deref(),
+        s,
+        "feedback",
+        0.0,
+    )
+    .await;
     let reviewed: Option<String> = sqlx::query_scalar(
         "SELECT model_key FROM chooser_observations WHERE task_id=$1 AND step='review' AND source='run'",
     )
@@ -232,7 +254,18 @@ pub async fn feedback(st: &AppState, task: &Task, good: bool) -> sqlx::Result<()
         let e = pricing::builtin().entries.iter().find(|e| e.id == key);
         if let Some(e) = e {
             let model = e.models.first().cloned();
-            put(st, task, "review", &category, &size, model.as_deref(), s, "feedback", 0.0).await;
+            put(
+                st,
+                task,
+                "review",
+                &category,
+                &size,
+                model.as_deref(),
+                s,
+                "feedback",
+                0.0,
+            )
+            .await;
         }
     }
     Ok(())
@@ -253,7 +286,18 @@ pub async fn feedback_of(st: &AppState, task: uuid::Uuid) -> sqlx::Result<Option
 /// for the agent loop and the review that approved it.
 pub async fn revert(st: &AppState, task: &Task) {
     let (category, size) = category_of(st, task).await;
-    put(st, task, "execute", &category, &size, task.model.as_deref(), 0.0, "revert", 0.0).await;
+    put(
+        st,
+        task,
+        "execute",
+        &category,
+        &size,
+        task.model.as_deref(),
+        0.0,
+        "revert",
+        0.0,
+    )
+    .await;
     let reviewed: Option<String> = sqlx::query_scalar(
         "SELECT model_key FROM chooser_observations WHERE task_id=$1 AND step='review' AND source='run'",
     )
@@ -264,6 +308,17 @@ pub async fn revert(st: &AppState, task: &Task) {
     .flatten();
     if let Some(e) = reviewed.and_then(|k| pricing::builtin().entries.iter().find(|e| e.id == k)) {
         let model = e.models.first().cloned();
-        put(st, task, "review", &category, &size, model.as_deref(), 0.0, "revert", 0.0).await;
+        put(
+            st,
+            task,
+            "review",
+            &category,
+            &size,
+            model.as_deref(),
+            0.0,
+            "revert",
+            0.0,
+        )
+        .await;
     }
 }

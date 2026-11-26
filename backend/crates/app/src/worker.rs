@@ -124,6 +124,10 @@ pub async fn run(st: AppState) {
             if let Err(e) = crate::attachments::sweep_drafts(&st).await {
                 tracing::warn!("attachment draft sweep failed: {e:#}");
             }
+            // WP15: learning data beyond eight half-lives weighs < 0.4 %.
+            if let Err(e) = crate::chooser::store::prune(&st).await {
+                tracing::warn!("chooser prune failed: {e:#}");
+            }
             // WP11: audit retention (the database refuses entries < 365 days).
             if let Err(e) = crate::audit::prune(&st.db, st.cfg.audit_retention_days).await {
                 tracing::warn!("audit prune failed: {e:#}");
@@ -474,9 +478,13 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
     let choice = crate::chooser::choose(st, s.user_id, &proj, &ask).await;
     let chosen = match choice.as_ref().and_then(|c| c.execute.clone()) {
         Some(t) => match t.connector_id {
-            Some(c) => crate::connectors::load_row(st, c)
-                .await?
-                .map(|row| (crate::connectors::harness(&row.3, &row.5), Some(c), t.model.clone())),
+            Some(c) => crate::connectors::load_row(st, c).await?.map(|row| {
+                (
+                    crate::connectors::harness(&row.3, &row.5),
+                    Some(c),
+                    t.model.clone(),
+                )
+            }),
             None => t.provider.clone().map(|p| (p, None, t.model.clone())),
         },
         None => None,
@@ -573,7 +581,10 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
                     decision_source,
                     decision_why,
                 );
-                match (&choice, router.clone().and_then(|v| serde_json::from_value(v).ok())) {
+                match (
+                    &choice,
+                    router.clone().and_then(|v| serde_json::from_value(v).ok()),
+                ) {
                     (Some(c), Some(r)) => {
                         // A chosen access that vanished in between counts as
                         // a fallback (the router's access is used).

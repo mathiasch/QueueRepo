@@ -410,7 +410,10 @@ mod tests {
 
     #[test]
     fn report_roundtrip_and_old_rows() {
-        let r: ChooserReport = serde_json::from_str(r#"{"features":{"category":"docs","size":"S","complexity":1},"quality":50}"#).unwrap();
+        let r: ChooserReport = serde_json::from_str(
+            r#"{"features":{"category":"docs","size":"S","complexity":1},"quality":50}"#,
+        )
+        .unwrap();
         assert_eq!(r.features.category, "docs");
         assert!(r.chosen.is_none() && r.chain.is_empty() && !r.explored);
         let s = serde_json::to_string(&r).unwrap();

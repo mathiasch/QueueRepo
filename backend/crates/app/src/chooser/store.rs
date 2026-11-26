@@ -313,13 +313,39 @@ pub async fn observe(st: &AppState, o: Observation<'_>) -> sqlx::Result<()> {
     Ok(())
 }
 
+/// Drops observations older than eight half-lives (weight < 0.4 %) and
+/// decision rows older than the usage retention. Returns rows removed.
+pub async fn prune(st: &AppState) -> sqlx::Result<u64> {
+    let (_, half_life) = instance(st).await?;
+    let a = sqlx::query(
+        "DELETE FROM chooser_observations WHERE created_at < now() - make_interval(days => $1)",
+    )
+    .bind(half_life.saturating_mul(8))
+    .execute(&st.db)
+    .await?
+    .rows_affected();
+    let b = sqlx::query(
+        "DELETE FROM chooser_decisions WHERE created_at < now() - make_interval(days => $1)",
+    )
+    .bind(i32::try_from(st.cfg.usage_retention_days).unwrap_or(i32::MAX))
+    .execute(&st.db)
+    .await?
+    .rows_affected();
+    Ok(a + b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn model_lists_are_cleaned() {
-        let v = vec![" haiku ".to_string(), "HAIKU".into(), "".into(), "opus".into()];
+        let v = vec![
+            " haiku ".to_string(),
+            "HAIKU".into(),
+            "".into(),
+            "opus".into(),
+        ];
         assert_eq!(clean_models(&v).unwrap(), vec!["haiku", "opus"]);
         assert!(clean_models(&["x".repeat(121)]).is_err());
         assert!(clean_models(&(0..51).map(|i| format!("m{i}")).collect::<Vec<_>>()).is_err());

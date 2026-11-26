@@ -443,6 +443,7 @@ pub async fn accept(st: &AppState, id: Uuid, inc: Incoming) -> anyhow::Result<Op
     .await?;
     tx.commit().await?;
     for t in &after.tasks {
+        crate::chooser::after_insert(st, t).await;
         queue::announce(st, t);
         queue::event(
             st,
