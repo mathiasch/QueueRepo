@@ -4,7 +4,7 @@ Gegenstand: kompletter WP12-Diff (Migration 0015, `queued-api`, `queued-common`,
 
 ## Urteil
 
-**Abnahmefähig mit benannten Restrisiken.** Alle blockierenden Funde sind behoben und durch Tests (teils mutativ) belegt. Die ehrliche Grenze: Der Container-Weg der Vorschau (Docker/Podman, Browser per `exec` im Image) ist nur als Kommando geprüft, nicht ausgeführt – getestet ist Engine `none`. Echte Modelle für die Auto-Auswahl wurden nicht aufgerufen (Fake-Server).
+**Abnahmefähig mit benannten Restrisiken.** Alle blockierenden Funde sind behoben und durch Tests (teils mutativ) belegt. Die volle Suite ist auf dem finalen Stand zweimal hintereinander grün (Backend 644, Frontend 69, Playwright 123 – Details `WP12-test.md`). Die ehrliche Grenze: Der Container-Weg der Vorschau (Docker/Podman, Browser per `exec` im Image) ist nur als Kommando geprüft, nicht ausgeführt – getestet ist Engine `none`. Echte Modelle für die Auto-Auswahl wurden nicht aufgerufen (Fake-Server).
 
 ## Anforderungen ↔ Belege
 

@@ -35,13 +35,15 @@ Befehle wie `HANDOFF.md` §4 (Backend fmt/clippy/test, Frontend fmt/clippy wasm3
 | Suite | Lauf 1 | Lauf 2 | Referenz WP11 |
 |---|---|---|---|
 | Backend fmt / clippy | sauber | sauber | – |
-| Backend `cargo test --workspace` | RUN1_BE | RUN2_BE | 609 |
+| Backend `cargo test --workspace` | **644 bestanden**, 0 fehlgeschlagen | **644 bestanden**, 0 fehlgeschlagen | 609 |
 | Frontend fmt / clippy wasm32 / clippy nativ | sauber | sauber | – |
-| Frontend `cargo test` | RUN1_FE | RUN2_FE | 66 |
+| Frontend `cargo test` | **69 bestanden** | **69 bestanden** | 66 |
 | `trunk build --release` | ok | ok | – |
-| Playwright (system, desktop, iphone, iphone-landscape, inkl. axe) | RUN1_PW | RUN2_PW | 119 |
+| Playwright (system, desktop, iphone, iphone-landscape, inkl. axe) | **123 bestanden** (10,8 min) | **123 bestanden** (13,0 min) | 119 |
 
-Rote Läufe davor (alle behoben, siehe Review): leere Vergleiche (B2), Prozess-Leck (B1), Stepper (B3), WP10-Tageszeit-Test, WP04-Claim-Test, sowie ein Lauf mit veraltetem Mutanten-Build (Werkzeug, siehe Review).
+Beide Läufe auf demselben Stand (Baum identisch mit WIP-Commit `a07b51b`; Lauf 1 auf dem inhaltsgleichen Snapshot `3fa7062`). Zuwachs: Backend +35 (609 → 644), Frontend +3 (66 → 69), Playwright +4 (119 → 123: Desktop 2, iPhone 1, iPhone quer 1).
+
+Rote Läufe davor (alle behoben, siehe Review): leere Vergleiche (B2), Prozess-Leck (B1), Stepper (B3), zweiter „Speichern“-Knopf (B7, 5 bestehende E2E-Tests rot), WP10-Tageszeit-Test, WP04-Claim-Test, sowie ein Lauf mit veraltetem Mutanten-Build (Werkzeug, siehe Review).
 
 ## 5. Nicht verifiziert
 
