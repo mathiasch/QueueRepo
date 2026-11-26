@@ -76,8 +76,8 @@ Plan, Details und Reihenfolge stehen in `work-packages.md`. Die Artefakte liegen
 | 12 | WP09 Memory, Dedupe, Anhänge | fertig | `2b936f7` |
 | 13 | WP10 Observability & Benachrichtigungen | fertig | `5543b95` |
 | 14 | WP11 Enterprise & Betrieb | fertig (Migration 0014) | `389f657` |
-| 15 | **WP12 Best-of-N, Preview, Routing** | **in Arbeit** | – |
-| 16 | WP15 Modell-Chooser | offen | – |
+| 15 | WP12 Best-of-N, Preview, Routing | fertig (Migration 0015) | `391ecb1` |
+| 16 | **WP15 Modell-Chooser** | **in Arbeit** | – |
 | 17 | WP14 Bezahlzugang | offen | – |
 | 18 | WP16 Abschluss-Audit | offen (allerletztes Paket) | – |
 
@@ -115,13 +115,15 @@ cd ../frontend && cargo fmt --all -- --check && cargo clippy --target wasm32-unk
 cd ../e2e && npx playwright test   # Projekte system, desktop, iphone, iphone-landscape (inkl. axe)
 ```
 
-Referenzwerte nach WP11:
+Referenzwerte nach WP12:
 
 | Suite | Tests |
 |---|---|
-| Backend | 609 |
-| Frontend | 66 |
-| Playwright | 119 |
+| Backend | 644 |
+| Frontend | 69 |
+| Playwright | 123 |
+
+Platz sparen: `CARGO_PROFILE_DEV_DEBUG=line-tables-only` verkleinert `backend/target` von 16 auf 5 GB, ohne die Testsemantik zu ändern. Bei Mutationstests nach dem Zurücksetzen neu bauen (`touch`), weil Cargo sonst wegen der mtime den Mutanten behält.
 
 Die Suite nie per `&` aus einem Skript starten. Ein so gestarteter Prozess erbt SIGINT als ignoriert, und die Trap-Tests schlagen dann falsch fehl. Stattdessen im Vordergrund oder über einen Wrapper starten.
 
@@ -161,7 +163,7 @@ Die Suite nie per `&` aus einem Skript starten. Ein so gestarteter Prozess erbt 
   - `queued-common`: Protokoll, Scanner, Metrik-Registry.
   - `queued-api`: Wire-Typen und Texte, geteilt mit dem Frontend.
   - `queuectl`: CLI.
-- **Migrationen:** `backend/crates/app/migrations/00NN_*.sql`, aktuell bis 0014. **Bestehende Migrationen nie ändern.**
+- **Migrationen:** `backend/crates/app/migrations/00NN_*.sql`, aktuell bis 0015. **Bestehende Migrationen nie ändern.**
 - **`frontend/`:** Leptos 0.8 CSR (`queued-web`), Build mit Trunk.
 - **`e2e/`:** Playwright inkl. axe; `scripts/stack.sh` startet den kompletten Stack.
 - **Sicherheitsmodell:**
@@ -174,13 +176,12 @@ Die Suite nie per `&` aus einem Skript starten. Ein so gestarteter Prozess erbt 
 
 ## 7. Nächste Schritte (konkret)
 
-1. **WP12** läuft mit `agent-prompts/next-WP12-best-of-n-preview-routing.md`.
-2. **WP15** mit `agent-prompts/next-WP15-model-chooser.md`.
-3. **WP14** mit `agent-prompts/next-WP14-paid-access.md`.
+1. **WP15** läuft mit `agent-prompts/next-WP15-model-chooser.md`.
+2. **WP14** mit `agent-prompts/next-WP14-paid-access.md`.
    - Das Lizenz- und ToS-Thema wird hier als Entscheidungspunkt für den Betreiber dokumentiert, nicht entschieden.
-4. **WP16** mit `agent-prompts/next-WP16-final-audit.md`.
+3. **WP16** mit `agent-prompts/next-WP16-final-audit.md`.
    - Läuft mit frischem Kontext, ohne Vorwissen aus den Paketen.
    - Zusätzlich bekannt: Das Docker-Image hat `pg_dump` 15, die DB ist 16 (WP11-review).
-5. **Abschluss:** Gesamtbericht an den Nutzer. Danach ggf. die offenen Themen ansprechen:
+4. **Abschluss:** Gesamtbericht an den Nutzer. Danach ggf. die offenen Themen ansprechen:
    - Lizenz- und Credential-Modell.
    - Funde, die nur dokumentiert und nicht behoben sind.
