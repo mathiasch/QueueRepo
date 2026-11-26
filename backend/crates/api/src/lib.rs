@@ -15,6 +15,7 @@ use uuid::Uuid;
 pub mod analytics;
 pub mod bon;
 pub mod branch;
+pub mod chooser;
 mod costs;
 pub mod diff;
 pub mod env;
@@ -703,6 +704,9 @@ pub struct CreateTask {
     /// WP12: a review agent picks the winner when all attempts are settled.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_select: bool,
+    /// WP15: time pressure – the model chooser uses no batch and no flex.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub urgent: bool,
     #[serde(flatten)]
     pub limits: TaskLimitFields,
 }
@@ -1319,6 +1323,7 @@ mod tests {
             attempts: None,
             attempt_targets: vec![],
             auto_select: false,
+            urgent: false,
             limits: TaskLimitFields {
                 max_runtime_secs: Some(Some(90)),
                 ..Default::default()

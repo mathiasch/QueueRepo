@@ -404,6 +404,7 @@ pub async fn fan_out(st: &AppState, task: &Task) -> anyhow::Result<()> {
                 t.model.as_deref().unwrap_or("dem Standardmodell")
             ),
             facts: routing::facts("attempt", &task.prompt, &task.context, 0),
+            chooser: None,
         };
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO tasks (id, user_id, project_id, parent_id, kind, title, prompt, context, provider, model,

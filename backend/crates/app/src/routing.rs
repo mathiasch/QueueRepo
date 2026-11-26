@@ -292,6 +292,17 @@ pub fn facts(kind: &str, prompt: &str, context: &str, attachments: usize) -> Tas
 pub struct Ask {
     pub facts: TaskFacts,
     pub text: String,
+    /// WP15: inputs of the model chooser's task analysis.
+    pub title: String,
+    pub prompt: String,
+    pub context: String,
+    /// MIME types and total size of the attachments.
+    pub attachment_mimes: Vec<String>,
+    pub attachment_bytes: u64,
+    /// Time pressure (composer/API flag).
+    pub urgent: bool,
+    /// Cost limit of the task (USD), if set at the task.
+    pub cost_limit: Option<f64>,
 }
 
 impl Ask {
@@ -299,7 +310,24 @@ impl Ask {
         Self {
             facts: facts(kind, prompt, context, attachments),
             text: format!("{title}\n{prompt}"),
+            title: title.to_string(),
+            prompt: prompt.to_string(),
+            context: context.to_string(),
+            ..Default::default()
         }
+    }
+
+    /// WP15: attachments as the chooser sees them (types and size).
+    pub fn with_attachments(mut self, mimes: Vec<String>, bytes: u64) -> Self {
+        self.attachment_mimes = mimes;
+        self.attachment_bytes = bytes;
+        self
+    }
+
+    pub fn with_urgency(mut self, urgent: bool, cost_limit: Option<f64>) -> Self {
+        self.urgent = urgent;
+        self.cost_limit = cost_limit;
+        self
     }
 }
 
@@ -405,6 +433,7 @@ pub fn decide(
             escalation_level: None,
             reason,
             facts: ask.facts.clone(),
+            chooser: None,
         }
     };
     let provider = explicit.provider.as_deref().filter(|p| !p.is_empty());
@@ -529,6 +558,7 @@ pub fn inherited_json(
             kind: kind.into(),
             ..Default::default()
         },
+        chooser: None,
     })
     .ok()
 }
@@ -566,6 +596,7 @@ pub fn decide_fix(
             escalation_level: Some(level),
             reason: format!("Eskalation nach Fehlversuch (Stufe {level}): {from} → {m}"),
             facts: ask.facts.clone(),
+            chooser: None,
         };
     }
     if let Some(r) = routing {
@@ -587,6 +618,7 @@ pub fn decide_fix(
                     target_text(&rule.target)
                 ),
                 facts: ask.facts.clone(),
+                chooser: None,
             };
         }
     }
@@ -605,6 +637,7 @@ pub fn decide_fix(
         rule_index: None,
         escalation_level: Some(failed.escalation_level),
         facts: ask.facts.clone(),
+        chooser: None,
     }
 }
 
@@ -664,6 +697,33 @@ pub async fn resolve_execute(
         &explicit,
         default_provider,
     );
+    // WP15: no explicit choice and no rule ⇒ the model chooser (when on in
+    // the project); its fallback is exactly this decision.
+    if let (Some(a), DecisionSource::Route | DecisionSource::Default) = (ask, decision.source) {
+        if let Some(choice) = crate::chooser::choose(st, user, project, a).await {
+            let chosen = crate::chooser::decision_of(decision.clone(), &choice);
+            let fell_back = chosen.source != DecisionSource::Chooser;
+            match check_decision(st, user, project, chosen, default_provider).await? {
+                Ok(e) => return Ok(Ok(e)),
+                Err(why) if !fell_back => {
+                    // The chosen access was refused after all (rights changed
+                    // in between): the router's decision, with the reason.
+                    let mut report = choice.report.clone();
+                    report.fallback = Some(format!("Gewählter Zugang nicht nutzbar: {why}"));
+                    report.reasons.push(format!("Gewählter Zugang nicht nutzbar: {why}"));
+                    let fb = crate::chooser::decision_of(
+                        decision,
+                        &crate::chooser::Choice {
+                            report,
+                            execute: None,
+                        },
+                    );
+                    return check_decision(st, user, project, fb, default_provider).await;
+                }
+                Err(why) => return Ok(Err(why)),
+            }
+        }
+    }
     check_decision(st, user, project, decision, default_provider).await
 }
 

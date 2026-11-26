@@ -246,6 +246,12 @@ async fn block_running(
         0
     });
     queue::emit_task(st, id).await;
+    // WP15: a limit stop is the model's result for the cost per accepted task.
+    if n > 0 && class.as_str().starts_with("limit_") {
+        if let Ok(Some(t)) = queue::load_task(st, id).await {
+            crate::chooser::learn::limit_stop(st, &t, class).await;
+        }
+    }
     n > 0
 }
 
@@ -724,7 +730,9 @@ async fn run_inner(
     )
     .await;
 
-    let routing = project.routing();
+    // WP15: the model chooser's step choices of this task (plan, review,
+    // analysis, flex) over the project routing.
+    let routing = crate::chooser::routing_for(task, &project);
     let remote = project_remote(st, &project);
     let env = environment::load(&st.db, project.id).await?;
     let commits = Committer {
@@ -2859,6 +2867,52 @@ fn review_target(
     }
 }
 
+/// WP12-N10 / WP15: when the reviewer's model is of a weaker tier than the
+/// executor's (both known in the price catalog), a reviewer at least as
+/// strong (preferably another provider), else the executor's own access
+/// and model. `None` = the planned reviewer is fine.
+async fn review_not_weaker(
+    st: &AppState,
+    task: &Task,
+    project: &Project,
+    review_model: Option<&str>,
+) -> anyhow::Result<Option<(Option<Uuid>, String, Option<String>)>> {
+    let cat = pricing::current(st).await;
+    let (Some((exec_tier, exec_family)), Some((rev_tier, _))) = (
+        crate::chooser::tier_family(&cat, task.model.as_deref()),
+        crate::chooser::tier_family(&cat, review_model),
+    ) else {
+        return Ok(None);
+    };
+    if rev_tier >= exec_tier {
+        return Ok(None);
+    }
+    let pick = crate::chooser::review_pick(st, task, project, exec_tier, &exec_family).await?;
+    let (target, why) = match pick {
+        Some(c) => (
+            (c.target.connector_id, c.target.provider.clone(), c.target.model.clone()),
+            format!("{} über „{}“", c.model, c.access),
+        ),
+        None => (
+            (task.connector_id, Some(task.provider.clone()), task.model.clone()),
+            "dasselbe Modell wie die Umsetzung".to_string(),
+        ),
+    };
+    event(
+        st,
+        task,
+        "review",
+        &format!(
+            "Review-Modell {} ist schwächer als die Umsetzung ({}) – Review stattdessen durch {why}",
+            review_model.unwrap_or("?"),
+            task.model.as_deref().unwrap_or("?")
+        ),
+    )
+    .await;
+    let (c, p, m) = target;
+    Ok(Some((c, p.unwrap_or_else(|| task.provider.clone()), m)))
+}
+
 async fn run_review(
     st: &AppState,
     task: &Task,
@@ -2903,6 +2957,11 @@ async fn run_review(
                 .await
             }
         }
+    }
+    // WP12-N10 / WP15: the review is never weaker than the executor (e.g.
+    // an escalation to the top tier with a mid-tier review route).
+    if let Some((c, p, m)) = review_not_weaker(st, task, project, model.as_deref()).await? {
+        (connector, provider, model) = (c, p, m);
     }
     let same = connector == rc.exec.connector_id && provider == rc.exec.provider;
     let acc_owned;
@@ -3059,6 +3118,7 @@ async fn run_review(
         });
     }
     let r = review.expect("checked");
+    crate::chooser::learn::review_verdict(st, task, model.as_deref(), r.approved).await;
     event(
         st,
         task,
@@ -3235,6 +3295,31 @@ async fn defer_review(
     pending: &PendingReview,
     usage: &Usage,
 ) -> Result<bool, RunError> {
+    // WP12-N10: a single-shot review on a weaker model than the executor
+    // falls back to the agentic review, which picks a reviewer not weaker.
+    let route_model = route
+        .target
+        .as_ref()
+        .and_then(|t| t.model.clone())
+        .or_else(|| routing.execute.target.as_ref().and_then(|t| t.model.clone()));
+    {
+        let cat = pricing::current(st).await;
+        if let (Some((e, _)), Some((r, _))) = (
+            crate::chooser::tier_family(&cat, task.model.as_deref()),
+            crate::chooser::tier_family(&cat, route_model.as_deref()),
+        ) {
+            if r < e {
+                event(
+                    st,
+                    task,
+                    "review",
+                    "Review per API wäre schwächer als die Umsetzung – agentisches Review mit einem nicht schwächeren Modell",
+                )
+                .await;
+                return Ok(false);
+            }
+        }
+    }
     let (c, model) =
         match step_connector(st, task, project, route, routing.execute.target.as_ref()).await? {
             Ok(x) => x,
@@ -3350,6 +3435,11 @@ pub(crate) async fn complete_review(
     };
     let res = match outcome {
         Ok(r) => {
+            let review_model = crate::chooser::routing_for(task, &project)
+                .and_then(|rt| rt.review.target.and_then(|t| t.model))
+                .or(task.model.clone());
+            crate::chooser::learn::review_verdict(st, task, review_model.as_deref(), r.approved)
+                .await;
             event(
                 st,
                 task,
@@ -3403,6 +3493,7 @@ pub(crate) async fn complete_analyze(
     usage: &Usage,
 ) -> anyhow::Result<()> {
     let settings = queue::load_settings(st, task.user_id).await?;
+    crate::chooser::learn::run_outcome(st, task, outcome.is_ok()).await;
     let res = match outcome {
         Ok(r) if r.status.as_deref() == Some("needs_input") && !r.questions.is_empty() => finish(
             st,
@@ -3728,7 +3819,7 @@ async fn llm_critic(
         Ok(p) => p,
         Err(e) => return skip(format!("Projekt nicht lesbar ({e})")).await,
     };
-    let Some(routing) = project.routing() else {
+    let Some(routing) = crate::chooser::routing_for(parent, &project) else {
         return skip("kein Zugang für Einzelschritte im Projekt eingestellt".into()).await;
     };
     let (c, model) = match step_connector(
@@ -3845,6 +3936,27 @@ async fn create_fix(st: &AppState, failed: &Task, failure: &str) -> anyhow::Resu
     // a rule for fix tasks, or the failed task's access – with the reason.
     let ask = crate::routing::Ask::new("fix", &title, &prompt, &root.context, 0);
     let mut decision = crate::routing::decide_fix(routing.as_ref(), failed, &ask);
+    // WP15: the model chooser's escalation chain wins over the routing's
+    // (checked like any decision; an unusable stage falls back below).
+    if let Some(d) = crate::chooser::fix_decision(failed, &root, &ask) {
+        match crate::routing::check_decision(st, failed.user_id, &project, d.clone(), &failed.provider)
+            .await?
+        {
+            Ok(_) => decision = d,
+            Err(why) => {
+                decision.reason = format!(
+                    "{} (Eskalation der Modellwahl auf {} nicht nutzbar: {why})",
+                    decision.reason,
+                    d.target.model.as_deref().unwrap_or("?")
+                );
+                // Keep the report: its review/step choices still apply.
+                decision.chooser = d.chooser;
+            }
+        }
+    } else if let Some(rep) = crate::chooser::report_of(failed).or_else(|| crate::chooser::report_of(&root)) {
+        // Chain exhausted (or none): the fix keeps the report's steps.
+        decision.chooser = Some(Box::new(rep));
+    }
     let level = decision.escalation_level.unwrap_or(failed.escalation_level);
     if decision.source == queued_api::DecisionSource::Rule {
         // A rule may name another access: checked like a new task; refused

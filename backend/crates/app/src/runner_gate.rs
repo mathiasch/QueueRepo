@@ -586,6 +586,8 @@ pub(crate) async fn finish_flow(
     push: Option<bool>,
     usage: &Usage,
 ) -> Result<(), RunError> {
+    // WP15: verify and review decided – the chooser learns from it.
+    crate::chooser::learn::run_outcome(st, task, p.failure.is_none()).await;
     let review = p.review.clone();
     let before = p.before.clone();
     let after = p.after.clone().unwrap_or_default();

@@ -159,6 +159,7 @@ pub struct AddArgs {
     /// WP12 Best-of-N.
     pub attempts: Option<i32>,
     pub auto_select: bool,
+    pub urgent: bool,
     pub text: Vec<String>,
     pub json: bool,
 }
@@ -181,6 +182,7 @@ pub async fn add(api: &Api, a: AddArgs) -> Result<Task> {
         attempts: a.attempts,
         attempt_targets: vec![],
         auto_select: a.auto_select,
+        urgent: a.urgent,
         limits: TaskLimitFields {
             max_cost_usd: a.max_cost.map(Some),
             ..Default::default()

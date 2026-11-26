@@ -58,6 +58,9 @@ enum Cmd {
         /// Den besten Versuch automatisch von einem Review-Agenten wählen lassen
         #[arg(long, requires = "attempts")]
         auto_select: bool,
+        /// Eilig: die automatische Modellwahl nutzt weder Batch noch Flex
+        #[arg(long)]
+        urgent: bool,
         /// Danach verfolgen wie „watch“
         #[arg(short, long)]
         watch: bool,
@@ -141,6 +144,7 @@ async fn run(cli: Cli) -> queuectl::Result<i32> {
             max_cost,
             attempts,
             auto_select,
+            urgent,
             watch,
             text,
         } => {
@@ -162,6 +166,7 @@ async fn run(cli: Cli) -> queuectl::Result<i32> {
                     max_cost,
                     attempts,
                     auto_select,
+                    urgent,
                     text,
                     json,
                 },

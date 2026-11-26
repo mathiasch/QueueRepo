@@ -92,6 +92,11 @@ pub struct Config {
     /// WP11: audit entries kept (env `AUDIT_RETENTION_DAYS`, default 730,
     /// at least 365 – the database refuses to delete younger entries).
     pub audit_retention_days: i64,
+    /// WP15: fixed seed of the model chooser's Thompson sample (env
+    /// `CHOOSER_SEED`; unset = a random seed per decision, stored in the
+    /// decision so it can be replayed). Makes decisions reproducible in
+    /// tests and when debugging.
+    pub chooser_seed: Option<u64>,
 }
 
 /// WP11: the lease must outlive a few heartbeats, and the runner clamps it
@@ -294,6 +299,7 @@ impl Config {
             runner_lease_secs,
             audit_retention_days: num::<i64>("AUDIT_RETENTION_DAYS", 730)
                 .max(queued_api::security::AUDIT_MIN_RETENTION_DAYS),
+            chooser_seed: var("CHOOSER_SEED").and_then(|v| v.trim().parse().ok()),
             data_dir,
         })
     }
@@ -355,6 +361,7 @@ impl Config {
             runner_heartbeat_secs: 1,
             runner_lease_secs: 30,
             audit_retention_days: 730,
+            chooser_seed: Some(1),
         }
     }
 

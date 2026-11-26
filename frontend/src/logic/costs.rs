@@ -62,6 +62,7 @@ pub fn step_label(step: &str) -> &'static str {
         "analyze" => "Analyse",
         "critic" => "Prüfung",
         "select" => "Auswahl (Best-of-N)",
+        "classify" => "Einordnung (Modellwahl)",
         _ => "Schritt",
     }
 }

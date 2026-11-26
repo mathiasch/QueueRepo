@@ -463,13 +463,32 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
     let Some((project_id, name, routing)) = project else {
         return Ok(());
     };
+    let title = format!("OnEmptyQueue: {}", s.onempty_actions.join(" + "));
+    // WP15: the model chooser picks the analysis (batch, no time pressure)
+    // and its fallback agent loop among the accesses that are not paused.
+    let proj: crate::models::Project = sqlx::query_as("SELECT * FROM projects WHERE id=$1")
+        .bind(project_id)
+        .fetch_one(&st.db)
+        .await?;
+    let ask = crate::routing::Ask::new("onempty", &title, "", "", 0);
+    let choice = crate::chooser::choose(st, s.user_id, &proj, &ask).await;
+    let chosen = match choice.as_ref().and_then(|c| c.execute.clone()) {
+        Some(t) => match t.connector_id {
+            Some(c) => crate::connectors::load_row(st, c)
+                .await?
+                .map(|row| (crate::connectors::harness(&row.3, &row.5), Some(c), t.model.clone())),
+            None => t.provider.clone().map(|p| (p, None, t.model.clone())),
+        },
+        None => None,
+    };
     // Access: the routing's analysis (or agent-loop) target, else the default provider.
     let target = routing
         .and_then(|r| serde_json::from_value::<queued_api::Routing>(r).ok())
         .and_then(|r| r.analyze.target.or(r.execute.target));
     let routing_set = target.is_some();
-    let (provider, connector_id, model) = match target {
-        Some(t) => match t.connector_id {
+    let (provider, connector_id, model) = match (chosen.clone(), target) {
+        (Some(c), _) => c,
+        (None, Some(t)) => match t.connector_id {
             Some(c) => match crate::connectors::load_row(st, c).await? {
                 Some(row) => {
                     let harness = crate::connectors::harness(&row.3, &row.5);
@@ -496,7 +515,7 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
                 (p, None, t.model)
             }
         },
-        None => {
+        (None, None) => {
             if !legacy_ready(st, s.user_id, &s.default_provider).await? {
                 return Ok(());
             }
@@ -521,14 +540,14 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
         .execute(&st.db)
         .await?;
     tracing::info!("OnEmptyQueue for user {} on project {name}", s.user_id);
-    queue::insert_task(
+    let task = queue::insert_task(
         st,
         NewTask {
             user_id: s.user_id,
             project_id,
             parent_id: None,
             kind: "onempty",
-            title: format!("OnEmptyQueue: {}", s.onempty_actions.join(" + ")),
+            title,
             prompt: String::new(),
             context: String::new(),
             provider,
@@ -545,17 +564,36 @@ async fn maybe_onempty(st: &AppState, s: &Settings) -> Result<()> {
             carry_from: None,
             pr_id: None,
             plan_mode: false,
-            routing_decision: crate::routing::inherited_json(
-                "onempty",
-                &decision_provider,
-                connector_id,
-                decision_model.as_deref(),
-                decision_source,
-                decision_why,
-            ),
+            routing_decision: {
+                let router = crate::routing::inherited_json(
+                    "onempty",
+                    &decision_provider,
+                    connector_id,
+                    decision_model.as_deref(),
+                    decision_source,
+                    decision_why,
+                );
+                match (&choice, router.clone().and_then(|v| serde_json::from_value(v).ok())) {
+                    (Some(c), Some(r)) => {
+                        // A chosen access that vanished in between counts as
+                        // a fallback (the router's access is used).
+                        let c = if chosen.is_some() {
+                            c.clone()
+                        } else {
+                            crate::chooser::Choice {
+                                execute: None,
+                                ..c.clone()
+                            }
+                        };
+                        serde_json::to_value(crate::chooser::decision_of(r, &c)).ok()
+                    }
+                    _ => router,
+                }
+            },
         },
     )
     .await?;
+    crate::chooser::after_insert(st, &task).await;
     Ok(())
 }
 

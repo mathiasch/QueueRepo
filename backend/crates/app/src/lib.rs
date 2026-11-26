@@ -11,6 +11,7 @@ pub mod backup;
 pub mod batch;
 pub mod bon;
 pub mod budget;
+pub mod chooser;
 pub mod config;
 pub mod connectors;
 pub mod crypto;

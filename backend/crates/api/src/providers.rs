@@ -394,11 +394,15 @@ pub enum DecisionSource {
     Inherited,
     /// No routing: the user's default provider.
     Default,
+    /// WP15: the model chooser (expected cost per accepted task).
+    Chooser,
+    /// WP15: a human replaced the chooser's choice.
+    Override,
 }
 
 /// WP12: the routing decision of a task's agent loop, stored at the task
 /// and shown in the UI. WP15 (model chooser) produces the same structure.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutingDecision {
     /// Pipeline step (`execute`).
     pub step: String,
@@ -416,6 +420,10 @@ pub struct RoutingDecision {
     /// German explanation for the UI.
     pub reason: String,
     pub facts: TaskFacts,
+    /// WP15: the model chooser's report (features, costs, alternatives,
+    /// steps, chain; also present when it fell back).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chooser: Option<Box<crate::chooser::ChooserReport>>,
 }
 
 /// `PUT /api/projects/{id}/routing`.
